@@ -1,8 +1,16 @@
-# VissLink v0.1 — Viessmann Vitotronic 300 KW3 via Optolink (lecture seule)
+# VissLink v0.2 — Viessmann Vitotronic 300 KW3 via Optolink (lecture seule)
 # Matériel : Wemos D1 mini (ESP8266) + interface infrarouge Optolink.
 #
 # Les identifiants sont lus dans secrets.yaml (non versionné), voir
 # secrets.yaml.example.
+#
+# Registres actifs : ceux dont l'adresse et le type sont établis. Les registres
+# expérimentaux sont en commentaire en fin de fichier, avec la marche à suivre
+# pour les vérifier avant de les activer.
+#
+# Charge : ~7 lectures/min ici, ~13 avec les registres expérimentaux. Une
+# lecture prend ~2 à 3 s (attente du 0x05), soit 20 à 30 lectures/min au plus :
+# garder une marge en ajoutant des registres.
 
 esphome:
   name: iot-viessmann
@@ -61,9 +69,13 @@ visslink:
   max_retries: 2          # nouvelles tentatives avant d'abandonner le cycle
 
 sensor:
+  # --- Températures (int16, dixièmes de degré) ------------------------------
+  # Le type int16 est le défaut (comportement v0.1) ; il est écrit ici pour
+  # la lisibilité.
   - platform: visslink
     name: "Température extérieure"
     address: 0x0800
+    data_type: int16
     update_interval: 60s
     unit_of_measurement: "°C"
     device_class: temperature
@@ -73,7 +85,8 @@ sensor:
   - platform: visslink
     name: "Température chaudière"
     address: 0x0802
-    update_interval: 30s
+    data_type: int16
+    update_interval: 60s
     unit_of_measurement: "°C"
     device_class: temperature
     filters:
@@ -82,8 +95,158 @@ sensor:
   - platform: visslink
     name: "Température ECS"
     address: 0x0804
+    data_type: int16
     update_interval: 60s
     unit_of_measurement: "°C"
     device_class: temperature
     filters:
       - multiply: 0.1
+
+  - platform: visslink
+    name: "Température départ M2"
+    address: 0x3900
+    data_type: int16
+    update_interval: 60s
+    unit_of_measurement: "°C"
+    device_class: temperature
+    filters:
+      - multiply: 0.1
+
+  # --- Consignes (uint8, degrés entiers) ------------------------------------
+  - platform: visslink
+    name: "Consigne A1 confort"
+    address: 0x2306
+    data_type: uint8
+    update_interval: 5min
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 0
+
+  - platform: visslink
+    name: "Consigne A1 réduit"
+    address: 0x2307
+    data_type: uint8
+    update_interval: 5min
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 0
+
+  - platform: visslink
+    name: "Consigne M2 confort"
+    address: 0x3306
+    data_type: uint8
+    update_interval: 5min
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 0
+
+  - platform: visslink
+    name: "Consigne M2 réduit"
+    address: 0x3307
+    data_type: uint8
+    update_interval: 5min
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 0
+
+  - platform: visslink
+    name: "Consigne ECS"
+    address: 0x6300
+    data_type: uint8
+    update_interval: 5min
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 0
+
+  # --- Brûleur (compteurs uint32) -------------------------------------------
+  - platform: visslink
+    name: "Démarrages brûleur"
+    address: 0x088A
+    data_type: uint32
+    update_interval: 1h
+    state_class: total_increasing
+    accuracy_decimals: 0
+
+  - platform: visslink
+    name: "Heures de fonctionnement brûleur"
+    address: 0x08A7
+    data_type: uint32          # secondes
+    update_interval: 1h
+    unit_of_measurement: "h"
+    device_class: duration
+    state_class: total_increasing
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.00027777778  # s -> h
+
+  # --- Expérimental : à vérifier avant activation ---------------------------
+  # Consigne chaudière calculée. Adresse non confirmée sur cette installation :
+  # comparer la valeur à celle affichée par la régulation.
+  # - platform: visslink
+  #   name: "Consigne chaudière calculée"
+  #   address: 0x5502
+  #   data_type: int16
+  #   update_interval: 60s
+  #   unit_of_measurement: "°C"
+  #   device_class: temperature
+  #   filters:
+  #     - multiply: 0.1
+
+  # Vérification d'un état binaire (étape 1) : lire d'abord l'octet brut en
+  # uint8 et observer ses valeurs pendant quelques jours (journaux DEBUG :
+  # "0x0846 <- 01"). Ne passer en binary_sensor (étape 2) que si seules les
+  # valeurs 0 et 1 apparaissent et qu'elles suivent le fonctionnement réel.
+  # Une même adresse ne peut être déclarée qu'une fois : retirer l'entrée
+  # uint8 en activant le binary_sensor correspondant.
+  # - platform: visslink
+  #   name: "Brut 0x0846 pompe de bouclage ECS"
+  #   address: 0x0846
+  #   data_type: uint8
+  #   update_interval: 60s
+  #   accuracy_decimals: 0
+  #   state_class: measurement
+
+binary_sensor:
+  # 0x00 = arrêt, 0x01 = marche. Toute autre valeur : état inconnu + avertissement
+  # dans les journaux (aucune interprétation arbitraire).
+  - platform: visslink
+    name: "Brûleur actif"
+    address: 0x0842
+    update_interval: 30s
+    device_class: running
+
+  # --- Expérimental : à vérifier avant activation (voir étape 1 ci-dessus) --
+  # Fortement corroboré, à valider sur cette chaudière.
+  # - platform: visslink
+  #   name: "Pompe de bouclage ECS"
+  #   address: 0x0846
+  #   update_interval: 60s
+  #   device_class: running
+
+  # À confirmer.
+  # - platform: visslink
+  #   name: "Pompe de charge ECS"
+  #   address: 0x0845
+  #   update_interval: 60s
+  #   device_class: running
+
+  # À confirmer.
+  # - platform: visslink
+  #   name: "Défaut chaudière"
+  #   address: 0x0883
+  #   update_interval: 60s
+  #   device_class: problem
+
+  # À confirmer.
+  # - platform: visslink
+  #   name: "Circulateur A1"
+  #   address: 0x2906
+  #   update_interval: 60s
+  #   device_class: running
+
+  # À confirmer.
+  # - platform: visslink
+  #   name: "Circulateur M2"
+  #   address: 0x3906
+  #   update_interval: 60s
+  #   device_class: running

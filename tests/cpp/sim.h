@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <deque>
 #include <map>
+#include <set>
 #include <vector>
 
 namespace vltest {
@@ -52,6 +53,7 @@ class SimBoiler {
 
   int requests{0};
   std::map<uint16_t, int> requests_by_address;
+  std::map<uint16_t, std::set<uint8_t>> lengths_by_address;  ///< LEN demandés
 
   void tick(uint32_t now) {
     if (!started_) {
@@ -76,6 +78,7 @@ class SimBoiler {
       requests_by_address[address]++;
       pending_address_ = address;
       pending_length_ = r[4];
+      lengths_by_address[address].insert(r[4]);
       has_pending_ = true;
       respond_at_ = now + response_delay_ms;
     }

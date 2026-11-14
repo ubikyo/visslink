@@ -1,3 +1,4 @@
+#include "decode.h"
 #include "kw_protocol.h"
 #include "sim.h"
 #include "test_framework.h"
@@ -180,4 +181,20 @@ TEST(kw_timeouts_across_millis_overflow) {
   CHECK_EQ(f.loop(start + 10), KwResult::NONE);
   CHECK_EQ(f.loop(2000), KwResult::NONE);  // millis() a débordé
   CHECK_EQ(f.loop(start + 5000), KwResult::SYNC_TIMEOUT);
+}
+
+TEST(kw_one_and_four_byte_reads) {
+  for (uint8_t length : {1, 4}) {
+    Fixture f;
+    CHECK(f.kw.request_read(0x088A, length, 0));
+    f.serial.push({0x05});
+    f.loop(5);
+    const std::vector<uint8_t> expected = {0x01, 0xF7, 0x08, 0x8A, length};
+    CHECK(f.serial.tx == expected);
+    for (uint8_t i = 0; i < length; i++)
+      f.serial.rx.push_back(0x10 + i);
+    f.loop(30);
+    CHECK_EQ(f.loop(100), KwResult::SUCCESS);
+    CHECK_EQ(f.kw.data_length(), length);
+  }
 }

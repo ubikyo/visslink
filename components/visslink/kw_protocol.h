@@ -28,11 +28,8 @@
 namespace esphome {
 namespace visslink {
 
-/// Les valeurs KW sont transmises octet de poids faible en premier.
-/// "D7 00" -> 215, "CC FF" -> -52.
-inline int16_t decode_int16_le(const uint8_t *data) {
-  return static_cast<int16_t>(static_cast<uint16_t>(data[0]) | (static_cast<uint16_t>(data[1]) << 8));
-}
+// Le décodage des valeurs (types, little-endian) est dans decode.h : ce
+// moteur ne transporte que des octets bruts.
 
 enum class KwResult : uint8_t {
   NONE,                ///< pas de transaction terminée pendant cet appel
