@@ -12,7 +12,12 @@
 //    elle est déjà dépassée : elle repart alors de maintenant (pas de
 //    rattrapage) ;
 //  - un échec est retenté après RETRY_DELAY_MS, au plus max_retries fois, puis
-//    le registre attend son intervalle normal.
+//    le registre attend son intervalle normal ;
+//  - un registre peut couvrir plusieurs blocs (programmation horaire : un bloc
+//    par jour). Il reste une seule entrée : après chaque bloc, il revient
+//    après BLOCK_DELAY_MS, en concurrence normale avec les autres registres,
+//    et ne reprend son intervalle qu'après le dernier bloc. Le nombre
+//    d'entrées, donc l'attente maximale des autres registres, est inchangé.
 
 #include <cstddef>
 #include <cstdint>
@@ -27,19 +32,28 @@ class RegisterScheduler {
  public:
   static constexpr int NONE = -1;
   static constexpr uint32_t RETRY_DELAY_MS = 1000;
+  /// Pause entre deux blocs d'un même registre : étale les 7 lectures d'une
+  /// programmation sur ~4 min au lieu d'une rafale. Valeur choisie par
+  /// simulation (cf. tests sim_v021_* et README, « Charge de la liaison »).
+  static constexpr uint32_t BLOCK_DELAY_MS = 30000;
 
   struct Entry {
     uint32_t interval_ms;
-    uint32_t due_ms;   ///< prochaine tentative
-    uint8_t failures;  ///< échecs consécutifs dans le cycle en cours
+    uint32_t due_ms;    ///< prochaine tentative
+    uint32_t cycle_ms;  ///< échéance du premier bloc du cycle (registres multi-blocs)
+    uint8_t failures;   ///< échecs consécutifs dans le cycle en cours
+    uint8_t blocks;     ///< nombre de blocs lus à chaque cycle (>= 1)
+    uint8_t block;      ///< bloc à lire
   };
 
   void set_max_retries(uint8_t max_retries) { this->max_retries_ = max_retries; }
   uint8_t max_retries() const { return this->max_retries_; }
 
-  /// Ajoute un registre, échu immédiatement. À appeler depuis setup() :
-  /// loop() n'alloue jamais.
-  void add(uint32_t interval_ms, uint32_t now) { this->entries_.push_back({interval_ms, now, 0}); }
+  /// Ajoute un registre de `blocks` blocs, échu à `now`. À appeler depuis
+  /// setup() : loop() n'alloue jamais.
+  void add(uint32_t interval_ms, uint32_t now, uint8_t blocks = 1) {
+    this->entries_.push_back({interval_ms, now, now, 0, blocks > 0 ? blocks : uint8_t(1), 0});
+  }
 
   /// Index du registre à lire maintenant (marqué en cours), ou NONE.
   int acquire(uint32_t now) {
@@ -76,6 +90,19 @@ class RegisterScheduler {
     }
     const bool gave_up = !success;
     e.failures = 0;
+    // Bloc suivant, y compris après un abandon : un jour illisible ne prive
+    // pas les autres de leur lecture.
+    if (e.block + 1 < e.blocks) {
+      if (e.block == 0)
+        e.cycle_ms = e.due_ms;
+      e.block++;
+      e.due_ms = now + BLOCK_DELAY_MS;
+      return gave_up;
+    }
+    if (e.block > 0) {
+      e.block = 0;
+      e.due_ms = e.cycle_ms;  // cadence calée sur le début du cycle
+    }
     e.due_ms += e.interval_ms;
     if (time_reached(now, e.due_ms))
       e.due_ms = now + e.interval_ms;
@@ -83,6 +110,8 @@ class RegisterScheduler {
   }
 
   const Entry &entry(size_t index) const { return this->entries_[index]; }
+  /// Bloc à lire (ou en cours de lecture) pour un registre.
+  uint8_t block(size_t index) const { return this->entries_[index].block; }
 
  protected:
   std::vector<Entry> entries_;

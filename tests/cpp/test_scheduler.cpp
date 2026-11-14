@@ -162,3 +162,90 @@ TEST(scheduler_millis_overflow) {
   CHECK(c[0] >= 10 && c[0] <= 11);
   CHECK(c[1] >= 20 && c[1] <= 21);
 }
+
+// --- v0.2.1 : registres multi-blocs (programmations horaires) ----------------
+
+TEST(scheduler_single_block_is_default) {
+  RegisterScheduler s;
+  s.add(60000, 0);
+  CHECK_EQ(s.entry(0).blocks, 1);
+  CHECK_EQ(s.block(0), 0);
+  s.add(60000, 0, 0);  // 0 bloc : ramené à 1
+  CHECK_EQ(s.entry(1).blocks, 1);
+}
+
+TEST(scheduler_blocks_spaced_then_interval_from_cycle_start) {
+  const uint32_t H6 = 6UL * 3600 * 1000;
+  const uint32_t D = RegisterScheduler::BLOCK_DELAY_MS;
+  RegisterScheduler s;
+  s.add(H6, 1000, 7);
+  uint32_t now = 1000;
+  for (uint8_t b = 0; b < 7; b++) {
+    CHECK_EQ(s.acquire(now), 0);
+    CHECK_EQ(s.block(0), b);
+    now += 3000;  // lecture de 3 s
+    CHECK(!s.finish(true, now));
+    if (b < 6) {
+      CHECK_EQ(s.entry(0).due_ms, now + D);  // bloc suivant après la pause
+      CHECK_EQ(s.acquire(now + D - 1), RegisterScheduler::NONE);
+      now += D;
+    }
+  }
+  CHECK_EQ(s.block(0), 0);
+  CHECK_EQ(s.entry(0).due_ms, 1000 + H6);  // calé sur le début du cycle, sans dérive
+}
+
+TEST(scheduler_block_retries_stay_on_same_block) {
+  RegisterScheduler s;
+  s.set_max_retries(2);
+  s.add(60000, 0, 7);
+  CHECK_EQ(s.acquire(0), 0);
+  CHECK(!s.finish(true, 100));  // bloc 0 lu
+  CHECK_EQ(s.acquire(RegisterScheduler::BLOCK_DELAY_MS + 100), 0);
+  CHECK_EQ(s.block(0), 1);
+  uint32_t now = RegisterScheduler::BLOCK_DELAY_MS + 200;
+  CHECK(!s.finish(false, now));  // tentative 1 du bloc 1
+  CHECK_EQ(s.block(0), 1);
+  CHECK_EQ(s.entry(0).due_ms, now + RegisterScheduler::RETRY_DELAY_MS);
+  now += RegisterScheduler::RETRY_DELAY_MS;
+  CHECK_EQ(s.acquire(now), 0);
+  CHECK(!s.finish(true, now + 100));  // succès à la 2e tentative
+  CHECK_EQ(s.block(0), 2);
+  CHECK_EQ(s.entry(0).failures, 0);
+}
+
+TEST(scheduler_block_given_up_moves_to_next_block) {
+  RegisterScheduler s;
+  s.set_max_retries(1);
+  s.add(60000, 0, 3);
+  CHECK_EQ(s.acquire(0), 0);
+  CHECK(!s.finish(false, 100));
+  CHECK_EQ(s.acquire(1100), 0);
+  CHECK(s.finish(false, 1200));  // abandon du bloc 0
+  CHECK_EQ(s.block(0), 1);       // le bloc 1 n'en est pas privé
+  CHECK_EQ(s.entry(0).due_ms, 1200 + RegisterScheduler::BLOCK_DELAY_MS);
+}
+
+TEST(scheduler_blocks_do_not_starve_others) {
+  // Saturation : un registre rapide et quatre programmations. Le registre
+  // rapide attend au plus N-1 = 4 lectures, comme avec 5 registres simples.
+  RegisterScheduler s;
+  s.add(1000, 0);
+  for (int i = 0; i < 4; i++)
+    s.add(6UL * 3600 * 1000, 0, 7);
+  uint32_t now = 0;
+  int since_fast = 0, worst = 0;
+  for (int i = 0; i < 200; i++) {
+    const int idx = s.acquire(now);
+    if (idx == RegisterScheduler::NONE) {
+      now += 100;
+      continue;
+    }
+    since_fast = (idx == 0) ? 0 : since_fast + 1;
+    if (since_fast > worst)
+      worst = since_fast;
+    now += 3000;
+    s.finish(true, now);
+  }
+  CHECK(worst <= 4);
+}

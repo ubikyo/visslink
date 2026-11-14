@@ -12,8 +12,10 @@ import subprocess
 import pytest
 
 EXAMPLE = "examples/iot-viessmann.yaml"
-# Exemple de la v0.1.0, tel que publié : doit rester valide sans modification.
+# Exemples de la v0.1.0 et de la v0.2, tels que publiés : doivent rester
+# valides sans modification.
 EXAMPLE_V01 = "tests/fixtures/iot-viessmann-v0.1.yaml"
+EXAMPLE_V02 = "tests/fixtures/iot-viessmann-v0.2.yaml"
 
 
 def _secrets() -> str:
@@ -95,7 +97,44 @@ INVALID_CASES = {
         "address: 0x0842", "address: 0x0800"
     ),
     "address_out_of_range": lambda s: s.replace("address: 0x0804", "address: 0x10000"),
+    # v0.2.1 : programmations horaires (text_sensor).
+    # Les 7 blocs comptent : 0x2008 est le mardi de 0x2000.
+    "sensor_inside_schedule_blocks": lambda s: s.replace(
+        "address: 0x0804", "address: 0x2008"
+    ),
+    "binary_sensor_on_schedule_sunday": lambda s: s.replace(
+        "address: 0x0842", "address: 0x2230"
+    ),
+    "overlapping_schedules": lambda s: s.replace("address: 0x3000", "address: 0x2030"),
+    "same_schedule_twice": lambda s: s.replace("address: 0x2100", "address: 0x2000"),
+    "schedule_address_too_high": lambda s: s.replace(
+        "address: 0x2200", "address: 0xFFD0"
+    ),
+    "schedule_interval_too_long": lambda s: s.replace(
+        "update_interval: 6h", "update_interval: 8d", 1
+    ),
+    "today_and_active_without_time": lambda s: s.replace(
+        "    time_id: ha_time\n", "", 1
+    ),
+    "active_without_time": lambda s: _drop_first(
+        _drop_first(s, "    time_id: ha_time\n"),
+        '    today:\n      name: "Radiateurs - Programmation du jour"\n',
+    ),
+    "data_type_on_schedule": lambda s: s.replace(
+        "address: 0x2000", "address: 0x2000\n    data_type: uint8"
+    ),
+    "length_on_schedule": lambda s: s.replace(
+        "address: 0x2000", "address: 0x2000\n    length: 8"
+    ),
+    "unknown_day_key": lambda s: s.replace(
+        "address: 0x2000", 'address: 0x2000\n    lundi:\n      name: "Lundi"'
+    ),
 }
+
+
+def _drop_first(text, fragment):
+    assert fragment in text, fragment
+    return text.replace(fragment, "", 1)
 
 
 @pytest.mark.parametrize("case", sorted(INVALID_CASES))
@@ -119,6 +158,96 @@ def test_v01_config_still_valid_and_defaults_to_int16(repo_root, tmp_path):
 def test_v01_fixture_matches_released_example(repo_root):
     text = (repo_root / EXAMPLE_V01).read_text(encoding="utf-8")
     assert text.startswith("# VissLink v0.1")
+
+
+# --- Compatibilité v0.2 --------------------------------------------------
+
+
+def test_v02_config_still_valid(repo_root, tmp_path):
+    result = _run_config(repo_root, tmp_path, example=EXAMPLE_V02)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    text = (repo_root / EXAMPLE_V02).read_text(encoding="utf-8")
+    assert text.startswith("# VissLink v0.2 ")
+    assert "text_sensor:" not in text
+
+
+# --- Programmations horaires (v0.2.1) ----------------------------------------
+
+SCHEDULES = (0x2000, 0x3000, 0x2100, 0x2200)
+
+
+def test_example_declares_four_schedules(repo_root, tmp_path):
+    result = _run_config(repo_root, tmp_path)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    shown = {int(a, 16) for a in re.findall(r"address: (0x[0-9a-fA-F]+)", out)}
+    for address in SCHEDULES:
+        assert address in shown, hex(address)
+    assert out.count("update_interval: 6h") == 4, out
+
+
+def _minimal_schedule(text):
+    """Remplace les programmations de l'exemple par une seule, minimale."""
+    head, _, _ = text.partition("\ntext_sensor:\n")
+    return (
+        head
+        + "\ntext_sensor:\n"
+        + "  - platform: visslink\n"
+        + '    name: "Radiateurs - Programmation"\n'
+        + "    address: 0x2000\n"
+    )
+
+
+def test_minimal_schedule_defaults_to_6h_without_clock(repo_root, tmp_path):
+    result = _run_config(repo_root, tmp_path, _minimal_schedule)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "update_interval: 6h" in out, out
+
+
+def test_schedule_day_sensors_are_accepted(repo_root, tmp_path):
+    days = (
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+    )
+
+    def transform(text):
+        text = _minimal_schedule(text)
+        return text + "".join(
+            f'    {day}:\n      name: "Radiateurs - {day}"\n' for day in days
+        )
+
+    result = _run_config(repo_root, tmp_path, transform)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    for day in days:
+        assert f"Radiateurs - {day}" in out, day
+
+
+def test_schedule_last_valid_address(repo_root, tmp_path):
+    # 0xFFC8 + 6 x 8 + 7 = 0xFFFF : le dimanche tient encore sur 16 bits.
+    result = _run_config(
+        repo_root,
+        tmp_path,
+        lambda s: s.replace("address: 0x2200", "address: 0xFFC8"),
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_schedule_next_to_another_register_is_accepted(repo_root, tmp_path):
+    # 0x2038 suit immédiatement le dimanche de 0x2000 (0x2030-0x2037).
+    result = _run_config(
+        repo_root,
+        tmp_path,
+        lambda s: s.replace("address: 0x0804", "address: 0x2038"),
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 # --- Types de données ------------------------------------------------------

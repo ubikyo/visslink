@@ -1,4 +1,4 @@
-# VissLink v0.2 — Viessmann Vitotronic 300 KW3 via Optolink (lecture seule)
+# VissLink v0.2.1 — Viessmann Vitotronic 300 KW3 via Optolink (lecture seule)
 # Matériel : Wemos D1 mini (ESP8266) + interface infrarouge Optolink.
 #
 # Les identifiants sont lus dans secrets.yaml (non versionné), voir
@@ -10,7 +10,9 @@
 #
 # Charge : ~7 lectures/min ici, ~13 avec les registres expérimentaux. Une
 # lecture prend ~2 à 3 s (attente du 0x05), soit 20 à 30 lectures/min au plus :
-# garder une marge en ajoutant des registres.
+# garder une marge en ajoutant des registres. Les programmations horaires
+# ajoutent 28 lectures toutes les 6 h, étalées sur ~4 min (une lecture par
+# circuit toutes les ~30 s).
 
 esphome:
   name: iot-viessmann
@@ -60,6 +62,12 @@ uart:
   data_bits: 8
   parity: EVEN
   stop_bits: 2
+
+# Heure locale fournie par Home Assistant : jour courant et plage active des
+# programmations horaires. Sans synchronisation, ces états restent inconnus.
+time:
+  - platform: homeassistant
+    id: ha_time
 
 visslink:
   uart_id: optolink_uart
@@ -250,3 +258,51 @@ binary_sensor:
   #   address: 0x3906
   #   update_interval: 60s
   #   device_class: running
+
+# --- Programmations horaires (lecture seule) ---------------------------------
+# `address` est celle du lundi ; les 7 jours sont lus à address + 8 × jour.
+# État principal : la semaine, jours identiques regroupés
+#   "Lu-Ve 06:00-22:00 | Sa-Di 07:00-23:00"
+# `today` : programmation du jour. `active` : une plage programmée est en cours
+# (n'indique PAS que le brûleur ou une pompe fonctionne réellement).
+# Option : `monday:` ... `sunday:` (un capteur texte par jour, cf. README).
+text_sensor:
+  - platform: visslink
+    name: "Radiateurs - Programmation"
+    address: 0x2000
+    update_interval: 6h
+    time_id: ha_time
+    today:
+      name: "Radiateurs - Programmation du jour"
+    active:
+      name: "Radiateurs - Plage active"
+
+  - platform: visslink
+    name: "Plancher - Programmation"
+    address: 0x3000
+    update_interval: 6h
+    time_id: ha_time
+    today:
+      name: "Plancher - Programmation du jour"
+    active:
+      name: "Plancher - Plage active"
+
+  - platform: visslink
+    name: "ECS - Programmation"
+    address: 0x2100
+    update_interval: 6h
+    time_id: ha_time
+    today:
+      name: "ECS - Programmation du jour"
+    active:
+      name: "ECS - Plage active"
+
+  - platform: visslink
+    name: "Bouclage ECS - Programmation"
+    address: 0x2200
+    update_interval: 6h
+    time_id: ha_time
+    today:
+      name: "Bouclage ECS - Programmation du jour"
+    active:
+      name: "Bouclage ECS - Plage active"

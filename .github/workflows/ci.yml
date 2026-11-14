@@ -24,6 +24,6 @@ jobs:
       - name: Compile firmware (d1_mini)
         # `make compile` génère des secrets fictifs, uniquement pour la compilation.
         run: make compile
-      - name: Validate and compile v0.1 YAML (backward compatibility)
-        # YAML de la v0.1.0 inchangé (tests/fixtures), sans binary_sensor.
-        run: make compat-v01
+      - name: Validate and compile v0.1 and v0.2 YAML (backward compatibility)
+        # YAML de la v0.1.0 et de la v0.2 inchangés (tests/fixtures).
+        run: make compat

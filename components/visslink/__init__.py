@@ -1,6 +1,8 @@
 """VissLink : communication Optolink (protocole KW, lecture seule) avec une
 régulation Viessmann Vitotronic."""
 
+from collections import Counter
+
 import esphome.codegen as cg
 import esphome.config_validation as cv
 import esphome.final_validate as fv
@@ -27,46 +29,72 @@ VissLinkRegister = visslink_ns.class_("VissLinkRegister")
 
 # Plateformes partageant le même ordonnanceur (et donc le même espace
 # d'adresses : un registre n'est lu qu'une fois, quelle que soit la plateforme).
-REGISTER_DOMAINS = ("sensor", "binary_sensor")
+REGISTER_DOMAINS = ("sensor", "binary_sensor", "text_sensor")
+
+# Programmation horaire (text_sensor) : 7 blocs de 8 octets à partir du lundi.
+SCHEDULE_DAYS = 7
+SCHEDULE_DAY_STRIDE = 8
+
+
+# Fréquence cible propre au registre. Plafond de 7 jours : les calculs
+# d'échéance restent ainsi sûrs lors du débordement de millis().
+UPDATE_INTERVAL_VALIDATOR = cv.All(
+    cv.positive_time_period_milliseconds,
+    cv.Range(min=cv.TimePeriod(seconds=1), max=cv.TimePeriod(days=7)),
+)
 
 # Champs communs à toutes les plateformes.
 REGISTER_SCHEMA = cv.Schema(
     {
         cv.GenerateID(CONF_VISSLINK_ID): cv.use_id(VissLinkComponent),
         cv.Required(CONF_ADDRESS): cv.hex_uint16_t,
-        # Fréquence cible propre au registre. Plafond de 7 jours : les calculs
-        # d'échéance restent ainsi sûrs lors du débordement de millis().
-        cv.Optional(CONF_UPDATE_INTERVAL, default="60s"): cv.All(
-            cv.positive_time_period_milliseconds,
-            cv.Range(min=cv.TimePeriod(seconds=1), max=cv.TimePeriod(days=7)),
-        ),
+        cv.Optional(CONF_UPDATE_INTERVAL, default="60s"): UPDATE_INTERVAL_VALIDATOR,
     }
 )
 
 
-def validate_unique_address(config):
-    """Refuse deux entités visslink sur le même registre, toutes plateformes
-    confondues : ce serait une requête dupliquée."""
-    full_config = fv.full_config.get()
-    same = [
-        conf
-        for domain in REGISTER_DOMAINS
-        for conf in full_config.get(domain, [])
-        if conf.get(CONF_PLATFORM) == "visslink"
-        and conf.get(CONF_VISSLINK_ID) == config[CONF_VISSLINK_ID]
-        and conf.get(CONF_ADDRESS) == config[CONF_ADDRESS]
-    ]
-    if len(same) > 1:
-        raise cv.Invalid(
-            f"Register 0x{config[CONF_ADDRESS]:04X} is declared by several "
-            "visslink entities; declare it only once",
-            path=[CONF_ADDRESS],
+def register_addresses(domain, config):
+    """Adresses des blocs lus par une entité."""
+    address = config[CONF_ADDRESS]
+    if domain == "text_sensor":
+        return [address + SCHEDULE_DAY_STRIDE * day for day in range(SCHEDULE_DAYS)]
+    return [address]
+
+
+def unique_address_validator(domain):
+    """Refuse deux entités visslink lisant le même bloc, toutes plateformes
+    confondues : ce serait une requête dupliquée. Les 7 blocs d'une
+    programmation comptent chacun."""
+
+    def validator(config):
+        full_config = fv.full_config.get()
+        mine = set(register_addresses(domain, config))
+        readers = Counter(
+            address
+            for other in REGISTER_DOMAINS
+            for conf in full_config.get(other, [])
+            if conf.get(CONF_PLATFORM) == "visslink"
+            and conf.get(CONF_VISSLINK_ID) == config[CONF_VISSLINK_ID]
+            for address in register_addresses(other, conf)
         )
-    return config
+        shared = sorted(a for a in mine if readers[a] > 1)
+        if shared:
+            raise cv.Invalid(
+                f"Register 0x{shared[0]:04X} is declared by several "
+                "visslink entities; declare it only once",
+                path=[CONF_ADDRESS],
+            )
+        return config
+
+    return validator
+
+
+validate_unique_address = unique_address_validator("sensor")
 
 
 async def register_register(var, config):
-    """Paramètres communs + inscription auprès de l'ordonnanceur."""
+    """Paramètres communs + inscription auprès de l'ordonnanceur (le nombre
+    de blocs est fourni par la classe C++)."""
     parent = await cg.get_variable(config[CONF_VISSLINK_ID])
     cg.add(var.set_address(config[CONF_ADDRESS]))
     cg.add(var.set_interval(config[CONF_UPDATE_INTERVAL]))
