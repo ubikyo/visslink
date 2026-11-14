@@ -16,3 +16,17 @@ build/
 .DS_Store
 .vscode/*
 !.vscode/extensions.json
+
+# ESPHome
+secrets.yaml
+.esphome/
+**/.esphome/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Tests C++
+tests/cpp/build/

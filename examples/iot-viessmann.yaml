@@ -1,0 +1,93 @@
+# VissLink v0.1 — Viessmann Vitotronic 300 KW3 via Optolink (lecture seule)
+# Matériel : Wemos D1 mini (ESP8266) + interface infrarouge Optolink.
+#
+# Les identifiants sont lus dans secrets.yaml (non versionné), voir
+# secrets.yaml.example.
+
+esphome:
+  name: iot-viessmann
+  friendly_name: Chaudière Viessmann
+
+esp8266:
+  board: d1_mini
+
+external_components:
+  # Dépôt local (développement). Pour utiliser la version publiée :
+  #   - source: github://ubikyo/visslink
+  #     components: [visslink]
+  - source:
+      type: local
+      path: ../components
+    components: [visslink]
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "iot-viessmann Fallback"
+    password: !secret fallback_ap_password
+
+captive_portal:
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    # Chiffrement OTA avec la clé de l'API (recommandé par ESPHome 2026.10).
+    encryption: {}
+
+# L'UART matériel (GPIO1/GPIO3) est réservé à l'Optolink :
+# les journaux passent uniquement par l'API / le réseau.
+logger:
+  level: DEBUG
+  baud_rate: 0
+
+uart:
+  id: optolink_uart
+  tx_pin: GPIO1
+  rx_pin: GPIO3
+  baud_rate: 4800
+  data_bits: 8
+  parity: EVEN
+  stop_bits: 2
+
+visslink:
+  id: chaudiere
+  uart_id: optolink_uart
+  # Valeurs par défaut, affichées pour référence :
+  sync_timeout: 10s       # attente maximale du caractère de synchro 0x05
+  response_timeout: 1s    # attente maximale de la réponse après la requête
+  max_retries: 2          # nouvelles tentatives avant d'abandonner le cycle
+
+sensor:
+  - platform: visslink
+    name: "Température extérieure"
+    address: 0x0800
+    length: 2
+    update_interval: 60s
+    unit_of_measurement: "°C"
+    device_class: temperature
+    filters:
+      - multiply: 0.1
+
+  - platform: visslink
+    name: "Température chaudière"
+    address: 0x0802
+    length: 2
+    update_interval: 30s
+    unit_of_measurement: "°C"
+    device_class: temperature
+    filters:
+      - multiply: 0.1
+
+  - platform: visslink
+    name: "Température ECS"
+    address: 0x0804
+    length: 2
+    update_interval: 60s
+    unit_of_measurement: "°C"
+    device_class: temperature
+    filters:
+      - multiply: 0.1
