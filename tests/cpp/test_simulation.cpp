@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <map>
+#include <memory>
 
 #include "decode.h"
 #include "kw_protocol.h"
@@ -664,4 +665,132 @@ TEST(sim_v021_coexists_with_all_v02_registers) {
   CHECK(b.max_gap_ms[v.burner] <= ref.max_gap_ms[ref_v.burner] + 1 * S);
   for (size_t i : {c.a1, c.m2, c.dhw, c.loop})
     CHECK(b.weeks[i].all_known());
+}
+
+// --- v0.2.2 : configuration de diagnostic -----------------------------------
+
+namespace {
+
+/// examples/iot-viessmann-diagnostic.yaml, dans l'ordre d'inscription du
+/// firmware (sensor, dont les six registres TEST, puis binary_sensor, puis
+/// text_sensor) : le brûleur reçoit sa première échéance après les TEST.
+/// `group` : 0 = les six registres TEST, 1 = G1 (ECS), 2 = G2 (circulateurs),
+/// 3 = G3 (défaut + consigne), -1 = aucun (exemple v0.2.1, référence).
+struct DiagnosticExample {
+  size_t outdoor, burner;
+  std::vector<size_t> tests;
+  std::vector<uint32_t> intervals;
+  std::unique_ptr<Circuits> circuits;
+
+  DiagnosticExample(Bench &b, int group) {
+    auto &r = b.boiler.registers;
+    r[0x0842] = {0x01};
+    r[0x0846] = {0x01};
+    r[0x0845] = {0x00};
+    r[0x2906] = {0x01};
+    r[0x3906] = {0x02};  // valeur hors 0/1 : publiée telle quelle
+    r[0x0883] = {0x00};
+    r[0x5502] = {0x4A, 0x02};
+    outdoor = b.add(0x0800, 60 * S, 0);
+    b.add(0x0802, 60 * S, 0);
+    b.add(0x0804, 60 * S, 0);
+    b.add(0x3900, 60 * S, 0);
+    for (uint16_t a : {0x2306, 0x2307, 0x3306, 0x3307, 0x6300})
+      b.add(a, 5 * MIN, 0, DataType::UINT8, 1);
+    b.add(0x088A, H, 0, DataType::UINT32, 1);
+    b.add(0x08A7, H, 0, DataType::UINT32, 1);
+    if (group == 0 || group == 1) {
+      test(b, 0x0846, 60 * S, DataType::UINT8);
+      test(b, 0x0845, 60 * S, DataType::UINT8);
+    }
+    if (group == 0 || group == 2) {
+      test(b, 0x2906, 2 * MIN, DataType::UINT8);
+      test(b, 0x3906, 2 * MIN, DataType::UINT8);
+    }
+    if (group == 0 || group == 3) {
+      test(b, 0x0883, 5 * MIN, DataType::UINT8);
+      test(b, 0x5502, 2 * MIN, DataType::INT16);
+    }
+    burner = b.add_binary(0x0842, 30 * S, 0);
+    circuits = std::make_unique<Circuits>(b, 0);
+  }
+
+  void test(Bench &b, uint16_t address, uint32_t interval, DataType type) {
+    tests.push_back(b.add(address, interval, 0, type, 1));
+    intervals.push_back(interval);
+  }
+};
+
+/// 6 h 30 (démarrage + un rafraîchissement des programmations) ; écarts
+/// mesurés en régime établi, après 10 min.
+void run_diagnostic(Bench &b) {
+  b.run(0, 10 * MIN);
+  b.max_gap_ms.clear();
+  b.run(10 * MIN, 6 * H + 20 * MIN);
+}
+
+}  // namespace
+
+TEST(sim_v022_diagnostic_config_load) {
+  // Exemple v0.2.1 + les six registres TEST, resynchro de 2 à 4 s.
+  // Référence : l'exemple v0.2.1 seul (780 lectures du brûleur en 6 h 30).
+  for (uint32_t post : {2000u, 2500u, 3000u, 3500u, 4000u}) {
+    Bench ref, b;
+    ref.boiler.post_response_delay_ms = b.boiler.post_response_delay_ms = post;
+    DiagnosticExample r(ref, -1);
+    DiagnosticExample d(b, 0);
+    run_diagnostic(ref);
+    run_diagnostic(b);
+
+    CHECK(b.failures.empty());
+    CHECK_EQ(b.boiler.requests, b.total_successes());  // aucune requête en double
+    for (size_t i : {d.circuits->a1, d.circuits->m2, d.circuits->dhw, d.circuits->loop})
+      CHECK_EQ(b.successes[i], 14);  // 28 lectures horaires à t = 0 et t = 6 h
+    for (size_t k = 0; k < d.tests.size(); k++)
+      CHECK(b.max_gap_ms[d.tests[k]] <= 2 * d.intervals[k]);  // jamais deux cycles perdus
+    CHECK(b.max_gap_ms[d.outdoor] <= 95 * S);                  // 60 s : jamais deux cycles perdus
+    const int lost = ref.successes[r.burner] - b.successes[d.burner];
+    if (post <= 3000) {
+      // Seule la première lecture, décalée de 12 s au démarrage, peut manquer.
+      CHECK(lost <= 1);
+      CHECK(b.max_gap_ms[d.burner] <= ref.max_gap_ms[r.burner] + 5 * S);
+    } else {
+      // 3,5 à 4 s : quelques lectures retardées (relevé : 4 puis 11 sur 780).
+      CHECK(lost <= 12);
+      CHECK(b.max_gap_ms[d.burner] <= 65 * S);
+    }
+    if (vltest::failures() > 0)
+      std::printf("    post=%u burner %d/%d gap %u ms (ref %u ms)\n", static_cast<unsigned>(post),
+                  b.successes[d.burner], ref.successes[r.burner], static_cast<unsigned>(b.max_gap_ms[d.burner]),
+                  static_cast<unsigned>(ref.max_gap_ms[r.burner]));
+  }
+  // Valeurs brutes : aucune conversion (0x02 reste 2, 0x5502 reste 586).
+  Bench b;
+  DiagnosticExample d(b, 0);
+  b.run(0, 10 * MIN);
+  CHECK_EQ(b.last_value[d.tests[3]], 2);
+  CHECK_EQ(b.last_value[d.tests[5]], 586);
+}
+
+TEST(sim_v022_diagnostic_groups_of_two_at_4s) {
+  // Stratégie de repli si la resynchro réelle approche 4 s : un groupe de
+  // deux registres à la fois.
+  for (int group : {1, 2, 3}) {
+    Bench ref, b;
+    ref.boiler.post_response_delay_ms = b.boiler.post_response_delay_ms = 4000;
+    DiagnosticExample r(ref, -1);
+    DiagnosticExample d(b, group);
+    run_diagnostic(ref);
+    run_diagnostic(b);
+    CHECK(b.failures.empty());
+    CHECK_EQ(b.boiler.requests, b.total_successes());
+    CHECK(ref.successes[r.burner] - b.successes[d.burner] <= 1);
+    CHECK(b.max_gap_ms[d.burner] <= ref.max_gap_ms[r.burner] + 5 * S);
+    for (size_t i : {d.circuits->a1, d.circuits->m2, d.circuits->dhw, d.circuits->loop})
+      CHECK_EQ(b.successes[i], 14);
+    if (vltest::failures() > 0)
+      std::printf("    group=%d burner %d/%d gap %u ms (ref %u ms)\n", group, b.successes[d.burner],
+                ref.successes[r.burner], static_cast<unsigned>(b.max_gap_ms[d.burner]),
+                static_cast<unsigned>(ref.max_gap_ms[r.burner]));
+  }
 }

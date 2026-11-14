@@ -77,7 +77,15 @@ inattendu signale un registre mal identifié ou un octet d'état multi-bits.
    les valeurs `00` et `01` apparaissent et qu'elles suivent le fonctionnement
    réel de l'installation.
 
-Les registres expérimentaux de l'exemple sont en commentaire.
+Les registres expérimentaux de l'exemple sont en commentaire. Pour les six
+registres encore à identifier (`0x0846`, `0x0845`, `0x2906`, `0x3906`,
+`0x0883`, `0x5502`), la configuration
+[examples/iot-viessmann-diagnostic.yaml](examples/iot-viessmann-diagnostic.yaml)
+les lit en valeurs brutes. Le statut de chaque registre, les procédures de
+validation et la charge de la liaison sont décrits dans
+[docs/registres.md](docs/registres.md). Validation recommandée : un groupe de
+deux registres à la fois (G1 ECS `0x0846`/`0x0845`, G2 circulateurs
+`0x2906`/`0x3906`, G3 défaut et consigne `0x0883`/`0x5502`).
 
 ### `text_sensor` : programmations horaires
 
@@ -119,14 +127,17 @@ semaine partielle.
 
 | Circuit | Lundi | Dimanche | Statut |
 |---|---|---|---|
-| Radiateurs A1 | `0x2000` | `0x2030` | lundi confirmé |
-| Plancher chauffant M2 | `0x3000` | `0x3030` | lundi confirmé |
-| Production ECS | `0x2100` | `0x2130` | lundi confirmé |
-| Bouclage ECS | `0x2200` | `0x2230` | lundi confirmé |
+| Radiateurs A1 | `0x2000` | `0x2030` | 7 blocs lus et décodés |
+| Plancher chauffant M2 | `0x3000` | `0x3030` | 7 blocs lus et décodés |
+| Production ECS | `0x2100` | `0x2130` | 7 blocs lus et décodés |
+| Bouclage ECS | `0x2200` | `0x2230` | 7 blocs lus et décodés |
 
 Adresse d'un jour : `adresse_lundi + 8 × jour` (lundi = 0 … dimanche = 6).
-**Seuls les blocs du lundi ont été confirmés sur la chaudière** ; la
-progression des six autres jours reste à vérifier (voir ci-dessous).
+Sur la chaudière réelle, les **sept blocs** des quatre circuits sont lus et
+décodés correctement (trames bien cadrées, plages valides). La correspondance
+de chaque bloc avec son jour (`+ 8 × jour`) n'a en revanche **pas été vérifiée
+jour par jour** : seul le bloc du lundi a été comparé individuellement à la
+régulation (voir ci-dessous).
 
 #### Format d'un bloc (8 octets)
 
@@ -187,9 +198,12 @@ pas de `device_class: running` par défaut.
 - La valeur `0xC0` (24:00) est acceptée en fin de plage d'après la règle de
   codage ; elle n'a pas été observée sur cette chaudière.
 
-#### Vérifier les six autres jours
+#### Vérifier la correspondance des jours
 
-1. Flasher, puis lire dans les journaux DEBUG les trames brutes, par exemple
+La lecture et le décodage des sept blocs sont acquis. Reste à vérifier, si
+besoin, que chaque bloc correspond bien au jour attendu :
+
+1. Lire dans les journaux DEBUG les trames brutes, par exemple
    `0x2008 <- 30 B0 FF FF FF FF FF FF` pour le mardi d'A1.
 2. Modifier temporairement une plage d'un seul jour sur la régulation (par
    exemple le jeudi d'A1) et vérifier que seul le bloc attendu (`0x2018`)
@@ -251,6 +265,9 @@ make compat       # YAML v0.1.0 et v0.2 inchangés : validation + compilation
 
 ## Historique
 
+- **v0.2.2** : configuration de diagnostic des registres expérimentaux
+  (valeurs brutes, lecture seule), procédures de validation et simulation de
+  charge ([docs/registres.md](docs/registres.md)). Composant inchangé.
 - **v0.2.1** : programmations horaires en lecture seule (`text_sensor`), jour
   courant et plage active calculés sur l'ESP, ordonnanceur multi-blocs.
 - **v0.2** : types numériques (`uint8`, `int16`, `uint16`, `uint32`) et

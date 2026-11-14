@@ -16,6 +16,8 @@ EXAMPLE = "examples/iot-viessmann.yaml"
 # valides sans modification.
 EXAMPLE_V01 = "tests/fixtures/iot-viessmann-v0.1.yaml"
 EXAMPLE_V02 = "tests/fixtures/iot-viessmann-v0.2.yaml"
+# v0.2.2 : configuration de diagnostic (exemple + six registres TEST bruts).
+DIAGNOSTIC = "examples/iot-viessmann-diagnostic.yaml"
 
 
 def _secrets() -> str:
@@ -320,3 +322,49 @@ def test_raw_check_and_binary_on_same_register_is_rejected(repo_root, tmp_path):
     out = result.stdout + result.stderr
     assert result.returncode != 0, out
     assert "0x0846" in out, out
+
+
+# --- Configuration de diagnostic (v0.2.2) -------------------------------------
+
+EXPERIMENTAL = {
+    0x0846: "uint8",
+    0x0845: "uint8",
+    0x2906: "uint8",
+    0x3906: "uint8",
+    0x0883: "uint8",
+    0x5502: "int16",
+}
+_TEST_ENTRY = re.compile(
+    r'  - platform: visslink\n    name: "TEST [^\n]*\n(    [^\n]*\n)*'
+)
+
+
+def _active_lines(text):
+    lines = (line for line in text.splitlines() if line.strip())
+    return "\n".join(line for line in lines if not line.lstrip().startswith("#"))
+
+
+def test_diagnostic_config_reads_experimental_registers_raw(repo_root, tmp_path):
+    result = _run_config(repo_root, tmp_path, example=DIAGNOSTIC)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    entries = re.findall(
+        r"name: TEST [^\n]*\n((?:    [^\n]*\n)*)", out
+    )  # sortie de `esphome config` : une entrée par capteur TEST
+    assert len(entries) == len(EXPERIMENTAL), out
+    seen = {}
+    for entry in entries:
+        address = int(re.search(r"address: (0x[0-9a-fA-F]+)", entry).group(1), 16)
+        seen[address] = re.search(r"data_type: (\w+)", entry).group(1)
+        assert "entity_category: diagnostic" in entry, entry
+        assert "filters" not in entry and "unit_of_measurement" not in entry, entry
+    assert seen == EXPERIMENTAL
+
+
+def test_diagnostic_config_is_the_example_plus_test_sensors(repo_root):
+    # Même nœud, mêmes Wi-Fi / API / OTA / UART / registres : seules les six
+    # entrées TEST (et les commentaires) diffèrent.
+    example = (repo_root / EXAMPLE).read_text(encoding="utf-8")
+    diagnostic = (repo_root / DIAGNOSTIC).read_text(encoding="utf-8")
+    assert len(_TEST_ENTRY.findall(diagnostic)) == len(EXPERIMENTAL)
+    assert _active_lines(_TEST_ENTRY.sub("", diagnostic)) == _active_lines(example)
