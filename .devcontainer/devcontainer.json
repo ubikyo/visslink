@@ -1,0 +1,26 @@
+
+{
+  "name": "VissLink Dev",
+
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+
+  "remoteUser": "vscode",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-vscode.cpptools",
+        "redhat.vscode-yaml",
+        "charliermarsh.ruff",
+        "eamodio.gitlens"
+      ]
+    }
+  },
+  
+  "features": {
+    "ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {}
+  }
+}
