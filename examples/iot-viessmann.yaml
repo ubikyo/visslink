@@ -54,7 +54,6 @@ uart:
   stop_bits: 2
 
 visslink:
-  id: chaudiere
   uart_id: optolink_uart
   # Valeurs par défaut, affichées pour référence :
   sync_timeout: 10s       # attente maximale du caractère de synchro 0x05
@@ -65,7 +64,6 @@ sensor:
   - platform: visslink
     name: "Température extérieure"
     address: 0x0800
-    length: 2
     update_interval: 60s
     unit_of_measurement: "°C"
     device_class: temperature
@@ -75,7 +73,6 @@ sensor:
   - platform: visslink
     name: "Température chaudière"
     address: 0x0802
-    length: 2
     update_interval: 30s
     unit_of_measurement: "°C"
     device_class: temperature
@@ -85,7 +82,6 @@ sensor:
   - platform: visslink
     name: "Température ECS"
     address: 0x0804
-    length: 2
     update_interval: 60s
     unit_of_measurement: "°C"
     device_class: temperature

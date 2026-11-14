@@ -1,4 +1,5 @@
-"""Plateforme `sensor` : un capteur par registre, avec son propre intervalle."""
+"""Plateforme `sensor` : un registre de température (int16 signé, 2 octets)
+par capteur, avec son propre intervalle de lecture."""
 
 import esphome.codegen as cg
 import esphome.config_validation as cv
@@ -6,7 +7,6 @@ import esphome.final_validate as fv
 from esphome.components import sensor
 from esphome.const import (
     CONF_ADDRESS,
-    CONF_LENGTH,
     CONF_PLATFORM,
     CONF_UPDATE_INTERVAL,
     STATE_CLASS_MEASUREMENT,
@@ -15,8 +15,6 @@ from esphome.const import (
 from . import CONF_VISSLINK_ID, VissLinkComponent, visslink_ns
 
 DEPENDENCIES = ["visslink"]
-
-CONF_SIGNED = "signed"
 
 VissLinkSensor = visslink_ns.class_("VissLinkSensor", sensor.Sensor)
 
@@ -28,8 +26,6 @@ CONFIG_SCHEMA = sensor.sensor_schema(
     {
         cv.GenerateID(CONF_VISSLINK_ID): cv.use_id(VissLinkComponent),
         cv.Required(CONF_ADDRESS): cv.hex_uint16_t,
-        cv.Optional(CONF_LENGTH, default=2): cv.one_of(1, 2, 4, int=True),
-        cv.Optional(CONF_SIGNED, default=True): cv.boolean,
         # Fréquence cible propre au registre. Plafond de 7 jours : les calculs
         # d'échéance restent ainsi sûrs lors du débordement de millis().
         cv.Optional(CONF_UPDATE_INTERVAL, default="60s"): cv.All(
@@ -66,7 +62,5 @@ async def to_code(config):
     var = await sensor.new_sensor(config)
     parent = await cg.get_variable(config[CONF_VISSLINK_ID])
     cg.add(var.set_address(config[CONF_ADDRESS]))
-    cg.add(var.set_length(config[CONF_LENGTH]))
-    cg.add(var.set_signed(config[CONF_SIGNED]))
     cg.add(var.set_interval(config[CONF_UPDATE_INTERVAL]))
     cg.add(parent.register_sensor(var))

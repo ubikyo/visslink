@@ -57,7 +57,10 @@ INVALID_CASES = {
     "wrong_baud_rate": lambda s: s.replace("baud_rate: 4800", "baud_rate: 9600"),
     "wrong_parity": lambda s: s.replace("parity: EVEN", "parity: NONE"),
     "wrong_stop_bits": lambda s: s.replace("stop_bits: 2", "stop_bits: 1"),
-    "unsupported_length": lambda s: s.replace("length: 2", "length: 3", 1),
+    # Option retirée : le capteur lit toujours un int16 de 2 octets.
+    "unknown_length_option": lambda s: s.replace(
+        "address: 0x0800", "address: 0x0800\n    length: 2"
+    ),
     "interval_too_short": lambda s: s.replace(
         "update_interval: 60s", "update_interval: 500ms", 1
     ),

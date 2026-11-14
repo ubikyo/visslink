@@ -1,74 +1,93 @@
 #pragma once
 
-// Ordonnanceur de lectures : chaque registre a son propre intervalle.
+// Ordonnanceur des lectures : un intervalle par registre, une lecture à la fois.
 //
 // Indépendant d'ESPHome (temps passé en paramètre) pour être testé sur PC.
 //
-// Règles :
-//  - une seule lecture en cours à la fois (aucun doublon possible) ;
-//  - parmi les registres échus, le plus en retard passe en premier, à
-//    égalité l'ordre de déclaration décide : un registre échu attend au plus
-//    N-1 transactions, il ne peut pas être repoussé indéfiniment ;
-//  - pas de rattrapage : si la chaudière est lente et qu'un cycle entier a
-//    été manqué, l'échéance suivante repart de l'instant présent au lieu
-//    d'empiler des lectures en retard ;
-//  - un échec est retenté au plus `max_retries` fois, puis le registre est
-//    replanifié à l'intervalle normal (il ne bloque pas les autres).
+//  - acquire() ne délivre rien tant qu'une lecture est en cours : aucun doublon,
+//    aucune accumulation ;
+//  - le registre le plus en retard passe en premier, à égalité le premier
+//    déclaré : un registre échu attend au plus N-1 lectures ;
+//  - l'échéance suivante vaut échéance + intervalle (pas de dérive), sauf si
+//    elle est déjà dépassée : elle repart alors de maintenant (pas de
+//    rattrapage) ;
+//  - un échec est retenté après RETRY_DELAY_MS, au plus max_retries fois, puis
+//    le registre attend son intervalle normal.
 
 #include <cstddef>
 #include <cstdint>
 #include <vector>
 
+#include "time_utils.h"
+
 namespace esphome {
 namespace visslink {
-
-struct RegisterSlot {
-  uint16_t address{0};
-  uint8_t length{0};
-  uint32_t interval_ms{0};
-
-  uint32_t cycle_due_ms{0};  ///< échéance nominale du cycle en cours
-  uint32_t next_due_ms{0};   ///< prochaine tentative (cycle ou nouvelle tentative)
-  uint32_t last_success_ms{0};
-  bool has_succeeded{false};
-  bool in_flight{false};
-  uint8_t failures{0};  ///< échecs consécutifs dans le cycle en cours
-};
 
 class RegisterScheduler {
  public:
   static constexpr int NONE = -1;
+  static constexpr uint32_t RETRY_DELAY_MS = 1000;
 
-  void reserve(size_t count) { this->slots_.reserve(count); }
-  /// Ajoute un registre et renvoie son index. À appeler pendant setup().
-  size_t add(uint16_t address, uint8_t length, uint32_t interval_ms);
+  struct Entry {
+    uint32_t interval_ms;
+    uint32_t due_ms;   ///< prochaine tentative
+    uint8_t failures;  ///< échecs consécutifs dans le cycle en cours
+  };
 
   void set_max_retries(uint8_t max_retries) { this->max_retries_ = max_retries; }
-  void set_retry_delay(uint32_t retry_delay_ms) { this->retry_delay_ms_ = retry_delay_ms; }
-
-  /// Rend tous les registres échus immédiatement.
-  void start(uint32_t now);
-
-  /// Renvoie l'index du registre à lire maintenant, ou NONE. Le registre
-  /// renvoyé est marqué « en cours » jusqu'à on_success()/on_failure().
-  int acquire_next(uint32_t now);
-
-  void on_success(size_t index, uint32_t now);
-  /// Renvoie true si les nouvelles tentatives sont épuisées pour ce cycle.
-  bool on_failure(size_t index, uint32_t now);
-
   uint8_t max_retries() const { return this->max_retries_; }
-  bool busy() const { return this->in_flight_ != NONE; }
-  size_t size() const { return this->slots_.size(); }
-  const RegisterSlot &slot(size_t index) const { return this->slots_[index]; }
+
+  /// Ajoute un registre, échu immédiatement. À appeler depuis setup() :
+  /// loop() n'alloue jamais.
+  void add(uint32_t interval_ms, uint32_t now) { this->entries_.push_back({interval_ms, now, 0}); }
+
+  /// Index du registre à lire maintenant (marqué en cours), ou NONE.
+  int acquire(uint32_t now) {
+    if (this->current_ != NONE)
+      return NONE;
+    uint32_t best_lateness = 0;
+    for (size_t i = 0; i < this->entries_.size(); i++) {
+      const Entry &e = this->entries_[i];
+      if (!time_reached(now, e.due_ms))
+        continue;
+      const uint32_t lateness = now - e.due_ms;
+      if (this->current_ == NONE || lateness > best_lateness) {
+        this->current_ = static_cast<int>(i);
+        best_lateness = lateness;
+      }
+    }
+    return this->current_;
+  }
+
+  /// Registre en cours de lecture, ou NONE.
+  int current() const { return this->current_; }
+
+  /// Termine la lecture en cours. Renvoie true si c'est un échec définitif
+  /// pour ce cycle (nouvelles tentatives épuisées).
+  bool finish(bool success, uint32_t now) {
+    if (this->current_ == NONE)
+      return false;
+    Entry &e = this->entries_[this->current_];
+    this->current_ = NONE;
+    if (!success && e.failures < this->max_retries_) {
+      e.failures++;
+      e.due_ms = now + RETRY_DELAY_MS;
+      return false;
+    }
+    const bool gave_up = !success;
+    e.failures = 0;
+    e.due_ms += e.interval_ms;
+    if (time_reached(now, e.due_ms))
+      e.due_ms = now + e.interval_ms;
+    return gave_up;
+  }
+
+  const Entry &entry(size_t index) const { return this->entries_[index]; }
 
  protected:
-  void schedule_next_cycle_(RegisterSlot &slot, uint32_t now);
-
-  std::vector<RegisterSlot> slots_;
-  int in_flight_{NONE};
+  std::vector<Entry> entries_;
+  int current_{NONE};
   uint8_t max_retries_{2};
-  uint32_t retry_delay_ms_{1000};
 };
 
 }  // namespace visslink

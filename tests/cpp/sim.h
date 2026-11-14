@@ -6,23 +6,21 @@
 #include <map>
 #include <vector>
 
-#include "kw_protocol.h"
-
 namespace vltest {
 
-/// Port série en mémoire : `rx` = octets émis par la chaudière, `tx` = octets
-/// écrits par VissLink.
-class MockSerial : public esphome::visslink::SerialPort {
+/// Port série en mémoire, mêmes méthodes que uart::UARTDevice.
+/// `rx` = octets émis par la chaudière, `tx` = octets écrits par VissLink.
+class MockSerial {
  public:
-  size_t available() override { return rx.size(); }
-  bool read_byte(uint8_t *byte) override {
+  size_t available() const { return rx.size(); }
+  bool read_byte(uint8_t *byte) {
     if (rx.empty())
       return false;
     *byte = rx.front();
     rx.pop_front();
     return true;
   }
-  void write(const uint8_t *data, size_t length) override {
+  void write_array(const uint8_t *data, size_t length) {
     tx.insert(tx.end(), data, data + length);
     writes++;
   }
@@ -40,7 +38,7 @@ class MockSerial : public esphome::visslink::SerialPort {
 /// Des défauts peuvent être injectés pour éprouver la reprise sur erreur.
 class SimBoiler {
  public:
-  enum class Fault { NONE, NO_RESPONSE, SHORT_RESPONSE, LONG_RESPONSE, TRAILING_SYNC };
+  enum class Fault { NONE, NO_RESPONSE, SHORT_RESPONSE, LONG_RESPONSE };
 
   explicit SimBoiler(MockSerial *serial) : serial_(serial) {}
 
@@ -108,9 +106,6 @@ class SimBoiler {
       case Fault::LONG_RESPONSE:
         data.push_back(0x42);
         data.push_back(0x43);
-        break;
-      case Fault::TRAILING_SYNC:
-        data.push_back(0x05);
         break;
       case Fault::NONE:
         break;
