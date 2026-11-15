@@ -16,6 +16,10 @@ v0.3 : `type: operating_mode` (le défaut reste `schedule`) affiche en texte,
 en lecture seule stricte, le programme de fonctionnement d'un circuit
 (0x2301 ou 0x3301, 1 octet) : « ECS seule » (00), « Chauffage + ECS » (03),
 « Arrêt » (05), « Inconnu » pour toute autre valeur ou un échec de lecture.
+
+v0.5 : `type: vito_clock` affiche, en lecture seule, l'horloge de la
+Vitotronic (0x088E, 8 octets BCD) décodée et vérifiée, pour la comparer à
+l'afficheur avant d'utiliser le bouclage à la demande.
 """
 
 import esphome.codegen as cg
@@ -35,9 +39,11 @@ from . import (
     REGISTER_SCHEMA,
     SCHEDULE_DAY_STRIDE,
     SCHEDULE_DAYS,
+    TEXT_SENSOR_TYPE_CLOCK,
     TEXT_SENSOR_TYPE_MODE,
     TEXT_SENSOR_TYPE_SCHEDULE,
     UPDATE_INTERVAL_VALIDATOR,
+    VITO_CLOCK_ADDRESS,
     VissLinkRegister,
     register_register,
     unique_address_validator,
@@ -63,6 +69,10 @@ VissLinkSchedule = visslink_ns.class_(
 VissLinkModeText = visslink_ns.class_(
     "VissLinkModeText", text_sensor.TextSensor, VissLinkRegister
 )
+VissLinkClockText = visslink_ns.class_(
+    "VissLinkClockText", text_sensor.TextSensor, VissLinkRegister
+)
+ICON_CLOCK = "mdi:clock-outline"
 ICON_MODE = "mdi:radiator"
 ICON_DIVERGENCE = "mdi:call-split"
 
@@ -138,8 +148,39 @@ MODE_SCHEMA = cv.All(
     _validate_mode,
 )
 
+
+def _validate_clock(config):
+    if config[CONF_ADDRESS] != VITO_CLOCK_ADDRESS:
+        raise cv.Invalid(
+            f"The Vitotronic clock is at 0x{VITO_CLOCK_ADDRESS:04X}",
+            path=[CONF_ADDRESS],
+        )
+    return config
+
+
+# Horloge de la Vitotronic, lecture seule (v0.5).
+CLOCK_SCHEMA = cv.All(
+    text_sensor.text_sensor_schema(
+        VissLinkClockText, icon=ICON_CLOCK, entity_category="diagnostic"
+    )
+    .extend(REGISTER_SCHEMA)
+    .extend(
+        {
+            cv.Optional(CONF_ADDRESS, default=VITO_CLOCK_ADDRESS): cv.hex_uint16_t,
+            cv.Optional(
+                CONF_UPDATE_INTERVAL, default="10min"
+            ): UPDATE_INTERVAL_VALIDATOR,
+        }
+    ),
+    _validate_clock,
+)
+
 CONFIG_SCHEMA = cv.typed_schema(
-    {TEXT_SENSOR_TYPE_SCHEDULE: SCHEDULE_SCHEMA, TEXT_SENSOR_TYPE_MODE: MODE_SCHEMA},
+    {
+        TEXT_SENSOR_TYPE_SCHEDULE: SCHEDULE_SCHEMA,
+        TEXT_SENSOR_TYPE_MODE: MODE_SCHEMA,
+        TEXT_SENSOR_TYPE_CLOCK: CLOCK_SCHEMA,
+    },
     default_type=TEXT_SENSOR_TYPE_SCHEDULE,
     lower=True,
 )
@@ -156,6 +197,8 @@ FINAL_VALIDATE_SCHEMA = _final_validate
 async def to_code(config):
     var = await text_sensor.new_text_sensor(config)
     await register_register(var, config)
+    if config[CONF_TYPE] == TEXT_SENSOR_TYPE_CLOCK:
+        return
     if config[CONF_TYPE] == TEXT_SENSOR_TYPE_MODE:
         parent = await cg.get_variable(config[CONF_VISSLINK_ID])
         cg.add(var.set_parent(parent))

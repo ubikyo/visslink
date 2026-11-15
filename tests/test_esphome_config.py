@@ -26,6 +26,8 @@ DIAGNOSTIC_V022 = "tests/fixtures/iot-viessmann-v0.2.2-diagnostic.yaml"
 EXAMPLE_V03 = "tests/fixtures/iot-viessmann-v0.3.yaml"
 # Exemple de la v0.4 (deux select, trois autorisations), tel que publié.
 EXAMPLE_V04 = "tests/fixtures/iot-viessmann-v0.4.yaml"
+# Exemple de la v0.4.1, tel que publié.
+EXAMPLE_V041 = "tests/fixtures/iot-viessmann-v0.4.1.yaml"
 
 
 def _secrets() -> str:
@@ -809,3 +811,211 @@ def test_v04_config_still_valid(repo_root, tmp_path):
     assert text.startswith("# VissLink v0.4 ")
     for flag in ("enable_writes", "enable_mode_writes", "enable_m2_mode_write"):
         assert f"{flag}: false" in out, flag
+
+
+# --- Diagnostic bouclage ECS (lecture seule) ----------------------------------
+
+DIAGNOSTIC_LOOP = "examples/iot-viessmann-diagnostic-bouclage.yaml"
+
+
+def test_loop_diagnostic_is_read_only_and_valid(repo_root, tmp_path):
+    result = _run_config(repo_root, tmp_path, example=DIAGNOSTIC_LOOP)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    for flag in ("enable_writes", "enable_mode_writes", "enable_m2_mode_write"):
+        assert f"{flag}: false" in out, flag
+    assert "ENABLED" not in out
+    # 0x0846 lu en octet brut, programmation du bouclage relue toutes les 10 min.
+    assert re.search(
+        r"name: TEST — Bouclage ECS brut\n(?:    [^\n]*\n)*?    address: 0x846\n", out
+    ), out
+    loop = out.partition("name: Bouclage ECS - Programmation\n")[2]
+    loop = loop.partition("\n  - platform:")[0]
+    assert "update_interval: 10min" in loop, loop
+    for day in (
+        "lundi",
+        "mardi",
+        "mercredi",
+        "jeudi",
+        "vendredi",
+        "samedi",
+        "dimanche",
+    ):
+        assert f"TEST — Bouclage {day}" in loop, day
+
+
+def test_loop_diagnostic_only_adds_read_entities(repo_root):
+    # Mêmes nœud, Wi-Fi, API, OTA, UART, autorisations et entités que
+    # l'exemple v0.4.1 dont il est issu : seuls s'ajoutent le capteur 0x0846,
+    # le détail des 7 jours et l'intervalle de 10 min du bouclage.
+    example = _active_lines((repo_root / EXAMPLE_V041).read_text(encoding="utf-8"))
+    diag = _active_lines((repo_root / DIAGNOSTIC_LOOP).read_text(encoding="utf-8"))
+    removed = [line for line in example.splitlines() if line not in diag.splitlines()]
+    assert removed == [], removed
+    added = [line for line in diag.splitlines() if line not in example.splitlines()]
+    allowed = re.compile(
+        r"^\s+(- platform: visslink|name: \"TEST — Bouclage[^\"]*\"|address: 0x0846|"
+        r"data_type: uint8|update_interval: (60s|10min)|accuracy_decimals: 0|"
+        r"entity_category: diagnostic|(monday|tuesday|wednesday|thursday|friday|"
+        r"saturday|sunday):)$"
+    )
+    assert all(allowed.match(line) for line in added), added
+
+
+# --- v0.5 : bouclage ECS à la demande -----------------------------------------
+
+
+def test_v041_config_still_valid(repo_root, tmp_path):
+    result = _run_config(repo_root, tmp_path, example=EXAMPLE_V041)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert (
+        (repo_root / EXAMPLE_V041)
+        .read_text(encoding="utf-8")
+        .startswith("# VissLink v0.4.1 ")
+    )
+    assert "enable_schedule_writes: false" in out, out
+
+
+def test_example_boost_present_but_inactive(repo_root, tmp_path):
+    text = (repo_root / EXAMPLE).read_text(encoding="utf-8")
+    assert "  enable_schedule_writes: false\n" in text
+    assert "enable_schedule_writes: true" not in text
+    result = _run_config(repo_root, tmp_path)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "visslink_boost:" in out
+    assert "validated_days: []" in out, out
+    assert "SCHEDULE BLOCK WRITES ENABLED" not in out
+    # Horloge lue en lecture seule, à 0x088E.
+    assert re.search(
+        r"name: Vitotronic - Horloge\n(?:    [^\n]*\n)*?    address: 0x88E\n", out
+    ), out
+
+
+def test_schedule_writes_need_enable_writes(repo_root, tmp_path):
+    bad = _run_config(
+        repo_root,
+        tmp_path,
+        lambda s: s.replace(
+            "enable_schedule_writes: false", "enable_schedule_writes: true"
+        ),
+    )
+    assert bad.returncode != 0, bad.stdout
+    good = _run_config(
+        repo_root,
+        tmp_path,
+        lambda s: s.replace(
+            "enable_schedule_writes: false", "enable_schedule_writes: true"
+        ).replace("enable_writes: false", "enable_writes: true"),
+    )
+    out = good.stdout + good.stderr
+    assert good.returncode == 0, out
+    assert "SCHEDULE BLOCK WRITES ENABLED" in out, out
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        lambda s: s.replace("validated_days: []", "validated_days: [dimanche]"),
+        lambda s: s.replace("  time_id: ha_time\n  validated_days", "  validated_days"),
+        lambda s: _drop_first(
+            s, '  start:\n    name: "Bouclage ECS — Démarrer maintenant"\n'
+        ),
+        lambda s: s.replace(
+            "type: vito_clock\n", "type: vito_clock\n    address: 0x0846\n"
+        ),
+        lambda s: s.replace(
+            '  start:\n    name: "Bouclage ECS — Démarrer maintenant"\n',
+            '  start:\n    name: "Bouclage ECS — Démarrer maintenant"\n  address: 0x0846\n',
+        ),
+    ],
+)
+def test_boost_invalid_configs(repo_root, tmp_path, case):
+    result = _run_config(repo_root, tmp_path, case)
+    assert result.returncode != 0, result.stdout
+
+
+def test_boost_validated_days_accepted(repo_root, tmp_path):
+    result = _run_config(
+        repo_root,
+        tmp_path,
+        lambda s: s.replace("validated_days: []", "validated_days: [sunday, Monday]"),
+    )
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+
+
+def test_boost_tables_match_cpp(repo_root):
+    cpp = (repo_root / "components/visslink/circulation_boost.h").read_text(
+        encoding="utf-8"
+    )
+    assert "LOOP_SCHEDULE_MONDAY = 0x2200;" in cpp
+    durations = re.search(r"BOOST_DURATIONS\[\] = \{([^}]*)\}", cpp).group(1)
+    py = (repo_root / "components/visslink_boost/__init__.py").read_text(
+        encoding="utf-8"
+    )
+    options = re.search(r"DURATION_OPTIONS = \[([^\]]*)\]", py).group(1)
+    assert [int(d) for d in re.findall(r"\d+", durations)] == [
+        int(d) for d in re.findall(r"\d+", options)
+    ]
+    # Jamais d'écriture sur 0x0846 : aucune occurrence dans le code d'écriture
+    # (hors commentaires).
+    for f in ("circulation_boost.h", "write_guard.h"):
+        text = (repo_root / "components/visslink" / f).read_text(encoding="utf-8")
+        code = re.sub(r"//[^\n]*", "", text)
+        assert "0x0846" not in code and "0x846" not in code, f
+
+
+def test_loop_diagnostic_still_valid_with_v05(repo_root, tmp_path):
+    result = _run_config(repo_root, tmp_path, example=DIAGNOSTIC_LOOP)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+# --- v0.5 : états Éco et Party (lecture seule) --------------------------------
+
+ECO_PARTY = {
+    0x2302: "Radiateurs - Éco",
+    0x2303: "Radiateurs - Party",
+    0x3302: "Plancher chauffant - Éco",
+    0x3303: "Plancher chauffant - Party",
+}
+
+
+def test_example_eco_party_binary_sensors(repo_root, tmp_path):
+    result = _run_config(repo_root, tmp_path)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    binaries = out.partition("\nbinary_sensor:\n")[2].partition("\nnumber:\n")[0]
+    for address, name in ECO_PARTY.items():
+        entry = re.search(rf"name: {re.escape(name)}\n((?:    [^\n]*\n)*)", binaries)
+        assert entry, name
+        assert f"address: 0x{address:X}\n" in entry.group(1), name
+        assert "update_interval: 30s" in entry.group(1), name
+        # Une seule déclaration de chaque adresse, toutes plateformes confondues.
+        assert out.count(f"address: 0x{address:X}\n") == 1, hex(address)
+
+
+@pytest.mark.parametrize("address", sorted(ECO_PARTY))
+def test_eco_party_never_writable(repo_root, tmp_path, address):
+    # Ni consigne (number) ni programme (select) sur ces adresses : refusé par
+    # la liste blanche, pas seulement comme doublon.
+    for old, expected in (
+        ("address: 0x2306", "not in the VissLink write whitelist"),
+        ("address: 0x2301", "is not an operating mode register"),
+    ):
+        result = _run_config(
+            repo_root,
+            tmp_path,
+            lambda s, old=old: s.replace(old, f"address: 0x{address:04X}"),
+        )
+        out = result.stdout + result.stderr
+        assert result.returncode != 0, hex(address)
+        assert expected in out, out
+
+
+def test_eco_party_duplicate_rejected(repo_root, tmp_path):
+    result = _run_config(
+        repo_root, tmp_path, lambda s: s.replace("address: 0x3303", "address: 0x3302")
+    )
+    assert result.returncode != 0, result.stdout

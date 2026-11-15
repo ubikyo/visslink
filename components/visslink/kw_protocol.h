@@ -20,8 +20,12 @@
 //   Vitotronic -> 1 octet                  0x00 = accepté ; 0x05 ou autre = refus
 //
 // Le format et l'accusé 0x00 sont documentés (openv, vcontrold). La longueur
-// de la réponse n'est concordante entre les sources que pour LEN = 1 :
-// l'écriture est donc limitée à un octet (MAX_WRITE_LENGTH).
+// de la réponse n'est concordante entre les sources que pour LEN = 1.
+// v0.5 : écriture de 8 octets autorisée en plus (blocs horaires, chemin
+// expérimental isolé). Réponse acceptée : un octet 00, comme vcontrold
+// (« RECV 1 SR ») ; VitoWiFi attend 8 octets. Toute autre réponse est une
+// issue indéterminée (RESPONSE_TOO_LONG, WRITE_REJECTED...) que seule une
+// relecture tranche. Aucune autre longueur n'est acceptée.
 //
 //   IDLE -> WAIT_SYNC -> WAIT_RESPONSE -> CHECK_TRAILING -> IDLE
 //              |               |                |
@@ -81,9 +85,12 @@ class KwProtocol {
   /// Accusé d'une écriture acceptée (« Bestätigung OK », openv ; « OK »,
   /// vcontrold). Toute autre valeur est un refus.
   static constexpr uint8_t WRITE_ACK = 0x00;
-  /// Seule longueur pour laquelle openv, vcontrold et VitoWiFi s'accordent
-  /// sur la réponse (un octet).
-  static constexpr uint8_t MAX_WRITE_LENGTH = 1;
+  /// Écriture d'un octet : seule longueur pour laquelle openv, vcontrold et
+  /// VitoWiFi s'accordent sur la réponse.
+  static constexpr uint8_t SINGLE_WRITE_LENGTH = 1;
+  /// Écriture d'un bloc horaire (v0.5, expérimental).
+  static constexpr uint8_t BLOCK_WRITE_LENGTH = 8;
+  static constexpr uint8_t MAX_WRITE_LENGTH = BLOCK_WRITE_LENGTH;
   /// 8 octets : taille des futurs blocs de programmation horaire.
   static constexpr uint8_t MAX_READ_LENGTH = 8;
   /// Silence exigé après la réponse. Un octet dure ~2,5 ms à 4800 bauds 8E2 :
@@ -109,11 +116,12 @@ class KwProtocol {
     return true;
   }
 
-  /// Démarre une écriture de `length` octets (1 au plus). Mêmes conditions
-  /// que request_read() : une seule transaction à la fois, et la trame ne
-  /// part qu'après un 0x05 frais. Aucune nouvelle tentative n'est faite ici.
+  /// Démarre une écriture de 1 ou 8 octets. Mêmes conditions que
+  /// request_read() : une seule transaction à la fois, et la trame ne part
+  /// qu'après un 0x05 frais. Aucune nouvelle tentative n'est faite ici.
   bool request_write(uint16_t address, const uint8_t *data, uint8_t length, uint32_t now) {
-    if (this->state_ != State::IDLE || data == nullptr || length == 0 || length > MAX_WRITE_LENGTH)
+    if (this->state_ != State::IDLE || data == nullptr ||
+        (length != SINGLE_WRITE_LENGTH && length != BLOCK_WRITE_LENGTH))
       return false;
     for (uint8_t i = 0; i < length; i++)
       this->write_data_[i] = data[i];

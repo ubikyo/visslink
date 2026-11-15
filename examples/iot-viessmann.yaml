@@ -1,4 +1,4 @@
-# VissLink v0.4.1 — Viessmann Vitotronic 300 KW3 via Optolink
+# VissLink v0.5 — Viessmann Vitotronic 300 KW3 via Optolink
 # Matériel : Wemos D1 mini (ESP8266) + interface infrarouge Optolink.
 #
 # Les identifiants sont lus dans secrets.yaml (non versionné), voir
@@ -30,11 +30,11 @@ esp8266:
 external_components:
   # Dépôt local (développement). Pour utiliser la version publiée :
   #   - source: github://ubikyo/visslink
-  #     components: [visslink]
+  #     components: [visslink, visslink_boost]
   - source:
       type: local
       path: ../components
-    components: [visslink]
+    components: [visslink, visslink_boost]
 
 wifi:
   ssid: !secret wifi_ssid
@@ -92,6 +92,10 @@ visslink:
   # enable_writes ET enable_mode_writes. Seulement pour l'essai M2, après la
   # validation de A1.
   enable_m2_mode_write: false
+  # Bouclage ECS à la demande (v0.5, EXPÉRIMENTAL) : écriture temporaire des
+  # blocs horaires du bouclage (0x2200-0x2237). Exige enable_writes. Laisser
+  # à false avant la procédure de docs/bouclage-ecs-v0.5.md.
+  enable_schedule_writes: false
 
 sensor:
   # --- Températures (int16, dixièmes de degré) ------------------------------
@@ -195,6 +199,42 @@ binary_sensor:
     address: 0x0842
     update_interval: 30s
     device_class: running
+
+  # --- États Éco et Party (v0.5, LECTURE SEULE, à valider) -------------------
+  # 1 octet, 00 = inactif, 01 = actif (vcontrold, Vitotronic 200 KW2 ; non
+  # encore confirmé sur cette KW3 : procédure dans docs/registres.md § 6).
+  # Toute autre valeur : état inconnu + avertissement, sans interprétation ;
+  # l'octet brut reste dans le journal DEBUG (« 0x3302 <- 01 »). Aucune
+  # écriture possible : ces adresses ne sont dans aucune liste blanche.
+  # 30 s : choix initial. La liaison passe de ~7,7 à ~15,7 lectures/min ; si
+  # la resynchro de la chaudière dépasse 3 s, passer à 60 s (§ 6, « Charge de la liaison »).
+  - platform: visslink
+    visslink_id: viessmann
+    name: "Radiateurs - Éco"
+    address: 0x2302
+    update_interval: 30s
+    icon: mdi:leaf
+
+  - platform: visslink
+    visslink_id: viessmann
+    name: "Radiateurs - Party"
+    address: 0x2303
+    update_interval: 30s
+    icon: mdi:party-popper
+
+  - platform: visslink
+    visslink_id: viessmann
+    name: "Plancher chauffant - Éco"
+    address: 0x3302
+    update_interval: 30s
+    icon: mdi:leaf
+
+  - platform: visslink
+    visslink_id: viessmann
+    name: "Plancher chauffant - Party"
+    address: 0x3303
+    update_interval: 30s
+    icon: mdi:party-popper
 
   # --- Expérimental : à vérifier avant activation (voir étape 1 ci-dessus) --
   # Fortement corroboré, à valider sur cette chaudière.
@@ -314,6 +354,32 @@ select:
     address: 0x3301
     update_interval: 5min
 
+# --- Bouclage ECS à la demande (v0.5, EXPÉRIMENTAL) ---------------------------
+# Ajoute une plage temporaire au bloc du jour de la programmation du bouclage,
+# puis rétablit exactement le bloc d'origine (sauvegardé en flash avant toute
+# écriture). La pompe reste commandée par la régulation : 0x0846 n'est jamais
+# écrit ; il reste lu pour voir si le circulateur tourne réellement.
+# INACTIF tant que enable_schedule_writes est false, et chaque jour tant que
+# sa correspondance bloc <-> jour n'est pas validée (validated_days).
+visslink_boost:
+  visslink_id: viessmann
+  time_id: ha_time
+  validated_days: []          # ex. [sunday] après validation (docs/bouclage-ecs-v0.5.md)
+  start:
+    name: "Bouclage ECS — Démarrer maintenant"
+  duration:
+    name: "Bouclage ECS — Durée"
+  restore:
+    name: "Bouclage ECS — Restaurer la programmation"
+  forget:
+    name: "Bouclage ECS — Oublier la sauvegarde"
+  active:
+    name: "Bouclage ECS — Plage temporaire en cours"
+  restore_required:
+    name: "Bouclage ECS — Restauration nécessaire"
+  status:
+    name: "Bouclage ECS — État de l'opération"
+
 # --- Programmations horaires (lecture seule) ---------------------------------
 # `address` est celle du lundi ; les 7 jours sont lus à address + 8 × jour.
 # État principal : la semaine, jours identiques regroupés
@@ -361,3 +427,10 @@ text_sensor:
       name: "Bouclage ECS - Programmation du jour"
     active:
       name: "Bouclage ECS - Plage active"
+
+  # Horloge de la Vitotronic (0x088E), lecture seule : à comparer avec
+  # l'afficheur avant d'utiliser le bouclage à la demande.
+  - platform: visslink
+    visslink_id: viessmann
+    type: vito_clock
+    name: "Vitotronic - Horloge"

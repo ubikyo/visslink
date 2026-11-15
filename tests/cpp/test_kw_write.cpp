@@ -129,9 +129,13 @@ TEST(kw_write_invalid_requests_refused) {
   Fixture f;
   const uint8_t two[2] = {20, 21};
   CHECK(!f.kw.request_write(0x2306, two, 0, 0));  // longueur nulle
-  CHECK(!f.kw.request_write(0x2306, two, 2, 0));  // > MAX_WRITE_LENGTH
+  CHECK(!f.kw.request_write(0x2306, two, 2, 0));  // ni 1 ni 8
   CHECK(!f.kw.request_write(0x2306, nullptr, 1, 0));
-  CHECK_EQ(KwProtocol::MAX_WRITE_LENGTH, 1);
+  const uint8_t nine[9] = {};
+  for (uint8_t len : {2, 3, 4, 5, 6, 7, 9})
+    CHECK(!f.kw.request_write(0x2200, nine, len, 0));  // v0.5 : seulement 1 ou 8 octets
+  CHECK_EQ(KwProtocol::SINGLE_WRITE_LENGTH, 1);
+  CHECK_EQ(KwProtocol::BLOCK_WRITE_LENGTH, 8);
   CHECK(f.kw.is_idle());
 
   // Une seule transaction à la fois, lecture ou écriture.
@@ -219,4 +223,53 @@ TEST(kw_cancel_only_before_anything_is_sent) {
   CHECK(!g.kw.cancel_before_send());
   Fixture h;
   CHECK(!h.kw.cancel_before_send());  // IDLE : rien à annuler
+}
+
+
+// --- v0.5 : écriture d'un bloc horaire de 8 octets ---------------------------
+
+TEST(kw_block_write_frame_and_ack) {
+  Fixture f;
+  const uint8_t block[8] = {0x31, 0x43, 0x70, 0x72, 0xAC, 0xAD, 0xFF, 0xFF};
+  CHECK(f.kw.request_write(0x2230, block, 8, 0));
+  f.loop(10);
+  CHECK(f.serial.tx.empty());  // rien avant le 0x05
+  f.serial.push({0x05});
+  f.loop(20);
+  const std::vector<uint8_t> expected = {0x01, 0xF4, 0x22, 0x30, 0x08, 0x31, 0x43, 0x70, 0x72, 0xAC, 0xAD, 0xFF, 0xFF};
+  CHECK(f.serial.tx == expected);
+  CHECK_EQ(f.serial.writes, 1);  // une seule émission, 13 octets
+  f.serial.push({0x00});
+  CHECK_EQ(f.settle(60), KwResult::SUCCESS);  // accusé reçu : PAS une preuve d'application
+}
+
+TEST(kw_block_write_ambiguous_replies) {
+  const uint8_t block[8] = {0x31, 0x43, 0x70, 0x72, 0xAC, 0xAD, 0xFF, 0xFF};
+  {  // 8 octets en réponse (comportement attendu par VitoWiFi) : issue indéterminée
+    Fixture f;
+    CHECK(f.kw.request_write(0x2230, block, 8, 0));
+    f.serial.push({0x05});
+    f.loop(5);
+    f.serial.push({0x31, 0x43, 0x70, 0x72, 0xAC, 0xAD, 0xFF, 0xFF});
+    CHECK_EQ(f.loop(60), KwResult::RESPONSE_TOO_LONG);
+    CHECK(f.kw.state() == State::RECOVERY);
+  }
+  {  // refus 05
+    Fixture f;
+    CHECK(f.kw.request_write(0x2230, block, 8, 0));
+    f.serial.push({0x05});
+    f.loop(5);
+    f.serial.push({0x05});
+    CHECK_EQ(f.settle(60), KwResult::WRITE_REJECTED);
+  }
+  {  // aucune réponse : jamais réémise par le moteur
+    Fixture f;
+    CHECK(f.kw.request_write(0x2230, block, 8, 0));
+    f.serial.push({0x05});
+    f.loop(5);
+    const size_t sent = f.serial.tx.size();
+    CHECK_EQ(f.loop(1005), KwResult::RESPONSE_TIMEOUT);
+    f.loop(5000);
+    CHECK_EQ(f.serial.tx.size(), sent);
+  }
 }

@@ -127,6 +127,79 @@ inline ScheduleError decode_schedule_day(const uint8_t *data, size_t length, Day
   return ScheduleError::NONE;
 }
 
+// --- Emplacements (v0.5) -----------------------------------------------------
+//
+// Représentation d'un bloc qui conserve la POSITION de chaque plage (un
+// emplacement libre FF FF au milieu reste à sa place). Contrairement à
+// DaySchedule (plages compactées), elle permet de réencoder exactement les
+// 8 octets lus : tout bloc valide décodé puis réencodé redonne les mêmes
+// octets (chaque octet horaire valide a un seul codage).
+
+struct ScheduleSlots {
+  bool used[SCHEDULE_SLOTS]{};
+  uint16_t start[SCHEDULE_SLOTS]{};  ///< minutes depuis 00:00
+  uint16_t end[SCHEDULE_SLOTS]{};
+
+  uint8_t used_count() const {
+    uint8_t n = 0;
+    for (bool u : this->used)
+      n += u ? 1 : 0;
+    return n;
+  }
+};
+
+/// Minutes -> octet horaire (heure × 8 + dizaines de minutes), ou -1 si la
+/// valeur n'est pas codable (pas un multiple de 10, ou au-delà de 24:00).
+inline int encode_schedule_time(uint16_t minutes) {
+  if (minutes % 10u != 0 || minutes > MINUTES_PER_DAY)
+    return -1;
+  return static_cast<int>((minutes / 60u) * 8u + (minutes % 60u) / 10u);
+}
+
+/// Décode en conservant les positions. Mêmes règles que decode_schedule_day.
+inline ScheduleError decode_schedule_slots(const uint8_t *data, size_t length, ScheduleSlots *out) {
+  if (data == nullptr || length != SCHEDULE_BLOCK_LENGTH)
+    return ScheduleError::BAD_LENGTH;
+  ScheduleSlots slots;
+  for (uint8_t i = 0; i < SCHEDULE_SLOTS; i++) {
+    const uint8_t raw_start = data[2 * i], raw_end = data[2 * i + 1];
+    if (raw_start == SCHEDULE_UNSET && raw_end == SCHEDULE_UNSET)
+      continue;
+    if (raw_start == SCHEDULE_UNSET || raw_end == SCHEDULE_UNSET)
+      return ScheduleError::INCOMPLETE_PAIR;
+    const int start = decode_schedule_time(raw_start), end = decode_schedule_time(raw_end);
+    if (start < 0 || end < 0)
+      return ScheduleError::INVALID_TIME;
+    if (start >= MINUTES_PER_DAY || end <= start)
+      return ScheduleError::BAD_RANGE;
+    slots.used[i] = true;
+    slots.start[i] = static_cast<uint16_t>(start);
+    slots.end[i] = static_cast<uint16_t>(end);
+  }
+  *out = slots;
+  return ScheduleError::NONE;
+}
+
+/// Encode 8 octets (FF FF pour un emplacement libre). Renvoie false, sans
+/// rien écrire, si une plage n'est pas codable ou incohérente.
+inline bool encode_schedule_slots(const ScheduleSlots &slots, uint8_t *out) {
+  uint8_t buffer[SCHEDULE_BLOCK_LENGTH];
+  for (uint8_t i = 0; i < SCHEDULE_SLOTS; i++) {
+    if (!slots.used[i]) {
+      buffer[2 * i] = buffer[2 * i + 1] = SCHEDULE_UNSET;
+      continue;
+    }
+    const int start = encode_schedule_time(slots.start[i]), end = encode_schedule_time(slots.end[i]);
+    if (start < 0 || end < 0 || slots.start[i] >= MINUTES_PER_DAY || slots.end[i] <= slots.start[i])
+      return false;
+    buffer[2 * i] = static_cast<uint8_t>(start);
+    buffer[2 * i + 1] = static_cast<uint8_t>(end);
+  }
+  for (uint8_t i = 0; i < SCHEDULE_BLOCK_LENGTH; i++)
+    out[i] = buffer[i];
+  return true;
+}
+
 // --- Présentation ------------------------------------------------------------
 
 static const char *const SCHEDULE_TEXT_EMPTY = "aucune plage";

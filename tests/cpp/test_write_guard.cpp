@@ -262,3 +262,18 @@ TEST(write_timing_components) {
   CHECK_EQ(t.applied_ms(), 5135u);
   CHECK_EQ(t.total_ms(), 8180u);
 }
+
+
+TEST(eco_party_registers_are_never_writable) {
+  // v0.5 : Éco et Party, lecture seule. Aucune liste blanche ne les contient.
+  uint8_t out = 0;
+  for (uint16_t a : {0x2302, 0x2303, 0x3302, 0x3303}) {
+    CHECK(find_writable(a) == nullptr);
+    CHECK(!is_mode_write_whitelisted(a));
+    CHECK(!is_write_whitelisted(a));
+    CHECK_EQ(check_write_value(a, 1, 1, 0, 1, &out), WriteCheck::NOT_WHITELISTED);
+    for (uint8_t v : {0x00, 0x01})
+      CHECK_EQ(check_mode_write(a, 1, v), WriteCheck::NOT_WHITELISTED);
+    CHECK(mode_write_permitted(a, true, true, true) == ModePermission::NOT_WHITELISTED);
+  }
+}

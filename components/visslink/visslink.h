@@ -26,6 +26,7 @@
 #include "esphome/components/time/real_time_clock.h"
 #endif
 
+#include "circulation_boost.h"
 #include "decode.h"
 #include "kw_protocol.h"
 #include "schedule.h"
@@ -158,6 +159,17 @@ static_assert(SCHEDULE_BLOCK_LENGTH <= KwProtocol::MAX_READ_LENGTH, "schedule bl
 
 class VissLinkComponent;
 
+/// Client du chemin expérimental des blocs horaires (bouclage ECS, v0.5) :
+/// lectures ponctuelles et écritures de 8 octets, résultats rendus ici.
+class VissLinkBlockClient {
+ public:
+  virtual void on_direct_read(uint16_t address, bool ok, const uint8_t *data, uint8_t length, uint32_t now) = 0;
+  /// `sent` : trame émise ; `acked` : accusé 00 (jamais une preuve).
+  virtual void on_block_write(uint16_t address, bool sent, bool acked, uint32_t now) = 0;
+  /// Contrôle croisé juste avant émission.
+  virtual bool expects_block_write(uint16_t address, const uint8_t *data) const = 0;
+};
+
 #ifdef USE_NUMBER
 /// Consigne réglable (v0.3) : registre uint8 de la liste blanche, lu
 /// périodiquement comme un capteur. L'état publié provient toujours d'une
@@ -207,6 +219,18 @@ class VissLinkModeText : public text_sensor::TextSensor, public VissLinkRegister
 
   VissLinkComponent *parent_{nullptr};
   int raw_{-1};
+};
+#endif
+
+#ifdef USE_TEXT_SENSOR
+/// Horloge de la Vitotronic (0x088E), lecture seule (v0.5) : date, heure et
+/// jour décodés et vérifiés, ou « invalide (raison) : octets bruts ».
+class VissLinkClockText : public text_sensor::TextSensor, public VissLinkRegister {
+ public:
+  uint8_t get_length() const override { return VITO_CLOCK_LENGTH; }
+  bool publish_data(uint8_t block, const uint8_t *data) override;
+  void publish_unknown(uint8_t block) override;
+  void dump_register_config() override;
 };
 #endif
 
@@ -269,6 +293,23 @@ class VissLinkComponent : public Component, public uart::UARTDevice {
   /// Écriture du programme de M2 (0x3301, v0.4, non documentée) : false par
   /// défaut, exige aussi enable_writes et enable_mode_writes.
   void set_enable_m2_mode_write(bool enable) { this->enable_m2_mode_write_ = enable; }
+  /// Écriture des blocs horaires du bouclage (v0.5, expérimental) : false par
+  /// défaut, exige aussi enable_writes.
+  void set_enable_schedule_writes(bool enable) { this->enable_schedule_writes_ = enable; }
+
+  // --- Blocs horaires (v0.5) ---
+  void set_block_client(VissLinkBlockClient *client) { this->block_client_ = client; }
+  bool schedule_writes_enabled() const { return this->enable_writes_ && this->enable_schedule_writes_; }
+  bool link_ok() const { return this->link_ok_; }
+  /// Aucune écriture en attente ni en cours (consignes, programmes, blocs).
+  bool writes_idle() const { return this->writes_.pending_count() == 0 && !this->writes_.active(); }
+  /// Lecture ponctuelle prioritaire : horloge 0x088E ou bloc du bouclage, 8
+  /// octets. Refusée si une autre est en cours ou si l'adresse n'est pas
+  /// autorisée.
+  bool request_direct_read(uint16_t address, uint8_t length);
+  /// Écriture d'un bloc du bouclage (8 octets), via l'arbitre. Refusée sans
+  /// les autorisations, hors liste blanche ou si le bloc est invalide.
+  bool submit_block_write(uint16_t address, const uint8_t *data, uint32_t now);
 
 #ifdef USE_NUMBER
   /// Demande d'écriture venant de Home Assistant (VissLinkNumber::control).
@@ -289,6 +330,10 @@ class VissLinkComponent : public Component, public uart::UARTDevice {
  protected:
   void handle_result_(KwResult result, uint32_t now);
   void handle_write_result_(KwResult result, uint32_t now);
+  void handle_block_write_result_(KwResult result, uint32_t now);
+  void handle_direct_result_(KwResult result, uint32_t now);
+  bool start_direct_read_(uint32_t now);
+  bool block_write_allowed_(uint16_t address, const uint8_t *data) const;
   bool start_write_(uint32_t now);
   void preempt_unsent_read_(uint32_t now);
   void log_write_timing_(uint16_t address);
@@ -306,6 +351,19 @@ class VissLinkComponent : public Component, public uart::UARTDevice {
   bool enable_writes_{false};
   bool enable_mode_writes_{false};
   bool enable_m2_mode_write_{false};
+  bool enable_schedule_writes_{false};
+  VissLinkBlockClient *block_client_{nullptr};
+  /// Lecture ponctuelle (v0.5) : une à la fois, nouvelles tentatives comme
+  /// une lecture ordinaire.
+  struct DirectRead {
+    bool pending{false};
+    bool in_flight{false};
+    uint16_t address{0};
+    uint8_t length{0};
+    uint8_t failures{0};
+    uint32_t due_ms{0};
+  } direct_;
+  bool block_verify_pending_{false};  ///< écriture de bloc : arbitre libéré après la relecture
   ReadBackTracker read_back_;
   WriteTiming timing_;         ///< chronologie de l'écriture en cours (v0.4.1)
   bool timing_valid_{false};   ///< trame réellement émise

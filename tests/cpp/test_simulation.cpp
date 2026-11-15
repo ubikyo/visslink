@@ -16,6 +16,8 @@
 #include "sim.h"
 #include "test_framework.h"
 #include "write_guard.h"
+#include "circulation_boost.h"
+#include <functional>
 
 using namespace esphome::visslink;
 using vltest::MockSerial;
@@ -59,6 +61,55 @@ struct Bench {
   int preemptions{0};
   WriteTiming timing;
   std::vector<WriteTiming> timings;
+
+  // v0.5 : blocs horaires du bouclage (même logique que VissLinkComponent).
+  bool enable_schedule_writes{false};
+  struct DirectRead {
+    bool pending{false}, in_flight{false};
+    uint16_t address{0};
+    uint8_t length{0}, failures{0};
+    uint32_t due_ms{0};
+  } direct;
+  bool block_verify_pending{false};
+  std::function<void(uint16_t, bool, const uint8_t *, uint8_t, uint32_t)> on_direct_read;
+  std::function<void(uint16_t, bool, bool, uint32_t)> on_block_write;
+  std::function<bool(uint16_t, const uint8_t *)> expects_block_write;
+  std::vector<KwResult> block_write_results;
+  int block_refused_at_send{0};
+
+  bool schedule_writes_enabled() const { return enable_writes && enable_schedule_writes; }
+  bool writes_idle() const { return writes.pending_count() == 0 && !writes.active(); }
+  bool block_write_allowed(uint16_t address, const uint8_t *data) const {
+    ScheduleSlots slots;
+    return schedule_writes_enabled() && is_schedule_write_whitelisted(address) &&
+           decode_schedule_slots(data, SCHEDULE_BLOCK_LENGTH, &slots) == ScheduleError::NONE && expects_block_write &&
+           expects_block_write(address, data);
+  }
+  bool submit_block_write(uint16_t address, const uint8_t *data, uint32_t now) {
+    if (!block_write_allowed(address, data))
+      return false;
+    return writes.submit_block(WriteArbiter::BOOST_OWNER, address, data, now) == WriteArbiter::Submit::QUEUED;
+  }
+  bool request_direct_read(uint16_t address, uint8_t len, uint32_t now) {
+    const bool allowed = len == 8 && (address == VITO_CLOCK_ADDRESS || is_schedule_write_whitelisted(address));
+    if (!allowed || direct.pending)
+      return false;
+    direct = DirectRead();
+    direct.pending = true;
+    direct.address = address;
+    direct.length = len;
+    direct.due_ms = now;
+    return true;
+  }
+  void deliver_direct(bool ok, uint32_t now) {
+    direct.pending = false;
+    if (block_verify_pending) {
+      block_verify_pending = false;
+      writes.complete(now);
+    }
+    if (on_direct_read)
+      on_direct_read(direct.address, ok, ok ? kw.data() : nullptr, ok ? kw.data_length() : 0, now);
+  }
   ReadBackTracker read_back;
   std::map<size_t, int> mode_state;  ///< programme publié (brut 00/03/05, -1 = inconnu)
   std::vector<ModeDivergence> divergence_log;  ///< divergence A1/M2 après chaque relecture de programme
@@ -233,6 +284,8 @@ struct Bench {
     number_state.clear();
     mode_state.clear();
     read_back = ReadBackTracker();
+    direct = DirectRead();
+    block_verify_pending = false;
     serial.rx.clear();  // tampon de réception de l'UART perdu
   }
   /// Laisse tourner la chaudière seule (ESP en cours de démarrage).
@@ -261,7 +314,41 @@ struct Bench {
   /// Même enchaînement que VissLinkComponent::loop() / handle_result_().
   void step(uint32_t now) {
     const KwResult result = kw.loop(now, serial);
-    if (result != KwResult::NONE && write_in_flight) {
+    if (result != KwResult::NONE && write_in_flight && writes.current().owner == WriteArbiter::BOOST_OWNER) {
+      // VissLinkComponent::handle_block_write_result_
+      write_in_flight = false;
+      block_write_results.push_back(result);
+      const bool sent = result != KwResult::SYNC_TIMEOUT;
+      if (!sent)
+        link_ok = false;
+      const uint16_t address = writes.current().address;
+      if (sent)
+        block_verify_pending = true;
+      else
+        writes.complete(now);
+      if (on_block_write)
+        on_block_write(address, sent, result == KwResult::SUCCESS, now);
+      if (sent && !direct.pending) {
+        block_verify_pending = false;
+        writes.complete(now);
+      }
+    } else if (result != KwResult::NONE && direct.in_flight) {
+      // VissLinkComponent::handle_direct_result_
+      direct.in_flight = false;
+      if (result == KwResult::SUCCESS) {
+        link_ok = true;
+        deliver_direct(true, now);
+      } else {
+        if (result == KwResult::SYNC_TIMEOUT)
+          link_ok = false;
+        if (direct.failures < scheduler.max_retries()) {
+          direct.failures++;
+          direct.due_ms = now + RegisterScheduler::RETRY_DELAY_MS;
+        } else {
+          deliver_direct(false, now);
+        }
+      }
+    } else if (result != KwResult::NONE && write_in_flight) {
       // VissLinkComponent::handle_write_result_
       write_in_flight = false;
       write_results.push_back(result);
@@ -338,44 +425,69 @@ struct Bench {
         }
       }
     }
-    // VissLinkComponent::preempt_unsent_read_ (v0.4.1).
-    if (preempt_unsent_reads && enable_writes && !write_in_flight && kw.is_waiting_sync() &&
+    // VissLinkComponent::preempt_unsent_read_ (v0.4.1, lectures ponctuelles v0.5).
+    const bool direct_ready = direct.pending && !direct.in_flight && time_reached(now, direct.due_ms);
+    if (preempt_unsent_reads && !write_in_flight && !direct.in_flight && kw.is_waiting_sync() &&
         scheduler.current() != RegisterScheduler::NONE && !scheduler.entry(scheduler.current()).urgent &&
-        writes.ready(now, link_ok) && kw.cancel_before_send()) {
+        ((enable_writes && writes.ready(now, link_ok)) || direct_ready) && kw.cancel_before_send()) {
       scheduler.release();
       preemptions++;
     }
-    if (kw.is_idle() && scheduler.current() == RegisterScheduler::NONE) {
+    if (kw.is_idle() && scheduler.current() == RegisterScheduler::NONE && !direct.in_flight) {
       WriteArbiter::Request w;
-      while (writes.pop_expired(now, &w))
+      while (writes.pop_expired(now, &w)) {
         expired_writes++;
+        if (w.owner == WriteArbiter::BOOST_OWNER && on_block_write)
+          on_block_write(w.address, false, false, now);
+      }
+      bool started = false;
       if (enable_writes && writes.next(now, link_ok, &w)) {
-        // VissLinkComponent::start_write_ : contrôle complet avant émission
-        // (VissLinkRegister::write_allowed, refus par défaut hors number).
-        const Reg &r = regs[w.owner];
-        uint8_t encoded = 0;
-        const bool number_ok = r.number && find_writable(w.address) != nullptr &&
-                               check_write_value(w.address, 1, w.value, r.min, r.max, &encoded) == WriteCheck::OK &&
-                               encoded == w.value;
-        const bool mode_ok =
-            r.mode && is_mode_register(w.address) && check_mode_write(w.address, 1, w.value) == WriteCheck::OK &&
-            mode_write_permitted(w.address, enable_writes, enable_mode_writes, enable_m2_mode_write) ==
-                ModePermission::OK;
-        const bool allowed = r.address == w.address && is_write_whitelisted(w.address) && (number_ok || mode_ok);
-        if (allowed && kw.request_write(w.address, &w.value, 1, now)) {
-          write_in_flight = true;
-          write_start_ms.push_back(now);
-          timing = WriteTiming();
-          timing.requested = w.requested_ms;
-          timing.started = now;
+        if (w.owner == WriteArbiter::BOOST_OWNER) {
+          // VissLinkComponent::start_write_, bloc horaire : contrôles revérifiés.
+          if (w.length == 8 && block_write_allowed(w.address, w.data) &&
+              kw.request_write(w.address, w.data, 8, now)) {
+            write_in_flight = true;
+            started = true;
+          } else {
+            block_refused_at_send++;
+            writes.complete(now);
+            if (on_block_write)
+              on_block_write(w.address, false, false, now);
+          }
         } else {
-          refused_at_send++;
-          writes.complete(now);
+          // VissLinkComponent::start_write_ : contrôle complet avant émission
+          // (VissLinkRegister::write_allowed, refus par défaut hors number).
+          const Reg &r = regs[w.owner];
+          uint8_t encoded = 0;
+          const bool number_ok = r.number && find_writable(w.address) != nullptr &&
+                                 check_write_value(w.address, 1, w.value, r.min, r.max, &encoded) == WriteCheck::OK &&
+                                 encoded == w.value;
+          const bool mode_ok =
+              r.mode && is_mode_register(w.address) && check_mode_write(w.address, 1, w.value) == WriteCheck::OK &&
+              mode_write_permitted(w.address, enable_writes, enable_mode_writes, enable_m2_mode_write) ==
+                  ModePermission::OK;
+          const bool allowed = r.address == w.address && is_write_whitelisted(w.address) && (number_ok || mode_ok);
+          if (allowed && kw.request_write(w.address, &w.value, 1, now)) {
+            write_in_flight = true;
+            started = true;
+            write_start_ms.push_back(now);
+            timing = WriteTiming();
+            timing.requested = w.requested_ms;
+            timing.started = now;
+          } else {
+            refused_at_send++;
+            writes.complete(now);
+          }
         }
       }
+      // VissLinkComponent::start_direct_read_
+      if (!started && direct.pending && time_reached(now, direct.due_ms) && read_back.idle() &&
+          kw.request_read(direct.address, direct.length, now))
+        direct.in_flight = true;
     }
     if (kw.is_idle()) {
-      const int index = scheduler.acquire(now, strict_read_back && !read_back.idle());
+      const int index =
+          scheduler.acquire(now, (strict_read_back && !read_back.idle()) || direct.pending || block_verify_pending);
       if (index != RegisterScheduler::NONE &&
           !kw.request_read(block_address(regs[index], scheduler.block(index)), length(regs[index]), now))
         scheduler.finish(false, now);
@@ -2022,5 +2134,421 @@ TEST(sim_v041_no_ordinary_read_inside_read_back_retries) {
     CHECK_EQ(next_is_retry, strict);
     CHECK_EQ(b.number_state[v.dhw], 45);
     CHECK_EQ(b.boiler.write_frames, 1);  // la relecture est retentée, jamais l'écriture
+  }
+}
+
+// --- v0.5 : bouclage ECS à la demande (blocs horaires de 8 octets) ------------
+//
+// Chaudière SIMULÉE : écritures de 8 octets appliquées et accusées par 00
+// (hypothèse vcontrold), défauts injectés. Rien ici ne valide l'écriture sur
+// la KW3 réelle.
+
+namespace {
+
+/// Même logique que VissLinkBoost (components/visslink_boost) : exécute les
+/// actions du séquenceur, flash simulée.
+struct BoostGlue {
+  Bench &b;
+  BoostSequencer seq;
+  BoostConfig config;
+  bool flash_has{false};
+  BoostRecord flash;
+  bool save_fails{false};
+  int saves{0};
+  BoostAction pending;
+  bool has_pending{false};
+
+  BoostGlue(Bench &bench, uint8_t validated_mask) : b(bench) {
+    config.validated_days_mask = validated_mask;
+    boot();
+  }
+  void boot() {
+    seq = BoostSequencer();
+    seq.configure(config);
+    seq.boot(flash_has ? &flash : nullptr);
+    has_pending = false;
+    b.on_direct_read = [this](uint16_t, bool ok, const uint8_t *d, uint8_t len, uint32_t now) {
+      seq.on_read(ok, d, len, now);
+      dispatch(now);
+    };
+    b.on_block_write = [this](uint16_t, bool sent, bool acked, uint32_t now) {
+      seq.on_write(sent, acked, now);
+      dispatch(now);
+    };
+    b.expects_block_write = [this](uint16_t a, const uint8_t *d) { return seq.expects_write(a, d); };
+  }
+  /// VissLinkBoost::press(START).
+  std::string start(uint16_t duration, const HaTime &ha, uint32_t now) {
+    if (!b.schedule_writes_enabled())
+      return "disabled";
+    if (!b.link_ok)
+      return "link";
+    if (!b.writes_idle() && seq.idle())
+      return "busy";
+    const BoostStart r = seq.start(duration, ha, now);
+    dispatch(now);
+    return r == BoostStart::ACCEPTED ? "accepted" : r == BoostStart::RECOVERY_PENDING ? "recovery" : "refused";
+  }
+  bool restore(uint32_t now) {
+    if (!b.schedule_writes_enabled())
+      return false;
+    const bool ok = seq.request_restore(now);
+    dispatch(now);
+    return ok;
+  }
+  /// VissLinkBoost::dispatch_.
+  void dispatch(uint32_t now) {
+    for (int guard = 0; guard < 8; guard++) {
+      if (!has_pending) {
+        pending = seq.poll(now);
+        if (pending.type == BoostActionType::NONE)
+          return;
+        has_pending = true;
+      }
+      const BoostAction a = pending;
+      switch (a.type) {
+        case BoostActionType::READ:
+          if (!b.request_direct_read(a.address, a.length, now))
+            return;
+          has_pending = false;
+          return;
+        case BoostActionType::WRITE:
+          has_pending = false;
+          if (!b.submit_block_write(a.address, a.data, now))
+            seq.on_write(false, false, now);
+          else
+            return;
+          break;
+        case BoostActionType::SAVE:
+          has_pending = false;
+          saves++;
+          if (!save_fails) {
+            flash = a.record;
+            flash_has = true;
+          }
+          seq.on_saved(!save_fails, now);
+          break;
+        case BoostActionType::CLEAR:
+          has_pending = false;
+          saves++;
+          flash_has = false;
+          seq.on_saved(true, now);
+          break;
+        default:
+          has_pending = false;
+          return;
+      }
+    }
+  }
+};
+
+/// Horloge de la régulation simulée : 2026-11-15 (dimanche) 14:00:00 à t = 0.
+constexpr uint32_t CLOCK_BASE_S = 14 * 3600;
+
+void set_vito_clock(SimBoiler &boiler, uint32_t now_ms) {
+  const uint32_t t = CLOCK_BASE_S + now_ms / 1000;
+  auto bcd = [](uint32_t v) { return static_cast<uint8_t>((v / 10) << 4 | (v % 10)); };
+  boiler.registers[VITO_CLOCK_ADDRESS] = {0x20, 0x26, 0x11, 0x15, 0x07, bcd(t / 3600 % 24), bcd(t / 60 % 60),
+                                          bcd(t % 60)};
+}
+
+HaTime ha_now(uint32_t now_ms) {
+  HaTime h;
+  h.valid = true;
+  h.weekday = 6;
+  h.minute_of_day = static_cast<uint16_t>((CLOCK_BASE_S + now_ms / 1000) / 60 % 1440);
+  return h;
+}
+
+/// Pas de 5 ms : chaudière, composant, colle du bouclage, horloge.
+void run_boost(Bench &b, BoostGlue &g, uint32_t from, uint32_t duration_ms) {
+  for (uint32_t t = from; t - from < duration_ms; t += 5) {
+    if (t % 1000 == 0)
+      set_vito_clock(b.boiler, t);
+    b.boiler.tick(t);
+    b.step(t);
+    g.dispatch(t);
+  }
+}
+
+const std::vector<uint8_t> LOOP_SUNDAY = {0x31, 0x43, 0xAC, 0xAD, 0xFF, 0xFF, 0xFF, 0xFF};
+const std::vector<uint8_t> LOOP_SUNDAY_BOOST = {0x31, 0x43, 0x70, 0x72, 0xAC, 0xAD, 0xFF, 0xFF};  // + 14:00-14:20
+
+struct BoostBench {
+  Modes modes;
+  BoostGlue glue;
+  BoostBench(Bench &b, bool schedule_writes = true)
+      : modes(b, true, false, true), glue(b, 1u << 6) {
+    b.enable_schedule_writes = schedule_writes;
+    for (uint8_t d = 0; d < SCHEDULE_DAYS; d++)
+      b.boiler.writable.insert(schedule_day_address(LOOP, d));
+    set_vito_clock(b.boiler, 0);
+  }
+};
+
+int writes_to(const SimBoiler &boiler, uint16_t address) {
+  auto it = boiler.write_frames_by_address.find(address);
+  return it == boiler.write_frames_by_address.end() ? 0 : it->second;
+}
+
+}  // namespace
+
+TEST(sim_v05_boost_end_to_end) {
+  Bench b;
+  BoostBench x(b);
+  run_boost(b, x.glue, 0, BOOT);  // 14:02
+  CHECK(b.boiler.registers[0x2230] == LOOP_SUNDAY);
+  CHECK(x.glue.start(10, ha_now(BOOT), BOOT) == "accepted");
+  run_boost(b, x.glue, BOOT, MIN);
+  CHECK(x.glue.seq.state() == BoostState::ACTIVE);
+  CHECK(b.boiler.registers[0x2230] == LOOP_SUNDAY_BOOST);
+  CHECK(x.glue.flash_has);
+  // Trame d'écriture : 01 F4 22 30 08 + 8 octets, une seule.
+  CHECK(b.boiler.write_log.size() == 1);
+  CHECK(b.boiler.write_log[0] == (std::vector<uint8_t>{0x01, 0xF4, 0x22, 0x30, 0x08, 0x31, 0x43, 0x70, 0x72, 0xAC,
+                                                        0xAD, 0xFF, 0xFF}));
+  // Horloge et bloc lus avant, relecture juste après l'écriture.
+  const auto &log = b.boiler.frame_log;
+  size_t w = 0;
+  while (log[w].first != 0xF4)
+    w++;
+  CHECK(log[w + 1] == (std::pair<uint8_t, uint16_t>{0xF7, 0x2230}));
+  bool clock_before = false, block_before = false;
+  for (size_t i = 0; i < w; i++) {
+    clock_before |= log[i].second == VITO_CLOCK_ADDRESS;
+    block_before |= log[i] == std::pair<uint8_t, uint16_t>{0xF7, 0x2230} && clock_before;
+  }
+  CHECK(clock_before && block_before);
+  // Fin de plage 14:20, restauration vers 14:22.
+  run_boost(b, x.glue, BOOT + MIN, 25 * MIN);
+  CHECK(x.glue.seq.idle());
+  CHECK(b.boiler.registers[0x2230] == LOOP_SUNDAY);
+  CHECK(!x.glue.flash_has);
+  CHECK(x.glue.seq.status() == "Programmation restaurée (vérifiée par relecture)");
+  CHECK_EQ(writes_to(b.boiler, 0x2230), 2);
+  CHECK_EQ(b.boiler.write_frames, 2);  // rien d'autre : ni 0x0846, ni les autres programmes
+  CHECK_EQ(writes_to(b.boiler, 0x0846), 0);
+  CHECK(b.failures.empty());
+  CHECK(b.successes[x.modes.base.burner] >= 50);
+}
+
+TEST(sim_v05_boost_disabled_by_default) {
+  for (int config = 0; config < 2; config++) {
+    Bench b;
+    BoostBench x(b, false);  // enable_schedule_writes: false
+    b.enable_writes = config == 1;
+    run_boost(b, x.glue, 0, BOOT);
+    CHECK(x.glue.start(10, ha_now(BOOT), BOOT) == "disabled");
+    CHECK(!x.glue.restore(BOOT));
+    run_boost(b, x.glue, BOOT, H);
+    CHECK_EQ(b.boiler.write_frames, 0);
+    CHECK(b.boiler.registers[0x2230] == LOOP_SUNDAY);
+  }
+  // Le séquenceur lui-même ne peut rien faire passer sans l'autorisation :
+  // une écriture de bloc est refusée au dépôt et à l'émission.
+  Bench b;
+  BoostBench x(b, false);
+  b.enable_writes = true;
+  run_boost(b, x.glue, 0, BOOT);
+  const uint8_t block[8] = {0x31, 0x43, 0x70, 0x72, 0xAC, 0xAD, 0xFF, 0xFF};
+  CHECK(!b.submit_block_write(0x2230, block, BOOT));
+  b.writes.submit_block(WriteArbiter::BOOST_OWNER, 0x2230, block, BOOT);  // contournement
+  run_boost(b, x.glue, BOOT, MIN);
+  CHECK_EQ(b.block_refused_at_send, 1);
+  CHECK_EQ(b.boiler.write_frames, 0);
+}
+
+TEST(sim_v05_only_loop_blocks_can_be_written) {
+  Bench b;
+  BoostBench x(b);
+  run_boost(b, x.glue, 0, BOOT);
+  const uint8_t block[8] = {0x31, 0x43, 0x70, 0x72, 0xAC, 0xAD, 0xFF, 0xFF};
+  for (uint16_t a : {0x2000, 0x2030, 0x3000, 0x2100, 0x2238, 0x088E, 0x0846, 0x2301})
+    CHECK(!b.submit_block_write(a, block, BOOT));
+  // Injectés directement dans l'arbitre : refusés juste avant l'émission.
+  uint32_t t = BOOT;
+  for (uint16_t a : {0x2000, 0x2100, 0x088E, 0x2230}) {  // 0x2230 : non attendu par le séquenceur
+    b.writes.submit_block(WriteArbiter::BOOST_OWNER, a, block, t);
+    run_boost(b, x.glue, t, 15 * S);
+    t += 15 * S;
+  }
+  CHECK_EQ(b.block_refused_at_send, 4);
+  CHECK_EQ(b.boiler.write_frames, 0);
+  // Lecture ponctuelle : seulement l'horloge et les blocs du bouclage.
+  CHECK(!b.request_direct_read(0x0846, 8, t));
+  CHECK(!b.request_direct_read(0x2000, 8, t));
+  CHECK(!b.request_direct_read(0x2230, 1, t));
+}
+
+TEST(sim_v05_boost_kw_sync_loss_and_unexpected_replies) {
+  {  // Interface débranchée juste avant l'écriture : rien n'est émis.
+    Bench b;
+    BoostBench x(b);
+    run_boost(b, x.glue, 0, BOOT);
+    CHECK(x.glue.start(10, ha_now(BOOT), BOOT) == "accepted");
+    uint32_t t = BOOT;
+    while (x.glue.seq.state() != BoostState::WRITE_PENDING && t < BOOT + MIN)
+      run_boost(b, x.glue, t, 5), t += 5;
+    b.boiler.connected = false;
+    run_boost(b, x.glue, t, 2 * MIN);
+    CHECK(x.glue.seq.idle());
+    CHECK(!x.glue.flash_has);
+    CHECK_EQ(b.boiler.write_frames, 0);
+    b.boiler.connected = true;
+    run_boost(b, x.glue, t + 2 * MIN, 30 * MIN);
+    CHECK_EQ(b.boiler.write_frames, 0);  // jamais réémise
+    CHECK(b.boiler.registers[0x2230] == LOOP_SUNDAY);
+  }
+  {  // Réponse de 8 octets (format VitoWiFi) : issue indéterminée, la relecture tranche.
+    Bench b;
+    BoostBench x(b);
+    b.boiler.write_faults[0x2230] = SimBoiler::WriteFault::LONG_REPLY;
+    run_boost(b, x.glue, 0, BOOT);
+    x.glue.start(10, ha_now(BOOT), BOOT);
+    run_boost(b, x.glue, BOOT, MIN);
+    CHECK(b.block_write_results.front() == KwResult::RESPONSE_TOO_LONG);
+    CHECK(x.glue.seq.state() == BoostState::ACTIVE);  // appliqué : constaté par relecture
+    CHECK_EQ(b.boiler.write_frames, 1);
+  }
+  {  // Accusé 00 mais bloc inchangé : refus constaté, sauvegarde effacée.
+    Bench b;
+    BoostBench x(b);
+    b.boiler.write_faults[0x2230] = SimBoiler::WriteFault::ACK_IGNORED;
+    run_boost(b, x.glue, 0, BOOT);
+    x.glue.start(10, ha_now(BOOT), BOOT);
+    run_boost(b, x.glue, BOOT, 30 * MIN);
+    CHECK(x.glue.seq.idle());
+    CHECK(x.glue.seq.status() == "Refusé par la régulation : bloc inchangé après écriture");
+    CHECK(!x.glue.flash_has);
+    CHECK_EQ(b.boiler.write_frames, 1);
+  }
+  {  // Accusé perdu, écriture appliquée : relecture -> plage active ; restaurée ensuite.
+    Bench b;
+    BoostBench x(b);
+    b.boiler.write_faults[0x2230] = SimBoiler::WriteFault::NO_REPLY_APPLIED;
+    run_boost(b, x.glue, 0, BOOT);
+    x.glue.start(10, ha_now(BOOT), BOOT);
+    run_boost(b, x.glue, BOOT, MIN);
+    CHECK(x.glue.seq.state() == BoostState::ACTIVE);
+    run_boost(b, x.glue, BOOT + MIN, 25 * MIN);
+    CHECK(x.glue.seq.idle());
+    CHECK(b.boiler.registers[0x2230] == LOOP_SUNDAY);
+  }
+}
+
+TEST(sim_v05_boost_non_conforming_read_back) {
+  // Le bloc relu après l'écriture n'est ni le temporaire ni l'origine :
+  // état indéterminé, sauvegarde conservée, plus aucune écriture.
+  Bench b;
+  BoostBench x(b);
+  run_boost(b, x.glue, 0, BOOT);
+  x.glue.start(10, ha_now(BOOT), BOOT);
+  uint32_t t = BOOT;
+  while (x.glue.seq.state() != BoostState::VERIFY_PENDING && t < BOOT + MIN)
+    run_boost(b, x.glue, t, 5), t += 5;
+  b.boiler.registers[0x2230] = {0x31, 0x43, 0x70, 0x71, 0xAC, 0xAD, 0xFF, 0xFF};
+  run_boost(b, x.glue, t, H);
+  CHECK(x.glue.seq.recovery_required());
+  CHECK(x.glue.flash_has);
+  CHECK_EQ(b.boiler.write_frames, 1);
+  CHECK(x.glue.start(10, ha_now(t + H), t + H) == "recovery");
+}
+
+TEST(sim_v05_boost_panel_change_never_overwritten) {
+  Bench b;
+  BoostBench x(b);
+  run_boost(b, x.glue, 0, BOOT);
+  x.glue.start(10, ha_now(BOOT), BOOT);
+  run_boost(b, x.glue, BOOT, MIN);
+  const std::vector<uint8_t> edited = {0x31, 0x43, 0x70, 0x72, 0xA8, 0xAD, 0xFF, 0xFF};
+  b.boiler.registers[0x2230] = edited;  // modification depuis le panneau
+  run_boost(b, x.glue, BOOT + MIN, 30 * MIN);
+  CHECK(x.glue.seq.recovery_required());
+  CHECK(b.boiler.registers[0x2230] == edited);
+  CHECK_EQ(b.boiler.write_frames, 1);
+}
+
+TEST(sim_v05_boost_power_cut_while_active_then_manual_restore) {
+  for (BoostState cut_at : {BoostState::WRITE_PENDING, BoostState::VERIFY_PENDING, BoostState::ACTIVE,
+                            BoostState::RESTORE_VERIFY}) {
+    Bench b;
+    BoostBench x(b);
+    run_boost(b, x.glue, 0, BOOT);
+    x.glue.start(10, ha_now(BOOT), BOOT);
+    uint32_t t = BOOT;
+    while (x.glue.seq.state() != cut_at && t < BOOT + 40 * MIN)
+      run_boost(b, x.glue, t, 5), t += 5;
+    CHECK(x.glue.seq.state() == cut_at);
+    // Coupure : RAM de l'ESP perdue, flash et régulation conservées.
+    b.reboot(t);
+    x.glue.boot();
+    b.boiler_only(t, 5 * S);
+    const int frames = b.boiler.write_frames;
+    run_boost(b, x.glue, t + 5 * S, H);
+    CHECK_EQ(b.boiler.write_frames, frames);  // aucune écriture automatique au démarrage
+    if (x.glue.flash_has) {
+      CHECK(x.glue.seq.recovery_required());
+      CHECK(x.glue.start(10, ha_now(t + H), t + H) == "recovery");  // tout nouveau déclenchement bloqué
+      CHECK(x.glue.restore(t + H));
+      run_boost(b, x.glue, t + H, 2 * MIN);
+      CHECK(x.glue.seq.idle());
+      CHECK(!x.glue.flash_has);
+    }
+    CHECK(b.boiler.registers[0x2230] == LOOP_SUNDAY);
+    if (vltest::failures() > 0)
+      std::printf("    coupure en %s\n", boost_state_to_string(cut_at));
+  }
+}
+
+TEST(sim_v05_boost_and_a1_command_serialized) {
+  // Bouclage et commande de mode A1 demandés presque ensemble : une seule
+  // écriture à la fois, chacune suivie de sa relecture ; aucune régression
+  // sur A1/M2.
+  Bench b;
+  BoostBench x(b);
+  run_boost(b, x.glue, 0, BOOT);
+  CHECK(x.glue.start(10, ha_now(BOOT), BOOT) == "accepted");
+  run_boost(b, x.glue, BOOT, 3 * S);
+  CHECK(b.request_mode(x.modes.a1, ECS_ONLY, BOOT + 3 * S) == "queued");
+  run_boost(b, x.glue, BOOT + 3 * S, 2 * MIN);
+  CHECK(x.glue.seq.state() == BoostState::ACTIVE);
+  CHECK_EQ(b.mode_of(x.modes.a1), 0x00);
+  CHECK(b.verify_results.back() == VerifyResult::CONFIRMED);
+  const auto &log = b.boiler.frame_log;
+  for (size_t i = 0; i + 1 < log.size(); i++) {
+    if (log[i].first == 0xF4)
+      CHECK(log[i + 1].first == 0xF7 && log[i + 1].second == log[i].second);  // relecture immédiate
+  }
+  CHECK_EQ(writes_to(b.boiler, 0x2301), 1);
+  CHECK_EQ(writes_to(b.boiler, 0x3301), 0);
+  run_boost(b, x.glue, BOOT + 3 * S + 2 * MIN, 25 * MIN);
+  CHECK(x.glue.seq.idle());
+  CHECK(b.boiler.registers[0x2230] == LOOP_SUNDAY);
+  CHECK(b.failures.empty());
+}
+
+TEST(sim_v05_boost_refused_on_unvalidated_day_or_bad_clock) {
+  {  // Jour non validé : aucune sauvegarde, aucune écriture.
+    Bench b;
+    BoostBench x(b);
+    x.glue.config.validated_days_mask = 1u << 0;  // lundi seulement
+    x.glue.boot();
+    run_boost(b, x.glue, 0, BOOT);
+    x.glue.start(10, ha_now(BOOT), BOOT);
+    run_boost(b, x.glue, BOOT, MIN);
+    CHECK(x.glue.seq.idle());
+    CHECK_EQ(x.glue.saves, 0);
+    CHECK_EQ(b.boiler.write_frames, 0);
+  }
+  {  // Horloge Home Assistant décalée d'une heure (changement d'heure ?) : refus.
+    Bench b;
+    BoostBench x(b);
+    run_boost(b, x.glue, 0, BOOT);
+    HaTime ha = ha_now(BOOT);
+    ha.minute_of_day += 60;
+    x.glue.start(10, ha, BOOT);
+    run_boost(b, x.glue, BOOT, MIN);
+    CHECK(x.glue.seq.idle());
+    CHECK_EQ(b.boiler.write_frames, 0);
   }
 }

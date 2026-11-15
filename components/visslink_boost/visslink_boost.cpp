@@ -1,0 +1,198 @@
+#include "visslink_boost.h"
+
+#include <cstring>
+
+#include "esphome/core/hal.h"
+#include "esphome/core/log.h"
+
+namespace esphome {
+namespace visslink_boost {
+
+static const char *const TAG = "visslink.boost";
+
+void BoostButton::press_action() {
+  if (this->parent_ != nullptr)
+    this->parent_->press(this->kind_);
+}
+
+void VissLinkBoost::setup() {
+  // Sauvegarde en FLASH (pas en RTC) : elle survit à une coupure secteur.
+  this->pref_ = global_preferences->make_preference<visslink::BoostRecord>(fnv1_hash("visslink_boost_v1"), true);
+  visslink::BoostRecord record;
+  const bool loaded = this->pref_.load(&record) && visslink::boost_record_valid(record);
+  this->sequencer_.configure(this->config_);
+  this->sequencer_.boot(loaded ? &record : nullptr);
+  if (loaded) {
+    // Aucune écriture automatique au démarrage (cf. docs/bouclage-ecs-v0.5.md).
+    ESP_LOGW(TAG, "%s", this->sequencer_.status().c_str());
+  }
+  if (this->parent_ != nullptr)
+    this->parent_->set_block_client(this);
+  if (this->duration_ != nullptr)
+    this->duration_->publish_state(1);  // 20 min par défaut
+  this->publish_();
+}
+
+void VissLinkBoost::dump_config() {
+  ESP_LOGCONFIG(TAG, "VissLink circulation boost (experimental):");
+  ESP_LOGCONFIG(TAG, "  Schedule writes: %s",
+                this->parent_ != nullptr && this->parent_->schedule_writes_enabled() ? "ENABLED" : "disabled");
+  ESP_LOGCONFIG(TAG, "  Validated days mask: 0x%02X (bit 0 = Monday)", this->config_.validated_days_mask);
+  ESP_LOGCONFIG(TAG, "  State: %s", visslink::boost_state_to_string(this->sequencer_.state()));
+}
+
+void VissLinkBoost::loop() {
+  this->dispatch_(millis());
+  this->publish_();
+}
+
+void VissLinkBoost::refuse_(const std::string &why) {
+  ESP_LOGW(TAG, "Request refused: %s", why.c_str());
+  this->refusal_ = VL_TEXT("Refusé : ") + why;
+  this->publish_();
+}
+
+void VissLinkBoost::press(BoostButton::Kind kind) {
+  const uint32_t now = millis();
+  this->refusal_.clear();
+  if (kind == BoostButton::Kind::FORGET) {
+    if (!this->sequencer_.forget())
+      this->refuse_(VL_TEXT("aucune sauvegarde à oublier"));
+    return;
+  }
+  // Démarrer et restaurer écrivent dans la régulation : mêmes autorisations.
+  if (this->parent_ == nullptr || !this->parent_->schedule_writes_enabled()) {
+    this->refuse_(VL_TEXT("écritures de programmation désactivées (enable_writes / enable_schedule_writes)"));
+    return;
+  }
+  if (kind == BoostButton::Kind::RESTORE) {
+    if (!this->sequencer_.request_restore(now))
+      this->refuse_(VL_TEXT("aucune plage temporaire ni récupération en cours"));
+    return;
+  }
+  if (!this->parent_->link_ok()) {
+    this->refuse_(VL_TEXT("liaison Optolink non synchronisée"));
+    return;
+  }
+  if (!this->parent_->writes_idle() && this->sequencer_.idle()) {
+    this->refuse_(VL_TEXT("une autre commande est en cours"));
+    return;
+  }
+  visslink::HaTime ha;
+  if (this->clock_ != nullptr) {
+    const ESPTime t = this->clock_->now();
+    const int weekday = visslink::weekday_from_esphome(t.day_of_week);
+    if (t.is_valid() && weekday >= 0) {
+      ha.valid = true;
+      ha.weekday = static_cast<uint8_t>(weekday);
+      ha.minute_of_day = static_cast<uint16_t>(t.hour * 60 + t.minute);
+    }
+  }
+  const auto index = this->duration_ != nullptr ? this->duration_->active_index() : optional<size_t>();
+  const uint16_t duration = index.has_value() && index.value() < visslink::BOOST_DURATION_COUNT
+                                ? visslink::BOOST_DURATIONS[index.value()]
+                                : 0;
+  switch (this->sequencer_.start(duration, ha, now)) {
+    case visslink::BoostStart::ACCEPTED:
+      ESP_LOGI(TAG, "Circulation boost requested (%u min)", duration);
+      break;
+    case visslink::BoostStart::BUSY:
+      this->refuse_(VL_TEXT("opération déjà en cours"));
+      break;
+    case visslink::BoostStart::RECOVERY_PENDING:
+      this->refuse_(VL_TEXT("récupération nécessaire d'abord"));
+      break;
+    case visslink::BoostStart::BAD_DURATION:
+      this->refuse_(VL_TEXT("durée invalide"));
+      break;
+    case visslink::BoostStart::RATE_LIMITED:
+      this->refuse_(VL_TEXT("trop tôt après le déclenchement précédent"));
+      break;
+  }
+  this->dispatch_(now);
+}
+
+bool VissLinkBoost::persist_(const visslink::BoostRecord &record) {
+  // Écriture, synchronisation immédiate de la flash, puis relecture.
+  if (!this->pref_.save(&record) || !global_preferences->sync())
+    return false;
+  visslink::BoostRecord check;
+  return this->pref_.load(&check) && std::memcmp(&check, &record, sizeof(record)) == 0;
+}
+
+void VissLinkBoost::dispatch_(uint32_t now) {
+  for (int guard = 0; guard < 8; guard++) {
+    if (!this->has_pending_) {
+      this->pending_ = this->sequencer_.poll(now);
+      if (this->pending_.type == visslink::BoostActionType::NONE)
+        return;
+      this->has_pending_ = true;
+    }
+    const BoostAction a = this->pending_;
+    switch (a.type) {
+      case visslink::BoostActionType::READ:
+        if (!this->parent_->request_direct_read(a.address, a.length))
+          return;  // ligne occupée : nouvel essai au prochain passage
+        this->has_pending_ = false;
+        return;  // résultat via on_direct_read
+      case visslink::BoostActionType::WRITE:
+        this->has_pending_ = false;
+        if (!this->parent_->submit_block_write(a.address, a.data, now))
+          this->sequencer_.on_write(false, false, now);  // rien d'émis
+        else
+          return;  // résultat via on_block_write
+        break;
+      case visslink::BoostActionType::SAVE: {
+        this->has_pending_ = false;
+        const bool ok = this->persist_(a.record);
+        ESP_LOGI(TAG, "Backup of 0x%04X (%s): %s", a.record.address, visslink::hex_block(a.record.original).c_str(),
+                 ok ? "saved to flash" : "FAILED");
+        this->sequencer_.on_saved(ok, now);
+        break;
+      }
+      case visslink::BoostActionType::CLEAR: {
+        this->has_pending_ = false;
+        const bool ok = this->persist_(visslink::BoostRecord());
+        ESP_LOGI(TAG, "Backup cleared: %s", ok ? "ok" : "FAILED");
+        this->sequencer_.on_saved(ok, now);
+        break;
+      }
+      default:
+        this->has_pending_ = false;
+        return;
+    }
+  }
+}
+
+void VissLinkBoost::on_direct_read(uint16_t /*address*/, bool ok, const uint8_t *data, uint8_t length,
+                                   uint32_t now) {
+  this->sequencer_.on_read(ok, data, length, now);
+  this->dispatch_(now);
+}
+
+void VissLinkBoost::on_block_write(uint16_t /*address*/, bool sent, bool acked, uint32_t now) {
+  this->sequencer_.on_write(sent, acked, now);
+  this->dispatch_(now);  // relecture demandée aussitôt : l'arbitre reste occupé jusque-là
+}
+
+void VissLinkBoost::publish_() {
+  const std::string status = this->refusal_.empty() ? this->sequencer_.status() : this->refusal_;
+  if (status != this->last_status_) {
+    this->last_status_ = status;
+    ESP_LOGI(TAG, "%s [%s]", status.c_str(), visslink::boost_state_to_string(this->sequencer_.state()));
+    if (this->status_sensor_ != nullptr) {
+      std::string text = status;
+      visslink::truncate_state(text);
+      this->status_sensor_->publish_state(text);
+    }
+  }
+  if (this->active_sensor_ != nullptr &&
+      (!this->active_sensor_->has_state() || this->active_sensor_->state != this->sequencer_.active()))
+    this->active_sensor_->publish_state(this->sequencer_.active());
+  if (this->restore_sensor_ != nullptr &&
+      (!this->restore_sensor_->has_state() || this->restore_sensor_->state != this->sequencer_.recovery_required()))
+    this->restore_sensor_->publish_state(this->sequencer_.recovery_required());
+}
+
+}  // namespace visslink_boost
+}  // namespace esphome

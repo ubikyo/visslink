@@ -27,6 +27,7 @@ CONF_MAX_RETRIES = "max_retries"
 CONF_ENABLE_WRITES = "enable_writes"
 CONF_ENABLE_MODE_WRITES = "enable_mode_writes"
 CONF_ENABLE_M2_MODE_WRITE = "enable_m2_mode_write"
+CONF_ENABLE_SCHEDULE_WRITES = "enable_schedule_writes"
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -82,6 +83,8 @@ MODE_UNKNOWN_TEXT = "Inconnu"
 CONF_DIVERGENCE = "divergence"
 TEXT_SENSOR_TYPE_SCHEDULE = "schedule"
 TEXT_SENSOR_TYPE_MODE = "operating_mode"
+TEXT_SENSOR_TYPE_CLOCK = "vito_clock"
+VITO_CLOCK_ADDRESS = 0x088E
 
 
 def _is_mode_text_sensor(conf):
@@ -91,7 +94,11 @@ def _is_mode_text_sensor(conf):
 def register_addresses(domain, config):
     """Adresses des blocs lus par une entité."""
     address = config[CONF_ADDRESS]
-    if domain == "text_sensor" and not _is_mode_text_sensor(config):
+    if (
+        domain == "text_sensor"
+        and config.get(CONF_TYPE, TEXT_SENSOR_TYPE_SCHEDULE)
+        == TEXT_SENSOR_TYPE_SCHEDULE
+    ):
         return [address + SCHEDULE_DAY_STRIDE * day for day in range(SCHEDULE_DAYS)]
     return [address]
 
@@ -177,6 +184,17 @@ def _warn_if_writes_enabled(config):
             "enable_mode_writes: true",
             path=[CONF_ENABLE_M2_MODE_WRITE],
         )
+    if config[CONF_ENABLE_SCHEDULE_WRITES] and not config[CONF_ENABLE_WRITES]:
+        raise cv.Invalid(
+            "enable_schedule_writes requires enable_writes: true",
+            path=[CONF_ENABLE_SCHEDULE_WRITES],
+        )
+    if config[CONF_ENABLE_SCHEDULE_WRITES]:
+        _LOGGER.warning(
+            "VissLink: SCHEDULE BLOCK WRITES ENABLED (enable_schedule_writes: "
+            "true), circulation 0x2200-0x2237, experimental: see "
+            "docs/bouclage-ecs-v0.5.md"
+        )
     if config[CONF_ENABLE_WRITES]:
         _LOGGER.warning(
             "VissLink: Optolink WRITES ENABLED (enable_writes: true). Writes are "
@@ -226,6 +244,9 @@ CONFIG_SCHEMA = cv.All(
             # v0.4, expérimental : écriture du programme de M2 (0x3301), non
             # documentée. Exige enable_writes ET enable_mode_writes.
             cv.Optional(CONF_ENABLE_M2_MODE_WRITE, default=False): cv.boolean,
+            # v0.5, expérimental : écriture des blocs horaires du bouclage ECS
+            # (0x2200-0x2237, 8 octets). Exige enable_writes.
+            cv.Optional(CONF_ENABLE_SCHEDULE_WRITES, default=False): cv.boolean,
         }
     )
     .extend(cv.COMPONENT_SCHEMA)
@@ -254,3 +275,4 @@ async def to_code(config):
     cg.add(var.set_enable_writes(config[CONF_ENABLE_WRITES]))
     cg.add(var.set_enable_mode_writes(config[CONF_ENABLE_MODE_WRITES]))
     cg.add(var.set_enable_m2_mode_write(config[CONF_ENABLE_M2_MODE_WRITE]))
+    cg.add(var.set_enable_schedule_writes(config[CONF_ENABLE_SCHEDULE_WRITES]))

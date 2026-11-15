@@ -286,3 +286,104 @@ résultat) et ses entrées TEST sont retirées avant d'activer le groupe suivant
 
 Le surcoût vient uniquement des six entités `sensor` ; le composant n'a pas
 changé.
+
+## 6. États Éco et Party (v0.5, lecture seule)
+
+### Registres
+
+| Circuit | Éco (« Sparbetrieb ») | Party | Source | Confirmé sur la KW3 |
+|---|---|---|---|---|
+| A1 radiateurs | `0x2302` | `0x2303` | vcontrold KW (200 KW2) : `getBetriebSparM1`, `getBetriebPartyM1`, 1 octet, unité `RT` (`00` → 0, `01` → 1) | **non** |
+| M2 plancher | `0x3302` | `0x3303` | vcontrold KW : `getBetriebSparM2`, `getBetriebPartyM2`, idem | **non** |
+
+Mise en œuvre (exemple v0.5) : quatre `binary_sensor` en **lecture seule**,
+toutes les 30 s.
+
+| Entité | Adresse |
+|---|---|
+| Radiateurs - Éco | `0x2302` |
+| Radiateurs - Party | `0x2303` |
+| Plancher chauffant - Éco | `0x3302` |
+| Plancher chauffant - Party | `0x3303` |
+
+- Décodage strict de la plateforme `binary_sensor` : `00` = inactif, `01` =
+  actif, **toute autre valeur = inconnu** avec un avertissement donnant
+  l'octet reçu. L'octet brut figure toujours dans le journal DEBUG.
+- **Aucune écriture possible** : ces adresses ne sont dans aucune liste
+  blanche (consignes, programmes, blocs horaires). Une déclaration en
+  `number` ou en `select` est refusée à la validation. Aucun bouton ni
+  interrupteur n'est créé. Tests : `eco_party_registers_are_never_writable`,
+  `test_eco_party_never_writable`.
+- Adresses uniques : chacune n'est déclarée qu'une fois (contrôle de
+  configuration, test `test_eco_party_duplicate_rejected`).
+
+### Procédure de validation (Vitotrol 200 associée à M2)
+
+Noter pour chaque étape l'heure, les quatre états Home Assistant et les
+lignes `0x2302/0x2303/0x3302/0x3303 <- xx` du journal DEBUG
+(`esphome logs … | tee eco-party.log`).
+
+1. **Repos** : Éco et Party inactifs partout (vérifier sur la Vitotronic et
+   la Vitotrol 200). Relever les quatre valeurs. Attendu : `00` partout.
+2. **Éco M2** : activer Éco depuis la **Vitotrol 200**. Attendre au moins
+   deux lectures (≥ 1 min). Attendu : `0x3302` passe à `01`.
+3. **Fin d'Éco M2** : désactiver Éco depuis la Vitotrol 200. Attendu :
+   `0x3302` revient à `00`.
+4. **Party M2** : même chose avec Party → `0x3303` passe à `01`, puis
+   revient à `00` après désactivation. Noter si Party s'arrête de lui-même
+   (fin automatique) et à quelle heure.
+5. **Indépendance** : pendant les étapes 2 à 4, vérifier que `0x2302` et
+   `0x2303` (A1) **ne changent pas**. Noter aussi si Éco et Party s'excluent
+   (activer Party pendant Éco annule-t-il Éco ?).
+6. **A1** : tester `0x2302` et `0x2303` uniquement depuis une commande
+   **réellement associée à A1** (panneau de la Vitotronic, menu du circuit
+   A1, ou commande à distance de A1 s'il y en a une). La Vitotrol 200 de M2
+   ne prouve rien pour A1.
+7. **Décision** :
+   - seules `00` et `01` apparaissent, et elles suivent les commandes : les
+     `binary_sensor` sont confirmés ;
+   - une autre valeur apparaît (entité « inconnue » et avertissement
+     `unexpected binary value`) : **remplacer** l'entité par un `sensor`
+     `data_type: uint8` brut (comme le diagnostic v0.2.2), sans
+     interpréter ;
+   - aucune variation : registre non confirmé pour cet usage sur la KW3.
+
+### Charge de la liaison
+
+Simulation de l'exemple v0.5 (brûleur 30 s, températures 60 s, consignes,
+programmes, programmations, horloge), 6 h 20 :
+
+| Resynchro | Sans Éco/Party | Éco/Party à 30 s | Éco/Party à 60 s |
+|---|---|---|---|
+| Lectures/min | ~7,7 | ~15,7 | ~11,7 |
+| 2 s | brûleur 780/780, écart 34 s | 780/780, 30 s | 780/780, 32 s |
+| 3 s | 780/780, 39 s | 779/780, 45 s ; temp. 85 s | 780/780, 45 s ; temp. 73 s |
+| 3,5 s | 780/780, 46 s | **765/780**, 60 s ; temp. 99 s | 778/780, 53 s |
+| 4 s | 779/780, 48 s | **700/780**, 80 s ; temp. 109 s | 763/780, 64 s |
+
+Les 30 s demandés **doublent** la charge. Jusqu'à 3 s de resynchro, l'effet
+est négligeable. Au-delà, le brûleur perd des lectures (10 % à 4 s). Pour
+la validation, 30 s convient. Pour l'usage courant (présence),
+**60 s est recommandé** si la resynchro réelle dépasse 3 s : la ligne
+`write timing` (v0.4.1) donne l'attente du `0x05` mesurée sur la chaudière.
+
+### Perspectives (non implémentées)
+
+Ces états serviront plus tard au pilotage par présence depuis Home
+Assistant. Rien n'est automatisé. Avant toute écriture, il faudra étudier :
+
+- **la commande** : vcontrold déclare `setBetriebSparM1` (`0x2302`) et
+  `setBetriebPartyM1/M2` (`0x2303`, `0x3303`) pour la KW2, **pas**
+  `setBetriebSparM2` (`0x3302`) ; rien pour la KW3 ;
+- **les programmations horaires** : Éco et Party sont des dérogations
+  temporaires. À quelle bascule de plage prennent-ils fin ? Party a une
+  fin automatique ;
+- **les modes A1/M2** (`0x2301`, `0x3301`) : effet en « ECS seule » ou
+  « Arrêt » ;
+- **les consignes** : Éco s'appuie sur la consigne réduite (`0x2307`,
+  `0x3307`) et Party sur la consigne Party (`0x2308`, `0x3308`, non lue) ;
+- **la Vitotrol 200** : priorité entre une commande Optolink et une commande
+  manuelle, et effet d'une écriture sur l'affichage de la Vitotrol.
+
+Principe inchangé : la régulation climatique reste assurée par la
+Vitotronic. VissLink ne ferait que demander une dérogation, puis la relire.

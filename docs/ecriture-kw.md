@@ -70,10 +70,13 @@ Exemple : consigne A1 normale (`0x2306`) à 21 °C → `01 F4 23 06 01 15`.
   octet = `response too long`. Rien pendant `response_timeout` = `response
   timeout`. Dans ces trois derniers cas, la ligne est resynchronisée
   (`RECOVERY`, 200 ms de silence) comme après une erreur de lecture.
-- **Longueur** : **un octet seulement** (`MAX_WRITE_LENGTH = 1`). Pour une
+- **Longueur** : **un octet** pour les consignes et les programmes. Pour une
   écriture de N > 1 octets, VitoWiFi attend N octets de réponse et vcontrold
   un seul. Les sources ne s'accordent que pour N = 1, et toutes les
-  consignes visées sont des uint8.
+  consignes visées sont des uint8. v0.5 : seule exception, les blocs
+  horaires du bouclage (8 octets), dans un chemin expérimental isolé où
+  toute réponse autre que `00` est une issue indéterminée tranchée par
+  relecture (`docs/bouclage-ecs-v0.5.md`).
 - **Après toute tentative** (acceptée, refusée, sans réponse) : relecture
   immédiate et prioritaire du registre, puis comparaison avec la valeur
   demandée. Cette relecture est le seul moyen fiable de savoir si la
@@ -200,7 +203,7 @@ n'y a pas de migration automatique.
 | Désactivées par défaut, activation explicite | `enable_writes` (défaut `false`) ; avertissement `WRITES ENABLED` à la validation ; sinon toute demande est refusée avant l'arbitre |
 | Liste blanche | `number.py` (validation YAML) **et** `write_guard.h` (vérifié au dépôt **et** juste avant l'émission) ; un test vérifie que les deux listes sont identiques et contiennent exactement `0x2306`, `0x2307`, `0x3306`, `0x3307`, `0x6300` |
 | Contrôle avant émission | `VissLinkRegister::write_allowed()` refuse par défaut ; seul `VissLinkNumber` l'accepte après un contrôle complet (liste blanche, 1 octet, bornes du YAML **et** plage documentée) refait juste avant `request_write` ; test `sim_v03_send_time_check_blocks_corrupted_requests` |
-| Longueur et type | uint8, 1 octet, contrôlé par la liste blanche et par le moteur KW (`MAX_WRITE_LENGTH`) |
+| Longueur et type | uint8, 1 octet, contrôlé par la liste blanche ; le moteur KW n'accepte que 1 octet, ou 8 pour les blocs horaires du bouclage (v0.5, chemin expérimental isolé, `docs/bouclage-ecs-v0.5.md`) |
 | Valeurs | consignes : finie, entière, dans `min_value..max_value` (déjà refusé par ESPHome au-delà) **et** dans la plage documentée ; programmes : `00`, `03`, `05` exclusivement |
 | Programmes de fonctionnement | `enable_mode_writes` (défaut `false`, exige `enable_writes`) ; M2 : en plus `enable_m2_mode_write` (défaut `false`, exige les deux autres) ; autorisations revérifiées à la demande **et** juste avant l'émission ; liste blanche distincte (`0x2301`, `0x3301`) ; une commande de programme à la fois ; relecture de A1 **et** M2 ; divergence affichée sans correction (§ 9) |
 | Adresse inconnue | refusée à la configuration, au dépôt et à l'émission |

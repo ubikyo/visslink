@@ -361,11 +361,29 @@ class WriteArbiter {
   };
 
   struct Request {
-    int owner;       ///< index du registre (même index que l'ordonnanceur)
+    int owner;       ///< index du registre (même index que l'ordonnanceur), ou BOOST_OWNER
     uint16_t address;
-    uint8_t value;
+    uint8_t value;   ///< écriture d'un octet
     uint32_t requested_ms;
+    uint8_t length{1};  ///< 1, ou 8 pour un bloc horaire (v0.5)
+    uint8_t data[8]{};  ///< bloc horaire
   };
+
+  /// Propriétaire des écritures de blocs horaires (bouclage ECS, v0.5).
+  static constexpr int BOOST_OWNER = -2;
+
+  /// Dépose l'écriture d'un bloc de 8 octets. Jamais de remplacement : une
+  /// seule demande à la fois pour ce propriétaire.
+  Submit submit_block(int owner, uint16_t address, const uint8_t *data, uint32_t now) {
+    if (this->has_request(owner) || this->count_ >= MAX_PENDING)
+      return Submit::FULL;
+    Request r{owner, address, data[0], now};
+    r.length = 8;
+    for (uint8_t i = 0; i < 8; i++)
+      r.data[i] = data[i];
+    this->pending_[this->count_++] = r;
+    return Submit::QUEUED;
+  }
 
   /// Dépose (ou remplace) la demande d'une entité.
   Submit submit(int owner, uint16_t address, uint8_t value, uint32_t now) {
