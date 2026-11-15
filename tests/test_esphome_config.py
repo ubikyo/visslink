@@ -1019,3 +1019,41 @@ def test_eco_party_duplicate_rejected(repo_root, tmp_path):
         repo_root, tmp_path, lambda s: s.replace("address: 0x3303", "address: 0x3302")
     )
     assert result.returncode != 0, result.stdout
+
+
+# --- Essai en lecture seule v0.5 ----------------------------------------------
+
+ESSAI_V05 = "examples/iot-viessmann-essai-lecture-v0.5.yaml"
+
+
+def test_read_only_trial_config_valid_and_without_writes(repo_root, tmp_path):
+    result = _run_config(repo_root, tmp_path, example=ESSAI_V05)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    for flag in (
+        "enable_writes",
+        "enable_mode_writes",
+        "enable_m2_mode_write",
+        "enable_schedule_writes",
+    ):
+        assert f"{flag}: false" in out, flag
+    assert "validated_days: []" in out
+    assert "ENABLED" not in out
+    for address in ("0x88E", "0x846", "0x2302", "0x2303", "0x3302", "0x3303"):
+        assert out.count(f"address: {address}\n") == 1, address
+
+
+def test_read_only_trial_only_adds_read_entities(repo_root):
+    example = _active_lines((repo_root / EXAMPLE).read_text(encoding="utf-8"))
+    trial = _active_lines((repo_root / ESSAI_V05).read_text(encoding="utf-8"))
+    removed = [line for line in example.splitlines() if line not in trial.splitlines()]
+    assert removed == [], removed
+    added = [line for line in trial.splitlines() if line not in example.splitlines()]
+    allowed = re.compile(
+        r"^\s+(- platform: visslink|visslink_id: viessmann|"
+        r"name: \"TEST — Bouclage[^\"]*\"|address: 0x0846|"
+        r"data_type: uint8|update_interval: (60s|10min)|accuracy_decimals: 0|"
+        r"entity_category: diagnostic|(monday|tuesday|wednesday|thursday|friday|"
+        r"saturday|sunday):)$"
+    )
+    assert all(allowed.match(line) for line in added), added
