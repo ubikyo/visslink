@@ -190,7 +190,8 @@ class VissLinkNumber : public number::Number, public VissLinkRegister {
 /// Programme de fonctionnement en lecture seule stricte (v0.3) : texte
 /// « ECS seule » (00), « Chauffage + ECS » (03), « Arrêt » (05), « Inconnu »
 /// pour toute autre valeur ou un échec de lecture. Jamais écrit : aucune
-/// commande n'existe pour cette entité (M2, 0x3301).
+/// commande n'existe pour cette entité (0x2301 ou 0x3301). Variante non
+/// modifiable du sélecteur.
 class VissLinkModeText : public text_sensor::TextSensor, public VissLinkRegister {
  public:
   void set_parent(VissLinkComponent *parent) { this->parent_ = parent; }
@@ -210,12 +211,13 @@ class VissLinkModeText : public text_sensor::TextSensor, public VissLinkRegister
 #endif
 
 #ifdef USE_SELECT
-/// Programme de fonctionnement modifiable (v0.3, expérimental) : 0x2301 (A1)
-/// seulement, le registre dont l'écriture est documentée. Options : ECS seule (00), Chauffage + ECS (03),
-/// Arrêt (05). Toute autre valeur lue rend l'état inconnu, avec un
-/// avertissement. L'état publié provient toujours d'une lecture. L'écriture
-/// exige `enable_writes` ET `enable_mode_writes`, et n'est possible que sur
-/// les adresses de MODE_WRITE_WHITELIST (0x2301 seulement).
+/// Programme de fonctionnement modifiable (v0.4, expérimental) : 0x2301 (A1)
+/// ou 0x3301 (M2). Options : ECS seule (00), Chauffage + ECS (03), Arrêt
+/// (05). Toute autre valeur lue rend l'état inconnu, avec un avertissement.
+/// L'état publié provient toujours d'une lecture. Écriture : A1 exige
+/// `enable_writes` ET `enable_mode_writes` ; M2 exige en plus
+/// `enable_m2_mode_write` (mode_write_permitted, vérifié à la demande et
+/// juste avant l'émission).
 class VissLinkModeSelect : public select::Select, public VissLinkRegister {
  public:
   void set_parent(VissLinkComponent *parent) { this->parent_ = parent; }
@@ -264,6 +266,9 @@ class VissLinkComponent : public Component, public uart::UARTDevice {
   /// Écriture des programmes de fonctionnement (v0.3, expérimental) : false
   /// par défaut, exige aussi enable_writes.
   void set_enable_mode_writes(bool enable) { this->enable_mode_writes_ = enable; }
+  /// Écriture du programme de M2 (0x3301, v0.4, non documentée) : false par
+  /// défaut, exige aussi enable_writes et enable_mode_writes.
+  void set_enable_m2_mode_write(bool enable) { this->enable_m2_mode_write_ = enable; }
 
 #ifdef USE_NUMBER
   /// Demande d'écriture venant de Home Assistant (VissLinkNumber::control).
@@ -298,6 +303,7 @@ class VissLinkComponent : public Component, public uart::UARTDevice {
   bool link_ok_{false};
   bool enable_writes_{false};
   bool enable_mode_writes_{false};
+  bool enable_m2_mode_write_{false};
   ReadBackTracker read_back_;
   bool mode_write_checked_{false};  ///< écriture de programme : divergence à journaliser après les relectures
   VissLinkRegister *mode_registers_[2]{};  ///< sélecteurs de programme (A1, M2), au plus deux

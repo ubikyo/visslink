@@ -51,6 +51,7 @@ struct Bench {
   // v0.3 : écritures (même logique que VissLinkComponent).
   bool enable_writes{false};
   bool enable_mode_writes{false};
+  bool enable_m2_mode_write{false};
   ReadBackTracker read_back;
   std::map<size_t, int> mode_state;  ///< programme publié (brut 00/03/05, -1 = inconnu)
   std::vector<ModeDivergence> divergence_log;  ///< divergence A1/M2 après chaque relecture de programme
@@ -139,14 +140,20 @@ struct Bench {
     bool busy = false;
     for (size_t i = 0; i < regs.size(); i++)
       busy |= regs[i].mode && writes.has_request(static_cast<int>(i));
-    if (!enable_writes)
-      return "disabled";
-    if (!enable_mode_writes)
-      return "mode disabled";
+    switch (mode_write_permitted(r.address, enable_writes, enable_mode_writes, enable_m2_mode_write)) {
+      case ModePermission::OK:
+        break;
+      case ModePermission::WRITES_DISABLED:
+        return "disabled";
+      case ModePermission::MODE_WRITES_DISABLED:
+        return "mode disabled";
+      case ModePermission::M2_WRITE_DISABLED:
+        return "m2 disabled";
+      case ModePermission::NOT_WHITELISTED:
+        return "read-only";
+    }
     if (option >= OPERATING_MODE_COUNT)
       return write_check_to_string(WriteCheck::VALUE_NOT_ALLOWED);
-    if (!is_mode_write_whitelisted(r.address))
-      return "read-only";
     if (check_mode_write(r.address, 1, value) != WriteCheck::OK)
       return write_check_to_string(check_mode_write(r.address, 1, value));
     if (mode_of(index) < 0)
@@ -329,7 +336,10 @@ struct Bench {
         const bool number_ok = r.number && find_writable(w.address) != nullptr &&
                                check_write_value(w.address, 1, w.value, r.min, r.max, &encoded) == WriteCheck::OK &&
                                encoded == w.value;
-        const bool mode_ok = r.mode && is_mode_register(w.address) && check_mode_write(w.address, 1, w.value) == WriteCheck::OK;
+        const bool mode_ok =
+            r.mode && is_mode_register(w.address) && check_mode_write(w.address, 1, w.value) == WriteCheck::OK &&
+            mode_write_permitted(w.address, enable_writes, enable_mode_writes, enable_m2_mode_write) ==
+                ModePermission::OK;
         const bool allowed = r.address == w.address && is_write_whitelisted(w.address) && (number_ok || mode_ok);
         if (allowed && kw.request_write(w.address, &w.value, 1, now)) {
           write_in_flight = true;
@@ -1474,16 +1484,18 @@ TEST(sim_v03_lost_ack_is_indeterminate_until_readback) {
 namespace {
 
 /// Consignes (sans programmations horaires) + programmes A1 et M2, lus à
-/// 03 (Chauffage + ECS). Chaudière simulée : 0x2301 accepte l'écriture,
-/// 0x3301 non (jamais sollicité de toute façon).
+/// 03 (Chauffage + ECS). Chaudière simulée : 0x2301 et 0x3301 acceptent
+/// l'écriture, pour qu'une trame M2 non autorisée se voie (registre modifié).
 struct Modes {
   V03 base;
   size_t a1, m2;
-  Modes(Bench &b, bool mode_writes = true) : base(b, false) {
+  Modes(Bench &b, bool mode_writes = true, bool m2_write = false) : base(b, false) {
     b.enable_mode_writes = mode_writes;
+    b.enable_m2_mode_write = m2_write;
     b.boiler.registers[0x2301] = {0x03};
     b.boiler.registers[0x3301] = {0x03};
     b.boiler.writable.insert(0x2301);
+    b.boiler.writable.insert(0x3301);
     a1 = b.add_mode(0x2301, 5 * MIN, 0);
     m2 = b.add_mode(0x3301, 5 * MIN, 0);
   }
@@ -1629,18 +1641,29 @@ TEST(sim_v03_mode_timeout_never_resent) {
   }
 }
 
-TEST(sim_v03_mode_m2_read_only_and_values_refused) {
+TEST(sim_v04_mode_values_refused_and_m2_needs_third_permission) {
   Bench b;
-  Modes m(b);
+  Modes m(b);  // enable_writes + enable_mode_writes, sans enable_m2_mode_write
   CHECK(b.request_mode(m.a1, OFF, 0) == "not read");
   b.run(0, BOOT);
   for (size_t option : {ECS_ONLY, HEATING_ECS, OFF})
-    CHECK(b.request_mode(m.m2, option, BOOT) == "read-only");  // 0x3301 : non documentée
-  for (size_t option : {size_t(3), size_t(4), size_t(255)})
+    CHECK(b.request_mode(m.m2, option, BOOT) == "m2 disabled");  // 0x3301 : troisième autorisation
+  for (size_t option : {size_t(3), size_t(4), size_t(255)}) {
     CHECK(b.request_mode(m.a1, option, BOOT) == "operating mode value not allowed (only 00, 03, 05)");
+    CHECK(b.request_mode(m.m2, option, BOOT) == "m2 disabled");  // l'autorisation passe avant tout
+  }
   CHECK(b.request_mode(m.a1, HEATING_ECS, BOOT) == "unchanged");
   b.run(BOOT, 10 * MIN);
   CHECK_EQ(b.boiler.write_frames, 0);
+
+  Bench c;
+  Modes n(c, true, true);  // trois autorisations
+  c.run(0, BOOT);
+  for (size_t option : {size_t(3), size_t(4), size_t(255)})
+    CHECK(c.request_mode(n.m2, option, BOOT) == "operating mode value not allowed (only 00, 03, 05)");
+  CHECK(c.request_mode(n.m2, HEATING_ECS, BOOT) == "unchanged");
+  c.run(BOOT, 10 * MIN);
+  CHECK_EQ(c.boiler.write_frames, 0);
 }
 
 TEST(sim_v03_mode_one_command_at_a_time) {
@@ -1672,4 +1695,129 @@ TEST(sim_v03_mode_no_write_without_request_reboot_or_reconnect) {
   b.run(33 * MIN, H);
   CHECK_EQ(b.boiler.write_frames, 0);
   CHECK_EQ(b.mode_of(m.a1), 0x03);
+}
+
+// --- v0.4 : programme de M2 (0x3301), troisième autorisation -----------------
+
+TEST(sim_v04_m2_write_with_three_permissions) {
+  // M2 03 -> 00 puis retour : relecture de M2 ET de A1 après chaque
+  // commande, divergence affichée, A1 jamais écrit.
+  Bench b;
+  Modes m(b, true, true);
+  b.run(0, BOOT);
+  CHECK(b.request_mode(m.m2, ECS_ONLY, BOOT) == "queued");
+  CHECK_EQ(b.mode_of(m.m2), 0x03);  // rien n'est publié avant la relecture
+  b.run(BOOT, MIN);
+  CHECK(b.boiler.write_log.back() == (std::vector<uint8_t>{0x01, 0xF4, 0x33, 0x01, 0x01, 0x00}));
+  CHECK_EQ(b.mode_of(m.m2), 0x00);
+  CHECK_EQ(b.mode_of(m.a1), 0x03);
+  CHECK(b.verify_results.back() == VerifyResult::CONFIRMED);
+  CHECK(b.divergence_after_write == std::vector<ModeDivergence>{ModeDivergence::DIFFERENT});
+  CHECK(b.request_mode(m.m2, HEATING_ECS, BOOT + MIN) == "queued");
+  b.run(BOOT + MIN, MIN);
+  CHECK(b.divergence_after_write.back() == ModeDivergence::SAME);
+  CHECK(both_read_back_after_each_write(b.boiler));
+  CHECK_EQ(b.boiler.write_frames_by_address[0x2301], 0);
+  CHECK_EQ(b.boiler.write_frames, 2);
+  CHECK(b.failures.empty());
+}
+
+TEST(sim_v04_m2_permission_matrix) {
+  // Les 8 combinaisons des trois options : M2 n'est écrit que si les trois
+  // sont vraies ; A1 si les deux premières le sont.
+  for (int mask = 0; mask < 8; mask++) {
+    const bool writes = mask & 1, modes = mask & 2, m2 = mask & 4;
+    Bench b;
+    Modes m(b, modes, m2);
+    b.enable_writes = writes;
+    b.run(0, BOOT);
+    b.request_mode(m.m2, OFF, BOOT);
+    b.run(BOOT, MIN);
+    b.request_mode(m.a1, ECS_ONLY, BOOT + MIN);
+    b.run(BOOT + MIN, MIN);
+    CHECK_EQ(b.boiler.write_frames_by_address[0x3301], writes && modes && m2 ? 1 : 0);
+    CHECK_EQ(b.boiler.write_frames_by_address[0x2301], writes && modes ? 1 : 0);
+    CHECK_EQ(b.boiler_value(0x3301), writes && modes && m2 ? 0x05 : 0x03);
+  }
+}
+
+TEST(sim_v04_m2_never_written_without_third_permission_after_reboot_reconnect) {
+  Bench b;
+  Modes m(b);  // enable_m2_mode_write: false
+  b.run(0, BOOT);
+  uint32_t t = BOOT;
+  for (int cycle = 0; cycle < 3; cycle++) {
+    CHECK(b.request_mode(m.m2, cycle == 1 ? OFF : ECS_ONLY, t) == "m2 disabled");
+    b.boiler.connected = false;  // coupure de la liaison
+    b.run(t, 2 * MIN);
+    b.boiler.connected = true;  // reconnexion
+    b.run(t + 2 * MIN, 5 * MIN);
+    CHECK(b.request_mode(m.m2, OFF, t + 7 * MIN) == "m2 disabled");
+    b.reboot(t + 7 * MIN);  // redémarrage de l'ESP
+    b.boiler_only(t + 7 * MIN, 3 * S);
+    b.run(t + 7 * MIN + 3 * S, 5 * MIN);
+    CHECK(b.request_mode(m.m2, OFF, t + 12 * MIN + 3 * S) == "m2 disabled");
+    t += 13 * MIN;
+    b.run(t - 57 * S, 57 * S);
+  }
+  b.run(t, H);
+  CHECK_EQ(b.boiler.write_frames, 0);
+  CHECK_EQ(b.boiler_value(0x3301), 0x03);
+  CHECK_EQ(b.mode_of(m.m2), 0x03);
+}
+
+TEST(sim_v04_m2_never_written_after_a1_timeout_or_concurrently) {
+  for (auto fault : {SimBoiler::WriteFault::NO_REPLY_LOST, SimBoiler::WriteFault::NO_REPLY_APPLIED,
+                     SimBoiler::WriteFault::NACK_SYNC}) {
+    Bench b;
+    Modes m(b);  // enable_m2_mode_write: false
+    b.boiler.write_faults[0x2301] = fault;
+    b.run(0, BOOT);
+    CHECK(b.request_mode(m.a1, OFF, BOOT) == "queued");
+    CHECK(b.request_mode(m.m2, OFF, BOOT) == "m2 disabled");  // concurrente : refusée d'abord par l'autorisation
+    for (uint32_t t = BOOT; t < BOOT + MIN; t += 1 * S) {
+      CHECK(b.request_mode(m.m2, ECS_ONLY, t) == "m2 disabled");  // pendant l'écriture A1 et ses relectures
+      b.run(t, 1 * S);
+    }
+    b.run(BOOT + MIN, 30 * MIN);
+    CHECK_EQ(b.boiler.write_frames, 1);  // la seule écriture A1, jamais réémise
+    CHECK_EQ(b.boiler.write_frames_by_address[0x3301], 0);
+    CHECK_EQ(b.boiler_value(0x3301), 0x03);
+  }
+  // Avec la troisième autorisation : une commande M2 pendant celle de A1 est
+  // refusée (une écriture de programme à la fois), pas mise en file.
+  Bench c;
+  Modes n(c, true, true);
+  c.run(0, BOOT);
+  CHECK(c.request_mode(n.a1, OFF, BOOT) == "queued");
+  CHECK(c.request_mode(n.m2, OFF, BOOT) == "busy");
+  c.run(BOOT, 5 * S);
+  CHECK(c.request_mode(n.m2, OFF, BOOT + 5 * S) == "busy");
+  c.run(BOOT + 5 * S, MIN);
+  CHECK_EQ(c.boiler.write_frames, 1);
+  CHECK_EQ(c.boiler.write_frames_by_address[0x3301], 0);
+}
+
+TEST(sim_v04_m2_send_time_check_blocks_bypassed_requests) {
+  // Défense en profondeur : une demande M2 déposée directement dans
+  // l'arbitre (sans passer par le contrôle de dépôt) est refusée juste avant
+  // l'émission tant que enable_m2_mode_write est faux.
+  Bench b;
+  Modes m(b);
+  b.run(0, BOOT);
+  b.writes.submit(static_cast<int>(m.m2), 0x3301, 0x05, BOOT);
+  b.run(BOOT, MIN);
+  CHECK_EQ(b.refused_at_send, 1);
+  CHECK_EQ(b.boiler.write_frames, 0);
+  // Autorisée au dépôt puis retirée avant l'émission : refusée aussi.
+  Bench c;
+  Modes n(c, true, true);
+  c.run(0, BOOT);
+  CHECK(c.request_mode(n.a1, OFF, BOOT) == "queued");
+  c.run(BOOT, MIN);
+  c.writes.submit(static_cast<int>(n.m2), 0x3301, 0x05, BOOT + MIN);
+  c.enable_m2_mode_write = false;
+  c.run(BOOT + MIN, MIN);
+  CHECK_EQ(c.refused_at_send, 1);
+  CHECK_EQ(c.boiler.write_frames_by_address[0x3301], 0);
 }

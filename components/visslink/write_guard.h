@@ -57,7 +57,7 @@ inline const WritableRegister *find_writable(uint16_t address) {
   return nullptr;
 }
 
-// --- Programmes de fonctionnement (v0.3, expérimental) -----------------------
+// --- Programmes de fonctionnement (v0.3/v0.4, expérimental) ------------------
 //
 // Liste blanche DISTINCTE de celle des consignes. Valeurs lues sur la
 // Vitotronic 300 KW3 de l'installation : 00 = ECS seule, 03 = Chauffage + ECS,
@@ -66,10 +66,18 @@ inline const WritableRegister *find_writable(uint16_t address) {
 
 /// Registres de programme lisibles (sélecteur) : A1, M2.
 static constexpr uint16_t MODE_REGISTERS[] = {0x2301, 0x3301};
-/// Registres de programme dont l'écriture est documentée : 0x2301 seulement
-/// (vcontrold, setBetriebArtM1, Vitotronic 200 KW2 ; une note openv la dit
-/// impossible sur un autre appareil). 0x3301 : aucune source, lecture seule.
-static constexpr uint16_t MODE_WRITE_WHITELIST[] = {0x2301};
+/// Registres de programme inscriptibles (v0.4), tous deux expérimentaux :
+///  - 0x2301 (A1) : écriture documentée par vcontrold (setBetriebArtM1,
+///    Vitotronic 200 KW2) ; une note openv la dit impossible sur un autre
+///    appareil ;
+///  - 0x3301 (M2) : écriture NON documentée (vcontrold : lecture seule) ;
+///    exige une troisième autorisation, enable_m2_mode_write.
+static constexpr uint16_t MODE_WRITE_WHITELIST[] = {
+    0x2301,  // Radiateurs A1 - expérimental
+    0x3301,  // Plancher M2 - expérimental, écriture non documentée
+};
+/// Programme de M2 : écriture soumise à enable_m2_mode_write.
+static constexpr uint16_t M2_MODE_REGISTER = 0x3301;
 static constexpr size_t MODE_WRITE_COUNT = sizeof(MODE_WRITE_WHITELIST) / sizeof(MODE_WRITE_WHITELIST[0]);
 /// Valeurs autorisées, dans l'ordre des options du sélecteur.
 static constexpr uint8_t OPERATING_MODE_VALUES[] = {0x00, 0x03, 0x05};
@@ -89,6 +97,48 @@ inline bool is_mode_write_whitelisted(uint16_t address) {
       return true;
   }
   return false;
+}
+
+/// Autorisations de configuration d'une écriture de programme, vérifiées à la
+/// demande ET juste avant l'émission :
+///  - tout programme : enable_writes ET enable_mode_writes ;
+///  - M2 (0x3301) : en plus enable_m2_mode_write.
+/// Une adresse hors de MODE_WRITE_WHITELIST n'est jamais autorisée.
+enum class ModePermission : uint8_t {
+  OK,
+  WRITES_DISABLED,       ///< enable_writes: false
+  MODE_WRITES_DISABLED,  ///< enable_mode_writes: false
+  M2_WRITE_DISABLED,     ///< enable_m2_mode_write: false
+  NOT_WHITELISTED,       ///< pas un registre de programme inscriptible
+};
+
+inline const char *mode_permission_to_string(ModePermission permission) {
+  switch (permission) {
+    case ModePermission::OK:
+      return "ok";
+    case ModePermission::WRITES_DISABLED:
+      return "writes are disabled (enable_writes: false)";
+    case ModePermission::MODE_WRITES_DISABLED:
+      return "operating mode writes are disabled (enable_mode_writes: false)";
+    case ModePermission::M2_WRITE_DISABLED:
+      return "M2 operating mode write is disabled (enable_m2_mode_write: false)";
+    case ModePermission::NOT_WHITELISTED:
+      return "not a writable operating mode register";
+  }
+  return "unknown";
+}
+
+inline ModePermission mode_write_permitted(uint16_t address, bool enable_writes, bool enable_mode_writes,
+                                           bool enable_m2_mode_write) {
+  if (!enable_writes)
+    return ModePermission::WRITES_DISABLED;
+  if (!enable_mode_writes)
+    return ModePermission::MODE_WRITES_DISABLED;
+  if (!is_mode_write_whitelisted(address))
+    return ModePermission::NOT_WHITELISTED;
+  if (address == M2_MODE_REGISTER && !enable_m2_mode_write)
+    return ModePermission::M2_WRITE_DISABLED;
+  return ModePermission::OK;
 }
 
 /// Index d'option d'une valeur lue, ou -1 si elle n'est pas un des trois
@@ -275,7 +325,7 @@ class WriteVerification {
 class WriteArbiter {
  public:
   static constexpr int NONE = -1;
-  /// Une demande par entité au plus : 5 consignes + 1 programme.
+  /// Une demande par entité au plus : 5 consignes + 2 programmes.
   static constexpr size_t MAX_PENDING = WRITABLE_REGISTER_COUNT + MODE_WRITE_COUNT;
   /// Délai minimal entre la fin d'une écriture (relecture comprise) et
   /// l'envoi de la suivante : pas de rafale, usure limitée de la mémoire de

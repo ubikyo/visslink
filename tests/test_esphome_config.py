@@ -22,6 +22,8 @@ DIAGNOSTIC = "examples/iot-viessmann-diagnostic.yaml"
 # tels que publiés.
 EXAMPLE_V022 = "tests/fixtures/iot-viessmann-v0.2.2.yaml"
 DIAGNOSTIC_V022 = "tests/fixtures/iot-viessmann-v0.2.2-diagnostic.yaml"
+# Exemple de la v0.3 (A1 en select, M2 en text_sensor), tel que publié.
+EXAMPLE_V03 = "tests/fixtures/iot-viessmann-v0.3.yaml"
 
 
 def _secrets() -> str:
@@ -179,24 +181,25 @@ INVALID_CASES = {
     "number_with_initial_value": lambda s: s.replace(
         "address: 0x2306", "address: 0x2306\n    initial_value: 20"
     ),
-    # v0.3 : modes de fonctionnement (select A1, text_sensor M2).
+    # v0.3/v0.4 : modes de fonctionnement (deux select).
     "mode_writes_without_writes": lambda s: s.replace(
         "enable_mode_writes: false", "enable_mode_writes: true"
     ),
     "mode_writes_not_boolean": lambda s: s.replace(
         "enable_mode_writes: false", "enable_mode_writes: perhaps"
     ),
-    # M2 (0x3301) : jamais un select (commande non documentée).
-    "m2_as_select": lambda s: (
-        s.replace(
-            "    address: 0x2301\n    update_interval: 5min\n",
-            "    address: 0x3301\n    update_interval: 5min\n",
-        )
-        .replace("    type: operating_mode\n", "    type: operating_mode\n", 1)
-        .replace(
-            "    address: 0x3301\n    update_interval: 5min\n    divergence:",
-            "    address: 0x2301\n    update_interval: 5min\n    divergence:",
-        )
+    # v0.4 : M2 exige enable_writes ET enable_mode_writes.
+    "m2_write_alone": lambda s: s.replace(
+        "enable_m2_mode_write: false", "enable_m2_mode_write: true"
+    ),
+    "m2_write_with_writes_only": lambda s: s.replace(
+        "enable_m2_mode_write: false", "enable_m2_mode_write: true"
+    ).replace("enable_writes: false", "enable_writes: true"),
+    "m2_write_with_mode_writes_only": lambda s: s.replace(
+        "enable_m2_mode_write: false", "enable_m2_mode_write: true"
+    ).replace("enable_mode_writes: false", "enable_mode_writes: true"),
+    "m2_write_not_boolean": lambda s: s.replace(
+        "enable_m2_mode_write: false", "enable_m2_mode_write: maybe"
     ),
     "select_on_party_register": lambda s: s.replace(
         "address: 0x2301", "address: 0x2303"
@@ -204,41 +207,67 @@ INVALID_CASES = {
     "select_on_candidate_2323": lambda s: s.replace(
         "address: 0x2301", "address: 0x2323"
     ),
+    "select_on_candidate_3323": lambda s: s.replace(
+        "address: 0x3301", "address: 0x3323"
+    ),
     "select_on_setpoint": lambda s: s.replace("address: 0x2301", "address: 0x2307"),
-    "mode_text_on_setpoint": lambda s: s.replace("address: 0x3301", "address: 0x3306"),
-    "mode_text_on_schedule": lambda s: s.replace("address: 0x3301", "address: 0x2000"),
+    "select_on_schedule": lambda s: s.replace("address: 0x3301", "address: 0x2000"),
     "same_mode_register_twice": lambda s: s.replace(
         "address: 0x3301", "address: 0x2301"
     ),
     "mode_register_also_sensor": lambda s: s.replace(
         "address: 0x0804", "address: 0x3301"
     ),
-    "unknown_text_sensor_type": lambda s: s.replace(
-        "type: operating_mode", "type: mode"
+    "mode_register_also_text_sensor": lambda s: (
+        s
+        + "\n  - platform: visslink\n    type: operating_mode\n"
+        + '    name: "M2 bis"\n    address: 0x3301\n'
     ),
-    "mode_text_with_today": lambda s: s.replace(
-        "    type: operating_mode\n",
-        '    type: operating_mode\n    today:\n      name: "X"\n',
+    "mode_text_on_setpoint": lambda s: (
+        s
+        + "\n  - platform: visslink\n    type: operating_mode\n"
+        + '    name: "X"\n    address: 0x3306\n'
+    ),
+    "unknown_text_sensor_type": lambda s: _m2_as_text(s, type_="mode"),
+    "mode_text_with_today": lambda s: _m2_as_text(
+        s, extra='    today:\n      name: "Y"\n'
     ),
     "select_with_options": lambda s: s.replace(
         "address: 0x2301", 'address: 0x2301\n    options: ["Party"]'
     ),
     "select_with_data_type": lambda s: s.replace(
-        "address: 0x2301", "address: 0x2301\n    data_type: uint8"
+        "address: 0x3301", "address: 0x3301\n    data_type: uint8"
     ),
     "two_divergence_sensors": lambda s: s.replace(
-        "    address: 0x2301\n",
-        '    address: 0x2301\n    divergence:\n      name: "Autre"\n',
+        "    address: 0x3301\n",
+        '    address: 0x3301\n    divergence:\n      name: "Autre"\n',
     ),
-    "divergence_without_a1_select": lambda s: _drop_first(
+    "divergence_without_m2": lambda s: _drop_first(
         s,
         "  - platform: visslink\n"
         "    visslink_id: viessmann\n"
-        '    name: "Radiateurs - Mode actuel"\n'
-        "    address: 0x2301\n"
+        '    name: "Plancher chauffant - Mode actuel"\n'
+        "    address: 0x3301\n"
         "    update_interval: 5min\n",
     ),
 }
+
+
+_M2_SELECT = (
+    "  - platform: visslink\n"
+    "    visslink_id: viessmann\n"
+    '    name: "Plancher chauffant - Mode actuel"\n'
+    "    address: 0x3301\n"
+    "    update_interval: 5min\n"
+)
+
+
+def _m2_as_text(text, type_="operating_mode", extra=""):
+    """M2 déclaré en text_sensor (lecture seule) au lieu du select."""
+    return _drop_first(text, _M2_SELECT) + (
+        f"\n  - platform: visslink\n    type: {type_}\n"
+        f'    name: "M2"\n    address: 0x3301\n{extra}'
+    )
 
 
 def _drop_first(text, fragment):
@@ -657,60 +686,68 @@ def test_mode_writes_need_both_flags_and_warn(repo_root, tmp_path):
 
 
 def test_example_mode_entities(repo_root, tmp_path):
-    # Une entité par circuit : A1 en select (modifiable si activé), M2 en
-    # text_sensor (lecture seule stricte), sans doublon numérique.
+    # Une entité par circuit, deux select, sans doublon numérique.
     result = _run_config(repo_root, tmp_path)
     out = result.stdout + result.stderr
     assert result.returncode == 0, out
     selects = out.partition("\nselect:\n")[2].partition("\ntext_sensor:\n")[0]
     shown = re.findall(r"name: ([^\n]+)\n    address: (0x[0-9a-fA-F]+)", selects)
-    assert shown == [("Radiateurs - Mode actuel", "0x2301")], selects
-    texts = out.partition("\ntext_sensor:\n")[2]
-    assert re.search(
-        r"address: 0x3301\n(?:    [^\n]*\n)*?    type: operating_mode\n", texts
-    ), texts
-    assert "name: Plancher chauffant - Mode actuel" in texts, texts
+    assert shown == [
+        ("Radiateurs - Mode actuel", "0x2301"),
+        ("Plancher chauffant - Mode actuel", "0x3301"),
+    ], selects
+    assert "type: operating_mode" not in out
     assert out.count("divergence:") == 1, out
     for address in ("0x2301", "0x3301"):
         assert out.count(f"address: {address}\n") == 1, address  # aucun doublon
 
 
-def test_m2_never_select(repo_root, tmp_path):
-    def transform(text):
-        head, _, _ = text.partition("\nselect:\n")
-        tail = text.partition("\n# --- Programmations horaires")[2]
-        return (
-            head
-            + "\nselect:\n  - platform: visslink\n"
-            + '    name: "M2"\n    address: 0x3301\n'
-            + "\n# --- Programmations horaires"
-            + tail.replace("    address: 0x3301\n", "    address: 0x2301\n").replace(
-                '    divergence:\n      name: "Modes A1 et M2 différents"\n', ""
-            )
-        )
+def test_example_three_write_flags_false_by_default(repo_root, tmp_path):
+    text = (repo_root / EXAMPLE).read_text(encoding="utf-8")
+    for flag in ("enable_writes", "enable_mode_writes", "enable_m2_mode_write"):
+        assert f"  {flag}: false\n" in text, flag
+        assert f"{flag}: true" not in text, flag
+
+    def transform(s):
+        for flag in ("enable_writes", "enable_mode_writes", "enable_m2_mode_write"):
+            s = _drop_first(s, f"  {flag}: false\n")
+        return s
 
     result = _run_config(repo_root, tmp_path, transform)
     out = result.stdout + result.stderr
-    assert result.returncode != 0, out
-    assert "0x3301" in out and "text_sensor" in out, out
+    assert result.returncode == 0, out
+    for flag in ("enable_writes", "enable_mode_writes", "enable_m2_mode_write"):
+        assert f"{flag}: false" in out, flag
+    assert "ENABLED" not in out
 
 
-def test_mode_text_sensor_alone_is_valid(repo_root, tmp_path):
-    # A1 et M2 tous deux en lecture seule (aucun select) : valide.
+def test_all_three_write_flags_valid_with_warnings(repo_root, tmp_path):
+    def transform(s):
+        for flag in ("enable_writes", "enable_mode_writes", "enable_m2_mode_write"):
+            s = s.replace(f"{flag}: false", f"{flag}: true")
+        return s
+
+    result = _run_config(repo_root, tmp_path, transform)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "M2 OPERATING MODE WRITE ENABLED" in out, out
+    assert "OPERATING MODE WRITES ENABLED" in out, out
+
+
+def test_mode_text_sensors_still_valid(repo_root, tmp_path):
+    # Lecture seule stricte possible pour les deux circuits (comme en v0.3).
     def transform(text):
-        text = _drop_first(
-            text,
-            "  - platform: visslink\n"
-            "    visslink_id: viessmann\n"
-            '    name: "Radiateurs - Mode actuel"\n'
-            "    address: 0x2301\n"
-            "    update_interval: 5min\n",
-        )
-        return text + (
-            "\n  - platform: visslink\n"
-            "    type: operating_mode\n"
-            '    name: "Radiateurs - Mode actuel"\n'
-            "    address: 0x2301\n"
+        head, _, tail = text.partition("\nselect:\n")
+        tail = tail.partition("\n# --- Programmations horaires")[2]
+        return (
+            head
+            + "\n# --- Programmations horaires"
+            + tail
+            + "\n  - platform: visslink\n    type: operating_mode\n"
+            + '    name: "A1"\n    address: 0x2301\n'
+            + '    divergence:\n      name: "Div"\n'
+            + "\n  - platform: visslink\n    type: operating_mode\n"
+            + '    name: "M2"\n    address: 0x3301\n'
         )
 
     result = _run_config(repo_root, tmp_path, transform)
@@ -728,14 +765,35 @@ def test_mode_tables_match_cpp(repo_root):
 
     assert as_ints(values) == list(MODES)
     assert as_ints(readable) == [0x2301, 0x3301]
-    assert as_ints(writable) == [0x2301]  # 0x3301 : écriture non documentée
+    assert as_ints(writable) == [0x2301, 0x3301]  # M2 : troisième autorisation
+    assert "M2_MODE_REGISTER = 0x3301;" in cpp
     texts = re.findall(r'case 0x0([035]):\n\s+return "([^"]+)";', cpp)
     assert [(int(v), t) for v, t in texts] == list(MODES.items())
     assert 'return "Inconnu";' in cpp
     py = (repo_root / "components/visslink/__init__.py").read_text(encoding="utf-8")
     assert "MODE_REGISTERS = (0x2301, 0x3301)" in py
-    assert "MODE_WRITE_WHITELIST = (0x2301,)" in py
+    assert "MODE_WRITE_WHITELIST = (0x2301, 0x3301)" in py
+    assert "M2_MODE_REGISTER = 0x3301" in py
     labels = re.findall(r'0x0([035]): "([^"]+)"', py)
     assert [(int(v), label) for v, label in labels] == list(MODES.items())
     for forbidden in ("Party", "Congé", "Ferien"):
         assert f'"{forbidden}"' not in py
+
+
+def test_v03_config_still_valid(repo_root, tmp_path):
+    # Exemple v0.3 inchangé (M2 en text_sensor) : valide, M2 non inscriptible.
+    result = _run_config(repo_root, tmp_path, example=EXAMPLE_V03)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    text = (repo_root / EXAMPLE_V03).read_text(encoding="utf-8")
+    assert text.startswith("# VissLink v0.3 ")
+    assert "enable_m2_mode_write" not in text
+    assert "enable_m2_mode_write: false" in out, out
+    assert "type: operating_mode" in out
+
+
+def test_m2_as_text_sensor_is_valid(repo_root, tmp_path):
+    # Témoin des deux cas invalides ci-dessus : sans l'erreur injectée, la
+    # même transformation est valide.
+    result = _run_config(repo_root, tmp_path, _m2_as_text)
+    assert result.returncode == 0, result.stdout + result.stderr

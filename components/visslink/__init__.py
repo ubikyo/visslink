@@ -26,6 +26,7 @@ CONF_RESPONSE_TIMEOUT = "response_timeout"
 CONF_MAX_RETRIES = "max_retries"
 CONF_ENABLE_WRITES = "enable_writes"
 CONF_ENABLE_MODE_WRITES = "enable_mode_writes"
+CONF_ENABLE_M2_MODE_WRITE = "enable_m2_mode_write"
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -65,9 +66,11 @@ REGISTER_SCHEMA = cv.Schema(
 # MODE_REGISTERS, MODE_WRITE_WHITELIST et OPERATING_MODE_VALUES (write_guard.h)
 # ; un test le vérifie.
 MODE_REGISTERS = (0x2301, 0x3301)
-# Écriture documentée (vcontrold, setBetriebArtM1) : A1 seulement. 0x3301 est
-# en lecture seule stricte (text_sensor).
-MODE_WRITE_WHITELIST = (0x2301,)
+# Registres de programme inscriptibles (v0.4, expérimental) : A1 (écriture
+# documentée par vcontrold, setBetriebArtM1) et M2 (écriture NON documentée,
+# soumise en plus à enable_m2_mode_write).
+MODE_WRITE_WHITELIST = (0x2301, 0x3301)
+M2_MODE_REGISTER = 0x3301
 # Valeur lue -> texte, dans l'ordre des options du sélecteur.
 OPERATING_MODES = {
     0x00: "ECS seule",
@@ -166,6 +169,14 @@ def _warn_if_writes_enabled(config):
             "enable_mode_writes requires enable_writes: true",
             path=[CONF_ENABLE_MODE_WRITES],
         )
+    if config[CONF_ENABLE_M2_MODE_WRITE] and not (
+        config[CONF_ENABLE_WRITES] and config[CONF_ENABLE_MODE_WRITES]
+    ):
+        raise cv.Invalid(
+            "enable_m2_mode_write requires enable_writes: true and "
+            "enable_mode_writes: true",
+            path=[CONF_ENABLE_M2_MODE_WRITE],
+        )
     if config[CONF_ENABLE_WRITES]:
         _LOGGER.warning(
             "VissLink: Optolink WRITES ENABLED (enable_writes: true). Writes are "
@@ -174,7 +185,12 @@ def _warn_if_writes_enabled(config):
     if config[CONF_ENABLE_MODE_WRITES]:
         _LOGGER.warning(
             "VissLink: OPERATING MODE WRITES ENABLED (enable_mode_writes: true), "
-            "experimental, 0x2301 only: see docs/ecriture-kw.md"
+            "experimental: see docs/ecriture-kw.md"
+        )
+    if config[CONF_ENABLE_M2_MODE_WRITE]:
+        _LOGGER.warning(
+            "VissLink: M2 OPERATING MODE WRITE ENABLED (enable_m2_mode_write: "
+            "true), 0x3301, UNDOCUMENTED write: see docs/ecriture-kw.md"
         )
     return config
 
@@ -204,9 +220,12 @@ CONFIG_SCHEMA = cv.All(
             # validées sur la chaudière : désactivées par défaut, cf.
             # docs/ecriture-kw.md avant toute activation.
             cv.Optional(CONF_ENABLE_WRITES, default=False): cv.boolean,
-            # v0.3, expérimental : écriture du programme de fonctionnement
-            # (0x2301 seulement). Exige aussi enable_writes.
+            # v0.3, expérimental : écriture des programmes de fonctionnement
+            # (A1 ; M2 exige en plus enable_m2_mode_write). Exige enable_writes.
             cv.Optional(CONF_ENABLE_MODE_WRITES, default=False): cv.boolean,
+            # v0.4, expérimental : écriture du programme de M2 (0x3301), non
+            # documentée. Exige enable_writes ET enable_mode_writes.
+            cv.Optional(CONF_ENABLE_M2_MODE_WRITE, default=False): cv.boolean,
         }
     )
     .extend(cv.COMPONENT_SCHEMA)
@@ -234,3 +253,4 @@ async def to_code(config):
     cg.add(var.set_max_retries(config[CONF_MAX_RETRIES]))
     cg.add(var.set_enable_writes(config[CONF_ENABLE_WRITES]))
     cg.add(var.set_enable_mode_writes(config[CONF_ENABLE_MODE_WRITES]))
+    cg.add(var.set_enable_m2_mode_write(config[CONF_ENABLE_M2_MODE_WRITE]))

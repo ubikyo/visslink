@@ -516,8 +516,13 @@ bool VissLinkComponent::start_write_(uint32_t now) {
   // Dernier contrôle avant émission : la demande a été validée au dépôt,
   // mais rien ne part sans un nouveau contrôle complet (adresse de la liste
   // blanche, longueur, bornes configurées et documentées).
+  // Programme : les autorisations de configuration sont revérifiées ici
+  // (M2 : enable_m2_mode_write).
   VissLinkRegister *reg = this->registers_[request.owner];
-  if (reg->get_address() != request.address || !is_write_whitelisted(request.address) ||
+  const bool mode_ok = !is_mode_register(request.address) ||
+                       mode_write_permitted(request.address, this->enable_writes_, this->enable_mode_writes_,
+                                            this->enable_m2_mode_write_) == ModePermission::OK;
+  if (reg->get_address() != request.address || !is_write_whitelisted(request.address) || !mode_ok ||
       !reg->write_allowed(request.value) || !this->kw_.request_write(request.address, &request.value, 1, now)) {
     ESP_LOGE(TAG, "0x%04X: write of %u refused at send time", request.address, request.value);
     this->writes_.complete(now);
@@ -655,14 +660,12 @@ void VissLinkComponent::submit_mode_write(VissLinkModeSelect *select, size_t ind
     if (reg != nullptr && this->writes_.has_request(this->index_of_(reg)))
       mode_busy = true;
   }
-  if (!this->enable_writes_) {
-    refused = "writes are disabled (enable_writes: false)";
-  } else if (!this->enable_mode_writes_) {
-    refused = "operating mode writes are disabled (enable_mode_writes: false)";
+  const ModePermission permission =
+      mode_write_permitted(address, this->enable_writes_, this->enable_mode_writes_, this->enable_m2_mode_write_);
+  if (permission != ModePermission::OK) {
+    refused = mode_permission_to_string(permission);
   } else if (index >= OPERATING_MODE_COUNT) {
     refused = write_check_to_string(WriteCheck::VALUE_NOT_ALLOWED);
-  } else if (!is_mode_write_whitelisted(address)) {
-    refused = "write not documented for this register (read-only)";
   } else if (check_mode_write(address, select->get_length(), value) != WriteCheck::OK || owner == WriteArbiter::NONE) {
     refused = write_check_to_string(check_mode_write(address, select->get_length(), value));
   } else if (select->mode_raw() < 0) {
@@ -698,7 +701,12 @@ void VissLinkComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "VissLink (Optolink KW):");
   ESP_LOGCONFIG(TAG, "  Writes: %s", this->enable_writes_ ? "ENABLED (whitelisted setpoints only)" : "disabled (read-only)");
   ESP_LOGCONFIG(TAG, "  Operating mode writes: %s",
-                this->enable_writes_ && this->enable_mode_writes_ ? "ENABLED (experimental, 0x2301 only)" : "disabled");
+                this->enable_writes_ && this->enable_mode_writes_ ? "ENABLED (experimental)" : "disabled");
+  ESP_LOGCONFIG(TAG, "  M2 operating mode write (0x3301): %s",
+                mode_write_permitted(M2_MODE_REGISTER, this->enable_writes_, this->enable_mode_writes_,
+                                     this->enable_m2_mode_write_) == ModePermission::OK
+                    ? "ENABLED (experimental, undocumented)"
+                    : "disabled");
   for (auto *reg : this->registers_)
     reg->dump_register_config();
 }

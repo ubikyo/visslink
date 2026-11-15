@@ -151,19 +151,39 @@ TEST(mode_values_only_00_03_05) {
     CHECK_EQ(operating_mode_index(static_cast<uint8_t>(raw)), -1);
 }
 
-TEST(mode_write_whitelist_is_0x2301_only) {
+TEST(mode_write_whitelist_is_a1_and_m2) {
   CHECK(is_mode_register(0x2301) && is_mode_register(0x3301));
-  CHECK_EQ(MODE_WRITE_COUNT, 1u);
-  for (uint8_t v : {0x00, 0x03, 0x05})
-    CHECK_EQ(check_mode_write(0x2301, 1, v), WriteCheck::OK);
-  for (int v : {0x01, 0x02, 0x04, 0x06, 0xFF})
-    CHECK_EQ(check_mode_write(0x2301, 1, static_cast<uint8_t>(v)), WriteCheck::VALUE_NOT_ALLOWED);
-  CHECK_EQ(check_mode_write(0x2301, 2, 0x03), WriteCheck::BAD_LENGTH);
-  // M2 : écriture non documentée. Party, éco, candidats 0x2323/0x3323 et
-  // consignes : jamais par ce chemin.
-  for (uint16_t a : {0x3301, 0x2302, 0x2303, 0x3303, 0x2323, 0x3323, 0x2306, 0x6300, 0x0000})
+  CHECK_EQ(MODE_WRITE_COUNT, 2u);
+  CHECK_EQ(M2_MODE_REGISTER, 0x3301);
+  for (uint16_t a : {0x2301, 0x3301}) {
+    for (uint8_t v : {0x00, 0x03, 0x05})
+      CHECK_EQ(check_mode_write(a, 1, v), WriteCheck::OK);
+    for (int v : {0x01, 0x02, 0x04, 0x06, 0xFF})
+      CHECK_EQ(check_mode_write(a, 1, static_cast<uint8_t>(v)), WriteCheck::VALUE_NOT_ALLOWED);
+    CHECK_EQ(check_mode_write(a, 2, 0x03), WriteCheck::BAD_LENGTH);
+  }
+  // Party, éco, candidats 0x2323/0x3323 et consignes : jamais par ce chemin.
+  for (uint16_t a : {0x2302, 0x2303, 0x3303, 0x2323, 0x3323, 0x2306, 0x6300, 0x0000})
     for (uint8_t v : {0x00, 0x03, 0x05})
       CHECK_EQ(check_mode_write(a, 1, v), WriteCheck::NOT_WHITELISTED);
+}
+
+TEST(mode_write_permission_matrix) {
+  for (int mask = 0; mask < 8; mask++) {
+    const bool writes = mask & 1, modes = mask & 2, m2 = mask & 4;
+    const ModePermission a1 = mode_write_permitted(0x2301, writes, modes, m2);
+    const ModePermission b2 = mode_write_permitted(0x3301, writes, modes, m2);
+    CHECK_EQ(a1 == ModePermission::OK, writes && modes);
+    CHECK_EQ(b2 == ModePermission::OK, writes && modes && m2);
+    if (!writes)
+      CHECK(a1 == ModePermission::WRITES_DISABLED && b2 == ModePermission::WRITES_DISABLED);
+    else if (!modes)
+      CHECK(a1 == ModePermission::MODE_WRITES_DISABLED && b2 == ModePermission::MODE_WRITES_DISABLED);
+    else if (!m2)
+      CHECK(b2 == ModePermission::M2_WRITE_DISABLED);
+  }
+  for (uint16_t a : {0x2302, 0x2323, 0x3323, 0x2306})
+    CHECK(mode_write_permitted(a, true, true, true) == ModePermission::NOT_WHITELISTED);
 }
 
 TEST(mode_and_setpoint_whitelists_are_distinct) {
@@ -171,10 +191,10 @@ TEST(mode_and_setpoint_whitelists_are_distinct) {
   CHECK(find_writable(0x2301) == nullptr);
   CHECK(find_writable(0x3301) == nullptr);
   CHECK_EQ(check_write_value(0x2301, 1, 3, 0, 5, &out), WriteCheck::NOT_WHITELISTED);
+  CHECK_EQ(check_write_value(0x3301, 1, 3, 0, 5, &out), WriteCheck::NOT_WHITELISTED);
   CHECK(!is_mode_write_whitelisted(0x2306));
-  CHECK(is_write_whitelisted(0x2301) && is_write_whitelisted(0x2306));
-  CHECK(!is_write_whitelisted(0x3301));
-  CHECK_EQ(WriteArbiter::MAX_PENDING, 6u);
+  CHECK(is_write_whitelisted(0x2301) && is_write_whitelisted(0x3301) && is_write_whitelisted(0x2306));
+  CHECK_EQ(WriteArbiter::MAX_PENDING, 7u);
 }
 
 TEST(mode_divergence_rules) {

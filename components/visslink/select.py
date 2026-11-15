@@ -1,17 +1,18 @@
-"""Plateforme `select` (v0.3, expérimental) : programme de fonctionnement
-modifiable, pour le seul registre dont l'écriture est documentée.
+"""Plateforme `select` (v0.4, expérimental) : programme de fonctionnement
+modifiable d'un circuit.
 
-Registre : 0x2301 (A1) uniquement. 0x3301 (M2) est en lecture seule stricte :
-il se déclare en `text_sensor` (`type: operating_mode`), jamais en `select`,
-pour qu'aucune commande ne paraisse applicable dans Home Assistant.
+Registres : 0x2301 (A1) et 0x3301 (M2). Options, exactement et dans cet
+ordre : « ECS seule » (00), « Chauffage + ECS » (03), « Arrêt » (05). L'état
+publié est toujours la dernière valeur RELUE ; une valeur lue inconnue rend
+l'état inconnu (aucune option n'est choisie arbitrairement).
 
-Options, exactement et dans cet ordre : « ECS seule » (00), « Chauffage + ECS »
-(03), « Arrêt » (05). L'état publié est toujours la dernière valeur RELUE ;
-une valeur lue inconnue rend l'état inconnu (aucune option n'est choisie
-arbitrairement). Écriture seulement avec `enable_writes: true` ET
-`enable_mode_writes: true` sur le composant `visslink`. Après une commande,
-A1 et M2 sont relus ; `divergence` (facultatif) signale des programmes
-différents, sans jamais les corriger.
+Écriture, refusée sinon (journal, et l'entité revient à la valeur lue) :
+  - A1 : `enable_writes: true` ET `enable_mode_writes: true` ;
+  - M2 : en plus `enable_m2_mode_write: true` (écriture non documentée).
+Une commande ne touche qu'un registre ; A1 et M2 sont relus ensuite.
+`divergence` (facultatif) signale des programmes différents, sans jamais les
+corriger. Un programme en lecture seule stricte se déclare en `text_sensor`
+(`type: operating_mode`).
 """
 
 import esphome.codegen as cg
@@ -48,9 +49,8 @@ def _validate(config):
     address = config[CONF_ADDRESS]
     if address not in MODE_WRITE_WHITELIST:
         raise cv.Invalid(
-            f"Register 0x{address:04X} cannot be a visslink select: only 0x2301 "
-            "has a documented operating mode write. Read-only operating modes "
-            "(0x3301) use a text_sensor with `type: operating_mode`",
+            f"Register 0x{address:04X} is not an operating mode register "
+            "(0x2301, 0x3301)",
             path=[CONF_ADDRESS],
         )
     return config

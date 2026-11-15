@@ -1,7 +1,7 @@
 # Raccourcis de développement VissLink.
 EXAMPLE := examples/iot-viessmann.yaml
 
-.PHONY: test cpp-test lint config compile secrets compat compat-v0.1 compat-v0.2 compat-v0.2.2 compat-v0.2.2-diagnostic
+.PHONY: test cpp-test lint config compile secrets compat compat-v0.1 compat-v0.2 compat-v0.2.2 compat-v0.2.2-diagnostic compat-v0.3 compat-v0.3
 
 # Tests C++ + validation de configuration ESPHome
 test:
@@ -30,15 +30,15 @@ config: secrets
 compile: secrets
 	esphome compile $(EXAMPLE)
 
-# Rétrocompatibilité : les YAML de la v0.1.0, de la v0.2 et de la v0.2.2
-# (production, identique à la v0.2.1, et diagnostic), inchangés
+# Rétrocompatibilité : les YAML de la v0.1.0, de la v0.2, de la v0.2.2
+# (production, identique à la v0.2.1, et diagnostic) et de la v0.3, inchangés
 # (tests/fixtures), doivent rester valides et compiler. Construits dans
 # build/compat-vXX avec des secrets fictifs ; examples/secrets.yaml n'est pas
 # utilisé.
 # v0.2.2 : exemple de production identique à celui de la v0.2.1.
-compat: compat-v0.1 compat-v0.2 compat-v0.2.2 compat-v0.2.2-diagnostic
+compat: compat-v0.1 compat-v0.2 compat-v0.2.2 compat-v0.2.2-diagnostic compat-v0.3
 
-compat-v0.1 compat-v0.2 compat-v0.2.2 compat-v0.2.2-diagnostic: compat-%:
+compat-v0.1 compat-v0.2 compat-v0.2.2 compat-v0.2.2-diagnostic compat-v0.3: compat-%:
 	mkdir -p build/compat-$*
 	sed 's|path: ../components|path: $(CURDIR)/components|' \
 	  tests/fixtures/iot-viessmann-$*.yaml > build/compat-$*/iot-viessmann.yaml

@@ -1,4 +1,4 @@
-# Écriture KW et pilotage des consignes (v0.3)
+# Écriture KW, consignes et programmes de fonctionnement (v0.3 – v0.4)
 
 > **Statut : aucune écriture n'a été faite sur la chaudière.** Le code
 > d'écriture est implémenté et testé **en simulation seulement**. Une
@@ -202,7 +202,7 @@ n'y a pas de migration automatique.
 | Contrôle avant émission | `VissLinkRegister::write_allowed()` refuse par défaut ; seul `VissLinkNumber` l'accepte après un contrôle complet (liste blanche, 1 octet, bornes du YAML **et** plage documentée) refait juste avant `request_write` ; test `sim_v03_send_time_check_blocks_corrupted_requests` |
 | Longueur et type | uint8, 1 octet, contrôlé par la liste blanche et par le moteur KW (`MAX_WRITE_LENGTH`) |
 | Valeurs | consignes : finie, entière, dans `min_value..max_value` (déjà refusé par ESPHome au-delà) **et** dans la plage documentée ; programmes : `00`, `03`, `05` exclusivement |
-| Programmes de fonctionnement | `enable_mode_writes` (défaut `false`, exige `enable_writes`), liste blanche distincte (`0x2301` seul), une commande de programme à la fois, relecture de A1 **et** M2, divergence affichée sans correction (§ 9) |
+| Programmes de fonctionnement | `enable_mode_writes` (défaut `false`, exige `enable_writes`) ; M2 : en plus `enable_m2_mode_write` (défaut `false`, exige les deux autres) ; autorisations revérifiées à la demande **et** juste avant l'émission ; liste blanche distincte (`0x2301`, `0x3301`) ; une commande de programme à la fois ; relecture de A1 **et** M2 ; divergence affichée sans correction (§ 9) |
 | Adresse inconnue | refusée à la configuration, au dépôt et à l'émission |
 | Pas d'écriture au démarrage | aucune restauration (`restore_value`, `initial_value` refusés ; aucune lecture de préférences en flash), aucune file persistante : la file est en RAM et vide au démarrage ; une demande est en outre refusée tant que la consigne n'a pas été lue et que la liaison n'est pas synchronisée ; seule une action Home Assistant (`control()`) crée une demande |
 | Pas d'écriture à la reconnexion de Home Assistant | à la reconnexion, Home Assistant s'abonne aux états mais n'appelle pas `number.set_value` ; l'état qu'il restaure à son propre démarrage n'est qu'affiché, jamais renvoyé ; VissLink ne rejoue rien |
@@ -293,7 +293,7 @@ plage ECS active.
 Valeurs **lues sur cette Vitotronic 300 KW3**, en `0x2301` (A1) comme en
 `0x3301` (M2) :
 
-| Valeur | Texte affiché (select A1 et text_sensor) |
+| Valeur | Texte affiché |
 |---|---|
 | `00` | « ECS seule » |
 | `03` | « Chauffage + ECS » |
@@ -302,78 +302,83 @@ Valeurs **lues sur cette Vitotronic 300 KW3**, en `0x2301` (A1) comme en
 
 Ce codage est identique à l'unité `BA` de vcontrold pour la 200 KW2 (`00` WW,
 `03` H+WW, `05` ABSCHALT). Toute autre valeur lue (`01`, `02`, `04`, …) n'est
-pas interprétée : l'état devient inconnu, avec un avertissement.
+pas interprétée.
 
-| Adresse | Lecture confirmée | Écriture documentée | Écriture testée | Dans VissLink |
+| Adresse | Lecture confirmée | Écriture documentée | Écriture testée | Autorisations requises |
 |---|---|---|---|---|
-| `0x2301` (A1) | **oui** (00, 03, 05) | **oui, mais contredite** : vcontrold `setBetriebArtM1` (200 KW2), utilisé par des utilisateurs ioBroker ; une note du wiki openv indique pour un autre appareil « 0x2301 cannot write, 0x2323 read+write ok » | **non** | écriture possible (liste blanche des programmes), expérimentale |
-| `0x3301` (M2) | **oui** (00, 03, 05) | **non** : vcontrold ne la déclare qu'en lecture (`getBetriebArtM2`) ; seule l'analogie avec A1 la suggère | **non** | **lecture seule** : écriture refusée dans tous les cas |
+| `0x2301` (A1) | **oui** (00, 03, 05) | **oui, mais contredite** : vcontrold `setBetriebArtM1` (200 KW2), utilisé par des utilisateurs ioBroker ; une note du wiki openv indique pour un autre appareil « 0x2301 cannot write, 0x2323 read+write ok » | **non** | `enable_writes` + `enable_mode_writes` |
+| `0x3301` (M2) | **oui** (00, 03, 05) | **non** : vcontrold ne la déclare qu'en lecture (`getBetriebArtM2`) ; seule l'analogie avec A1 la suggère | **non** | `enable_writes` + `enable_mode_writes` + **`enable_m2_mode_write`** |
 
 Le format de trame est le format d'écriture KW commun (§ 2). L'incertitude
-porte sur l'**acceptation** de l'écriture par la KW3 à cette adresse, pas
-sur la trame.
+porte sur l'**acceptation** de l'écriture par la KW3 à ces adresses. Pour M2,
+l'écriture est rendue possible (v0.4) **à titre expérimental**, sans aucune
+source : c'est la raison de la troisième autorisation.
 
-### Mise en œuvre
+### Mise en œuvre (v0.4)
 
 ```yaml
 visslink:
   id: viessmann
-  enable_writes: false        # défaut
-  enable_mode_writes: false   # défaut ; exige enable_writes: true
+  enable_writes: false          # défaut
+  enable_mode_writes: false     # défaut ; exige enable_writes: true
+  enable_m2_mode_write: false   # défaut ; exige les deux précédentes
 
-select:                      # A1 : modifiable si les deux options sont activées
+select:
   - platform: visslink
     visslink_id: viessmann
     name: "Radiateurs - Mode actuel"
     address: 0x2301
-
-text_sensor:                 # M2 : lecture seule stricte
+    divergence:                 # facultatif, une seule fois pour A1/M2
+      name: "Modes A1 et M2 différents"
   - platform: visslink
     visslink_id: viessmann
-    type: operating_mode     # défaut : schedule (programmation horaire)
     name: "Plancher chauffant - Mode actuel"
     address: 0x3301
-    divergence:              # facultatif, une seule fois pour A1/M2
-      name: "Modes A1 et M2 différents"
 ```
 
-- **Une entité par circuit**, sans doublon numérique :
-  - A1 (`0x2301`) : `select` « Radiateurs - Mode actuel », options exactement
-    « ECS seule », « Chauffage + ECS », « Arrêt » ;
-  - M2 (`0x3301`) : `text_sensor` « Plancher chauffant - Mode actuel ».
-    ESPHome ne permet pas de rendre un `select` non modifiable dans Home
-    Assistant : M2 est donc un texte, sur lequel aucune commande n'est
-    possible. Un `select` sur `0x3301` est **refusé** à la validation.
-- `select` : `0x2301` seulement. `text_sensor` `type: operating_mode` :
-  `0x2301` ou `0x3301` (lecture seule). Options fixes : `options`,
-  `data_type` et toute autre adresse sont refusés.
-- **L'état du select est toujours la dernière valeur relue** : une commande
-  acceptée ou refusée ne change pas l'option affichée. Elle est republiée
-  aussitôt, et ne change qu'après la relecture.
+- **Deux sélecteurs indépendants**, un par circuit, options exactement
+  « ECS seule », « Chauffage + ECS », « Arrêt ». Pas de doublon numérique.
+- **Autorisations** (validées à la configuration, puis revérifiées à la
+  demande et juste avant l'émission) :
+
+  | `enable_writes` | `enable_mode_writes` | `enable_m2_mode_write` | A1 | M2 |
+  |---|---|---|---|---|
+  | false | — | — | refusé | refusé |
+  | true | false | false | refusé | refusé |
+  | true | true | false | **autorisé** | refusé |
+  | true | true | true | **autorisé** | **autorisé** |
+  | toute combinaison où `enable_m2_mode_write: true` sans les deux autres | | | **erreur de validation** | |
+
+  `enable_mode_writes: true` sans `enable_writes: true` est aussi une erreur
+  de validation. Les trois options valent `false` par défaut.
+- Une commande refusée est journalisée (`M2 operating mode write is
+  disabled (enable_m2_mode_write: false)`, etc.) et l'entité revient à la
+  valeur lue. Le sélecteur M2 reste affiché comme modifiable dans Home
+  Assistant (ESPHome n'a pas de select en lecture seule). Pour un affichage
+  strictement non modifiable, déclarer M2 en `text_sensor` avec
+  `type: operating_mode` (comme en v0.3, toujours accepté).
+- **L'état d'un sélecteur est toujours la dernière valeur relue** : une
+  commande acceptée ou refusée ne change pas l'option affichée. Elle est
+  republiée aussitôt, et ne change qu'après la relecture.
 - Liste blanche **distincte** de celle des consignes (`MODE_WRITE_WHITELIST`
-  = `0x2301`). Une consigne ne peut pas être écrite par ce chemin, ni un
-  programme par celui des consignes (tests).
-- Valeurs écrites : `00`, `03`, `05` exclusivement, contrôlées au dépôt et
-  juste avant l'émission.
-- **Une commande = un registre.** VissLink n'écrit jamais M2 à la suite de
-  A1, ni pour « corriger » une divergence.
-- **Une seule commande de programme à la fois.** Une nouvelle demande est
-  refusée (`another operating mode write is in progress`) tant que la
-  précédente n'a pas été envoyée et ses deux relectures terminées. Elle
-  n'est ni remplacée ni mise en file.
+  = `0x2301`, `0x3301`). Valeurs écrites : `00`, `03`, `05` exclusivement.
+- **Une commande = un registre.** VissLink n'écrit jamais l'autre circuit à
+  la suite, ni pour « corriger » une divergence.
+- **Une seule commande de programme à la fois** : une nouvelle demande, sur
+  le même circuit ou sur l'autre, est refusée (`another operating mode write
+  is in progress`) tant que la précédente n'a pas été envoyée et ses deux
+  relectures terminées. Elle n'est ni remplacée ni mise en file.
 - **Relecture systématique des deux programmes** après chaque commande,
-  quelle qu'en soit l'issue (accusé `00`, refus, sans réponse) : A1 et M2
-  sont relus en priorité, avant toute autre lecture. L'écriture n'est
-  considérée comme terminée qu'après les deux relectures.
-- **Un accusé `00` ne prouve rien** : seule la relecture de `0x2301`
+  quelle qu'en soit l'issue (accusé `00`, refus, sans réponse), avant toute
+  autre lecture. L'écriture n'est terminée qu'après les deux relectures.
+- **Un accusé `00` ne prouve rien** : seule la relecture du registre écrit
   détermine le programme publié (`confirmed`, `NOT applied`, ou
   `indeterminate (unverified)`).
 - **Divergence** : si A1 et M2 diffèrent après la commande, le journal
   l'indique (`Operating modes differ after the write: … (not corrected
   automatically)`) et l'entité `divergence` passe à « on ». Elle est
   « inconnue » si l'un des deux programmes n'est pas lu. Les deux circuits
-  peuvent légitimement avoir des programmes différents : la divergence est
-  une information, pas une erreur.
+  peuvent légitimement avoir des programmes différents.
 - Aucune nouvelle tentative, rien au démarrage, rien à la reconnexion
   (mêmes garanties que les consignes, § 6).
 - **Party et Congé : non implémentés** (registres inconnus pour la KW3). Les
@@ -381,43 +386,84 @@ text_sensor:                 # M2 : lecture seule stricte
   l'essai sur `0x2301` échoue (refus `05`, ou accusé sans effet), la note
   openv désigne `0x2323` comme piste, à confirmer d'abord par lecture.
 
-### Essai matériel du programme A1 (une seule écriture réversible)
+Tests démontrant qu'aucune écriture M2 ne part sans la troisième
+autorisation : `mode_write_permission_matrix`, `sim_v04_m2_permission_matrix`
+(8 combinaisons), `sim_v04_m2_never_written_without_third_permission_after_reboot_reconnect`,
+`sim_v04_m2_never_written_after_a1_timeout_or_concurrently`,
+`sim_v04_m2_send_time_check_blocks_bypassed_requests` (demande injectée
+directement dans l'arbitre, ou autorisation retirée avant l'émission).
 
-Prérequis : les essais des consignes (§ 10) n'ont pas à être terminés, mais
-leurs étapes 1 et 2 (valeurs d'origine notées, identifiant `20 9C`) sont
-obligatoires.
+### Essai matériel A (programme A1) : une seule écriture réversible
+
+Prérequis : étapes 1 et 2 du § 10 (valeurs d'origine notées, identifiant
+`20 9C`).
 
 1. **Moment** : en journée, chauffage en marche normale, ballon chaud. A1 et
-   M2 lus tous deux à `03` (Chauffage + ECS) ; noter ce qu'affichent la
+   M2 lus tous deux à « Chauffage + ECS » ; noter ce qu'affichent la
    Vitotronic **et la télécommande**.
-2. **Configuration** : garder le `select` A1 et le `text_sensor` M2 (double
-   relecture et divergence), retirer ou laisser en lecture seule tout le reste ;
-   `enable_writes: true`, `enable_mode_writes: true`. Ne déclarer **aucun**
-   autre `number` modifiable pendant l'essai. Compiler, flasher, vérifier
-   `OPERATING MODE WRITES ENABLED` à la compilation.
-3. **Une seule écriture, réversible et sans effet de sécurité** : A1 de
-   « Chauffage + ECS » (`03`) vers « ECS seule » (`00`). Ne pas commencer
-   par « Arrêt ».
-4. Journal attendu : `0x2301 -> 00 (write)`, `0x2301 <- 00 (write
-   acknowledged)`, relecture de `0x2301` et `0x3301`, `operating mode write
-   confirmed by read-back (00)`, puis `Operating modes differ after the write:
-   0x2301 = 00, 0x3301 = 03`, ou `both 00` si la KW3 couple les circuits.
-5. **Comparer** : afficheur de la Vitotronic, **télécommande**, entités
-   « Radiateurs - Mode actuel », « Plancher chauffant - Mode actuel » et
-   « Modes A1 et M2 différents ». Noter
+2. **Configuration** : `enable_writes: true`, `enable_mode_writes: true`,
+   **`enable_m2_mode_write: false`**. Garder les deux sélecteurs (double
+   relecture, divergence). Ne laisser aucune consigne modifiable (`number`
+   remplacés par les `sensor` de `tests/fixtures/iot-viessmann-v0.2.2.yaml`).
+   Compiler et vérifier l'avertissement `OPERATING MODE WRITES ENABLED`, et
+   l'**absence** de `M2 OPERATING MODE WRITE ENABLED`.
+3. **Une seule écriture** : « Radiateurs - Mode actuel » de « Chauffage +
+   ECS » (`03`) vers « ECS seule » (`00`). Ne pas commencer par « Arrêt ».
+4. Journal attendu : `0x2301: operating mode 00 queued (experimental)`,
+   `0x2301 -> 00 (write)`, `0x2301 <- 00 (write acknowledged)`, relectures
+   `0x2301 <- 00` et `0x3301 <- 03` (ou `00` si la KW3 couple les circuits),
+   `operating mode write confirmed by read-back (00)`, puis `Operating modes
+   differ after the write: 0x2301 = 00, 0x3301 = 03 (not corrected
+   automatically)` ou `both 00`.
+5. **Comparer** : afficheur, **télécommande**, « Radiateurs - Mode actuel »,
+   « Plancher chauffant - Mode actuel », « Modes A1 et M2 différents ». Noter
    si M2 a changé de lui-même.
-6. **Revenir** dans les minutes qui suivent : A1 vers « Chauffage + ECS »
-   (`03`), même vérification. En cas de doute, rétablir le programme depuis
-   le panneau de la régulation ou la télécommande.
-7. **Au moindre écart** (réponse ≠ `00`, relecture différente, afficheur ou
-   télécommande non mis à jour, M2 modifié de façon inattendue) :
-   `enable_mode_writes: false` et analyser avant tout nouvel essai.
-8. Ensuite seulement, et un autre jour, essayer « Arrêt » (`05`) puis le
-   retour à `03`, avec les mêmes vérifications.
-9. `0x3301` reste en lecture seule tant qu'aucune source ne documente son
-   écriture. Ne pas la forcer.
-10. Reporter les résultats (date, valeurs, accusé, relectures, afficheur,
-    télécommande) dans le tableau ci-dessus.
+6. **Revenir** dans les minutes qui suivent vers « Chauffage + ECS » (`03`),
+   même vérification. En cas de doute, rétablir depuis la régulation ou la
+   télécommande.
+7. **Au moindre écart** (réponse ≠ `00`, `response timeout`, `NOT
+   applied`, afficheur ou télécommande non mis à jour, M2 modifié de façon
+   inattendue) : `enable_mode_writes: false` et analyser.
+8. Un autre jour seulement : « Arrêt » (`05`) puis retour à `03`.
+
+**A1 est validé** quand l'accusé, la relecture, l'afficheur et la
+télécommande concordent, à l'aller comme au retour.
+
+### Essai matériel B (programme M2) : uniquement après la validation de A1
+
+M2 n'a **aucune** source documentant son écriture. Cet essai n'a de sens
+qu'une fois A1 validé (essai A) : le format et le comportement de l'accusé
+sont alors connus sur cette KW3.
+
+1. **Prérequis** : essai A réussi et noté. Un autre jour que l'essai A.
+   Plancher chauffant en marche normale ; M2 et A1 lus à « Chauffage +
+   ECS ». Noter afficheur et télécommande **pour M2**.
+2. **Configuration** : les trois options à `true`. Aucune consigne
+   modifiable. Compiler et vérifier les deux avertissements
+   `OPERATING MODE WRITES ENABLED` et `M2 OPERATING MODE WRITE ENABLED`.
+3. **Ne rien commander sur A1 pendant l'essai.**
+4. **Une seule écriture** : « Plancher chauffant - Mode actuel » de
+   « Chauffage + ECS » (`03`) vers « ECS seule » (`00`).
+5. Journal attendu : `0x3301 -> 00 (write)`, puis soit
+   `0x3301 <- 00 (write acknowledged)`, soit `write rejected (reply 05)`, soit
+   `response timeout, outcome indeterminate until read-back (not resent)`.
+   Ensuite, relectures `0x3301` et `0x2301`, puis `confirmed`, `NOT applied`
+   ou `indeterminate`, et l'état de la divergence.
+6. **Comparer** : afficheur et télécommande pour M2 **et** pour A1 (A1 ne
+   doit pas avoir changé), entités et divergence.
+7. **Revenir** vers « Chauffage + ECS » (`03`) depuis Home Assistant si
+   l'écriture a été confirmée. Sinon, vérifier sur la régulation que M2 est
+   resté à « Chauffage + ECS ».
+8. **Résultats possibles** :
+   - refus `05`, ou accusé sans effet (`NOT applied`) : l'écriture M2 n'est
+     pas acceptée à cette adresse. `enable_m2_mode_write: false`
+     définitivement, pas d'autre essai « pour voir » ;
+   - confirmé, et afficheur et télécommande concordent : écriture M2
+     constatée sur cette installation. La reporter dans le tableau ci-dessus
+     (« Écriture testée : oui, date ») ;
+   - autre écart (A1 modifié, afficheur incohérent) : `enable_m2_mode_write:
+     false` et analyse.
+9. « Arrêt » (`05`) sur M2 seulement un autre jour, après un retour réussi.
 
 ## 10. Validation avant activation des écritures (sur la chaudière)
 
@@ -479,20 +525,19 @@ dupliquée et deux écritures ne se suivent jamais sans relecture.
 
 ## 12. Mémoire (Wemos D1 mini, ESPHome 2026.10.2)
 
-| Configuration | v0.2.2 : RAM / Flash | v0.3 : RAM / Flash |
+| Configuration | v0.2.2 : RAM / Flash | v0.4 : RAM / Flash |
 |---|---|---|
-| YAML v0.1 (inchangé) | 31 256 / 421 289 o | 31 548 (+292) / 423 797 (+2 508) o |
-| YAML v0.2 (inchangé) | 31 980 / 424 353 o | 32 272 (+292) / 426 893 (+2 540) o |
-| YAML v0.2.1 / v0.2.2 (inchangé) | 33 796 / 434 713 o | 34 112 (+316) / 437 269 (+2 556) o |
-| Diagnostic v0.2.2 (inchangé) | 34 304 / 435 517 o | 34 628 (+324) / 438 089 (+2 572) o |
-| Exemple v0.3 (5 `number`, 1 `select`, 1 mode en `text_sensor`) | — | **35 180 (42,9 %) / 447 589 (42,9 %) o** |
+| YAML v0.1 (inchangé) | 31 256 / 421 289 o | 31 588 (+332) / 424 069 (+2 780) o |
+| YAML v0.2 (inchangé) | 31 980 / 424 353 o | 32 312 (+332) / 427 181 (+2 828) o |
+| YAML v0.2.1 / v0.2.2 (inchangé) | 33 796 / 434 713 o | 34 160 (+364) / 437 557 (+2 844) o |
+| Diagnostic v0.2.2 (inchangé) | 34 304 / 435 517 o | 34 676 (+372) / 438 377 (+2 860) o |
+| YAML v0.3 (inchangé : 5 `number`, select A1, text_sensor M2) | — | 35 292 (43,1 %) / 447 885 (42,9 %) o |
+| **Exemple v0.4** (5 `number`, 2 `select`) | — | **35 252 (43,0 %) / 447 313 (42,8 %) o** |
 
-Le moteur d'écriture, l'arbitre et les deux listes blanches coûtent ~300 o
-de RAM et ~2,5 Ko de Flash, même sans `number` ni `select`. Les cinq
-consignes en `number` et les deux modes (select A1, text_sensor M2, avec la
-divergence) ajoutent ~1 100 o de RAM et ~10,3 Ko de Flash par rapport à
-l'exemple v0.2.2 compilé avec la v0.3. `enable_writes` et
-`enable_mode_writes` ne changent pas l'empreinte (simples indicateurs).
+Le moteur d'écriture, l'arbitre et les listes blanches coûtent ~350 o de RAM
+et ~2,8 Ko de Flash, même sans `number` ni `select`. Les trois options
+d'autorisation ne changent pas l'empreinte : à peine 16 o de Flash entre
+« tout désactivé » et « A1 + M2 autorisés ».
 
 ## 13. Inventaire avant les essais matériels
 
@@ -512,7 +557,8 @@ l'exemple v0.2.2 compilé avec la v0.3. `enable_writes` et
 - [x] Programmes : valeurs `00`, `03`, `05` lues en `0x2301` et `0x3301`.
 - [ ] Programme A1 : essai d'écriture réversible `03` → `00` → `03` (§ 9),
       comparaison afficheur / télécommande, comportement de M2.
-- [ ] `0x3301` : source documentant l'écriture (sinon, lecture seule).
+- [ ] Programme M2 : essai B (§ 9), seulement après la validation de A1 ;
+      `enable_m2_mode_write: false` en dehors de l'essai.
 - [ ] Party, Congé, `0x2323` / `0x3323` : identification par lecture seule.
 - [ ] Production ECS ponctuelle : identifier une fonction documentée de la
       KW3, faute de quoi elle reste non implémentée.

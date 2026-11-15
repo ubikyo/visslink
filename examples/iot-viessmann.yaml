@@ -1,4 +1,4 @@
-# VissLink v0.3 — Viessmann Vitotronic 300 KW3 via Optolink
+# VissLink v0.4 — Viessmann Vitotronic 300 KW3 via Optolink
 # Matériel : Wemos D1 mini (ESP8266) + interface infrarouge Optolink.
 #
 # Les identifiants sont lus dans secrets.yaml (non versionné), voir
@@ -85,9 +85,13 @@ visslink:
   # Écritures Optolink (consignes de la liste blanche uniquement). Laisser à
   # false tant que la procédure de docs/ecriture-kw.md n'est pas terminée.
   enable_writes: false
-  # Programmes de fonctionnement (expérimental, 0x2301 seulement). Exige
-  # aussi enable_writes. Laisser à false avant l'essai de docs/ecriture-kw.md.
+  # Programmes de fonctionnement (expérimental). Exige aussi enable_writes.
+  # Laisser à false avant l'essai A1 de docs/ecriture-kw.md.
   enable_mode_writes: false
+  # Programme de M2 (0x3301) : écriture NON documentée pour la KW3. Exige
+  # enable_writes ET enable_mode_writes. Seulement pour l'essai M2, après la
+  # validation de A1.
+  enable_m2_mode_write: false
 
 sensor:
   # --- Températures (int16, dixièmes de degré) ------------------------------
@@ -285,18 +289,29 @@ number:
     unit_of_measurement: "°C"
     mode: box
 
-# --- Modes de fonctionnement (v0.3, expérimental) ------------------------------
+# --- Modes de fonctionnement (v0.4, expérimental) ------------------------------
 # Affichés en texte. Valeurs validées sur cette KW3 : 00 = ECS seule,
 # 03 = Chauffage + ECS, 05 = Arrêt ; toute autre valeur : inconnu.
-# A1 (0x2301) : sélecteur, seul registre dont l'écriture est documentée ;
-# modifiable seulement si enable_writes ET enable_mode_writes. Son état est
-# toujours la dernière valeur RELUE, jamais une commande en attente.
-# M2 (0x3301) : lecture seule stricte, en text_sensor (voir plus bas).
+# Deux sélecteurs indépendants. Leur état est toujours la dernière valeur
+# RELUE, jamais une commande en attente. Écriture :
+#   - A1 (0x2301) : enable_writes ET enable_mode_writes ;
+#   - M2 (0x3301) : en plus enable_m2_mode_write (écriture non documentée).
+# Sinon, une commande est refusée (journal) et l'entité revient à la valeur
+# lue. Après chaque commande, A1 et M2 sont relus ; `divergence` signale des
+# modes différents, jamais corrigés automatiquement.
 select:
   - platform: visslink
     visslink_id: viessmann
     name: "Radiateurs - Mode actuel"
     address: 0x2301
+    update_interval: 5min
+    divergence:
+      name: "Modes A1 et M2 différents"
+
+  - platform: visslink
+    visslink_id: viessmann
+    name: "Plancher chauffant - Mode actuel"
+    address: 0x3301
     update_interval: 5min
 
 # --- Programmations horaires (lecture seule) ---------------------------------
@@ -346,16 +361,3 @@ text_sensor:
       name: "Bouclage ECS - Programmation du jour"
     active:
       name: "Bouclage ECS - Plage active"
-
-  # Mode de M2, en lecture seule stricte : aucune commande possible depuis
-  # Home Assistant. « Inconnu » pour une valeur hors 00/03/05 ou un échec de
-  # lecture. `divergence` : A1 et M2 dans des modes différents (affiché,
-  # jamais corrigé automatiquement).
-  - platform: visslink
-    visslink_id: viessmann
-    type: operating_mode
-    name: "Plancher chauffant - Mode actuel"
-    address: 0x3301
-    update_interval: 5min
-    divergence:
-      name: "Modes A1 et M2 différents"

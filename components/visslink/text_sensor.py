@@ -120,7 +120,8 @@ def _validate_mode(config):
     return config
 
 
-# Programme de fonctionnement en lecture seule (v0.3).
+# Programme de fonctionnement en lecture seule stricte (v0.3), variante non
+# modifiable du select.
 MODE_SCHEMA = cv.All(
     text_sensor.text_sensor_schema(VissLinkModeText, icon=ICON_MODE)
     .extend(REGISTER_SCHEMA)
