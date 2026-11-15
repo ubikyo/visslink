@@ -1,7 +1,7 @@
 # Raccourcis de développement VissLink.
 EXAMPLE := examples/iot-viessmann.yaml
 
-.PHONY: test cpp-test lint config compile secrets compat compat-v01 compat-v02
+.PHONY: test cpp-test lint config compile secrets compat compat-v0.1 compat-v0.2 compat-v0.2.2 compat-v0.2.2-diagnostic
 
 # Tests C++ + validation de configuration ESPHome
 test:
@@ -30,16 +30,18 @@ config: secrets
 compile: secrets
 	esphome compile $(EXAMPLE)
 
-# Rétrocompatibilité : les YAML de la v0.1.0 et de la v0.2, inchangés
+# Rétrocompatibilité : les YAML de la v0.1.0, de la v0.2 et de la v0.2.2
+# (production, identique à la v0.2.1, et diagnostic), inchangés
 # (tests/fixtures), doivent rester valides et compiler. Construits dans
 # build/compat-vXX avec des secrets fictifs ; examples/secrets.yaml n'est pas
 # utilisé.
-compat: compat-v01 compat-v02
+# v0.2.2 : exemple de production identique à celui de la v0.2.1.
+compat: compat-v0.1 compat-v0.2 compat-v0.2.2 compat-v0.2.2-diagnostic
 
-compat-v01 compat-v02: compat-%:
+compat-v0.1 compat-v0.2 compat-v0.2.2 compat-v0.2.2-diagnostic: compat-%:
 	mkdir -p build/compat-$*
 	sed 's|path: ../components|path: $(CURDIR)/components|' \
-	  tests/fixtures/iot-viessmann-$(subst v0,v0.,$*).yaml > build/compat-$*/iot-viessmann.yaml
+	  tests/fixtures/iot-viessmann-$*.yaml > build/compat-$*/iot-viessmann.yaml
 	printf 'wifi_ssid: "dummy"\nwifi_password: "dummy-password"\nfallback_ap_password: "dummy-fallback"\napi_encryption_key: "%s"\n' \
 	  "$$(openssl rand -base64 32)" > build/compat-$*/secrets.yaml
 	esphome config build/compat-$*/iot-viessmann.yaml

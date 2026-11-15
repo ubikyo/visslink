@@ -249,3 +249,59 @@ TEST(scheduler_blocks_do_not_starve_others) {
   }
   CHECK(worst <= 4);
 }
+
+// --- v0.3 : relecture de vérification après une écriture ---------------------
+
+TEST(scheduler_expedite_reads_first_then_resumes_cadence) {
+  RegisterScheduler s;
+  s.add(60000, 0);   // 0 : très en retard
+  s.add(300000, 0);  // 1 : consigne, 5 min
+  s.add(30000, 0);   // 2
+  CHECK_EQ(s.acquire(0), 0);
+  s.finish(true, 2000);
+  CHECK_EQ(s.acquire(2000), 1);
+  s.finish(true, 4000);  // prochaine échéance de 1 : 300 000
+  CHECK_EQ(s.acquire(4000), 2);
+  s.finish(true, 6000);
+
+  // À 100 s : 0 et 2 sont échus (et en retard), 1 ne l'est pas.
+  CHECK(s.expedite(1, 100000));
+  CHECK_EQ(s.acquire(100000), 1);  // servi avant les registres plus en retard
+  s.finish(true, 102000);
+  CHECK(!s.entry(1).urgent);
+  CHECK_EQ(s.entry(1).due_ms, 300000u);  // cadence d'origine conservée
+  CHECK_EQ(s.acquire(102000), 2);         // puis les autres, par retard décroissant
+}
+
+TEST(scheduler_expedite_keeps_priority_through_retries) {
+  RegisterScheduler s;
+  s.add(60000, 0);
+  s.add(300000, 0);
+  s.acquire(0);
+  s.finish(true, 1000);
+  s.acquire(1000);
+  s.finish(true, 2000);
+  CHECK(s.expedite(1, 70000));  // 0 est échu aussi
+  CHECK_EQ(s.acquire(70000), 1);
+  CHECK(!s.finish(false, 71000));
+  CHECK_EQ(s.acquire(72000), 1);  // nouvelle tentative, prioritaire sur 0 (échu)
+  CHECK(!s.finish(false, 73000));
+  CHECK_EQ(s.acquire(74000), 1);
+  CHECK(s.finish(false, 75000));  // abandon : la cadence normale reprend
+  CHECK(!s.entry(1).urgent);
+  CHECK_EQ(s.acquire(75000), 0);
+}
+
+TEST(scheduler_expedite_refused_for_schedules_and_current) {
+  RegisterScheduler s;
+  s.add(6UL * 3600 * 1000, 0, 7);
+  s.add(60000, 0);
+  CHECK(!s.expedite(0, 10));  // registre multi-blocs
+  CHECK(!s.expedite(5, 10));  // index inconnu
+  CHECK_EQ(s.acquire(0), 0);
+  CHECK(!s.expedite(0, 10));
+  CHECK(!s.expedite(5, 10));
+  s.finish(true, 100);
+  CHECK_EQ(s.acquire(100), 1);
+  CHECK(!s.expedite(1, 200));  // lecture en cours
+}

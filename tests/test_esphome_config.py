@@ -18,6 +18,10 @@ EXAMPLE_V01 = "tests/fixtures/iot-viessmann-v0.1.yaml"
 EXAMPLE_V02 = "tests/fixtures/iot-viessmann-v0.2.yaml"
 # v0.2.2 : configuration de diagnostic (exemple + six registres TEST bruts).
 DIAGNOSTIC = "examples/iot-viessmann-diagnostic.yaml"
+# Exemple de production de la v0.2.2 (identique à la v0.2.1) et diagnostic,
+# tels que publiés.
+EXAMPLE_V022 = "tests/fixtures/iot-viessmann-v0.2.2.yaml"
+DIAGNOSTIC_V022 = "tests/fixtures/iot-viessmann-v0.2.2-diagnostic.yaml"
 
 
 def _secrets() -> str:
@@ -130,6 +134,109 @@ INVALID_CASES = {
     ),
     "unknown_day_key": lambda s: s.replace(
         "address: 0x2000", 'address: 0x2000\n    lundi:\n      name: "Lundi"'
+    ),
+    # v0.3 : consignes (number) et écritures.
+    "enable_writes_not_boolean": lambda s: s.replace(
+        "enable_writes: false", "enable_writes: maybe"
+    ),
+    "number_address_not_whitelisted": lambda s: s.replace(
+        "address: 0x2306", "address: 0x0846"
+    ),
+    "number_on_burner_register": lambda s: s.replace(
+        "address: 0x2306", "address: 0x0842"
+    ),
+    "number_on_temperature_register": lambda s: s.replace(
+        "address: 0x2306", "address: 0x0800"
+    ),
+    "same_setpoint_twice": lambda s: s.replace("address: 0x2307", "address: 0x2306"),
+    "setpoint_also_declared_as_sensor": lambda s: s.replace(
+        "address: 0x0804", "address: 0x6300"
+    ),
+    "number_min_below_documented": lambda s: s.replace(
+        "min_value: 16", "min_value: 2", 1
+    ),
+    "number_max_above_documented": lambda s: s.replace(
+        "max_value: 24", "max_value: 38", 1
+    ),
+    "dhw_max_above_documented": lambda s: s.replace("max_value: 60", "max_value: 61"),
+    "dhw_min_below_documented": lambda s: s.replace("min_value: 40", "min_value: 9"),
+    "number_min_not_below_max": lambda s: s.replace(
+        "min_value: 16", "min_value: 24", 1
+    ),
+    "number_fractional_bound": lambda s: s.replace(
+        "min_value: 16", "min_value: 16.5", 1
+    ),
+    "number_half_step": lambda s: s.replace("step: 1", "step: 0.5", 1),
+    "number_step_two": lambda s: s.replace("step: 1", "step: 2", 1),
+    "number_without_min_value": lambda s: s.replace("    min_value: 16\n", "", 1),
+    "number_without_max_value": lambda s: s.replace("    max_value: 24\n", "", 1),
+    "number_with_data_type": lambda s: s.replace(
+        "address: 0x2306", "address: 0x2306\n    data_type: uint16"
+    ),
+    "number_with_restore_value": lambda s: s.replace(
+        "address: 0x2306", "address: 0x2306\n    restore_value: true"
+    ),
+    "number_with_initial_value": lambda s: s.replace(
+        "address: 0x2306", "address: 0x2306\n    initial_value: 20"
+    ),
+    # v0.3 : modes de fonctionnement (select A1, text_sensor M2).
+    "mode_writes_without_writes": lambda s: s.replace(
+        "enable_mode_writes: false", "enable_mode_writes: true"
+    ),
+    "mode_writes_not_boolean": lambda s: s.replace(
+        "enable_mode_writes: false", "enable_mode_writes: perhaps"
+    ),
+    # M2 (0x3301) : jamais un select (commande non documentée).
+    "m2_as_select": lambda s: (
+        s.replace(
+            "    address: 0x2301\n    update_interval: 5min\n",
+            "    address: 0x3301\n    update_interval: 5min\n",
+        )
+        .replace("    type: operating_mode\n", "    type: operating_mode\n", 1)
+        .replace(
+            "    address: 0x3301\n    update_interval: 5min\n    divergence:",
+            "    address: 0x2301\n    update_interval: 5min\n    divergence:",
+        )
+    ),
+    "select_on_party_register": lambda s: s.replace(
+        "address: 0x2301", "address: 0x2303"
+    ),
+    "select_on_candidate_2323": lambda s: s.replace(
+        "address: 0x2301", "address: 0x2323"
+    ),
+    "select_on_setpoint": lambda s: s.replace("address: 0x2301", "address: 0x2307"),
+    "mode_text_on_setpoint": lambda s: s.replace("address: 0x3301", "address: 0x3306"),
+    "mode_text_on_schedule": lambda s: s.replace("address: 0x3301", "address: 0x2000"),
+    "same_mode_register_twice": lambda s: s.replace(
+        "address: 0x3301", "address: 0x2301"
+    ),
+    "mode_register_also_sensor": lambda s: s.replace(
+        "address: 0x0804", "address: 0x3301"
+    ),
+    "unknown_text_sensor_type": lambda s: s.replace(
+        "type: operating_mode", "type: mode"
+    ),
+    "mode_text_with_today": lambda s: s.replace(
+        "    type: operating_mode\n",
+        '    type: operating_mode\n    today:\n      name: "X"\n',
+    ),
+    "select_with_options": lambda s: s.replace(
+        "address: 0x2301", 'address: 0x2301\n    options: ["Party"]'
+    ),
+    "select_with_data_type": lambda s: s.replace(
+        "address: 0x2301", "address: 0x2301\n    data_type: uint8"
+    ),
+    "two_divergence_sensors": lambda s: s.replace(
+        "    address: 0x2301\n",
+        '    address: 0x2301\n    divergence:\n      name: "Autre"\n',
+    ),
+    "divergence_without_a1_select": lambda s: _drop_first(
+        s,
+        "  - platform: visslink\n"
+        "    visslink_id: viessmann\n"
+        '    name: "Radiateurs - Mode actuel"\n'
+        "    address: 0x2301\n"
+        "    update_interval: 5min\n",
     ),
 }
 
@@ -362,9 +469,273 @@ def test_diagnostic_config_reads_experimental_registers_raw(repo_root, tmp_path)
 
 
 def test_diagnostic_config_is_the_example_plus_test_sensors(repo_root):
-    # Même nœud, mêmes Wi-Fi / API / OTA / UART / registres : seules les six
-    # entrées TEST (et les commentaires) diffèrent.
-    example = (repo_root / EXAMPLE).read_text(encoding="utf-8")
+    # Même nœud, mêmes Wi-Fi / API / OTA / UART / registres que l'exemple
+    # v0.2.2 : seules les six entrées TEST (et les commentaires) diffèrent.
+    example = (repo_root / EXAMPLE_V022).read_text(encoding="utf-8")
     diagnostic = (repo_root / DIAGNOSTIC).read_text(encoding="utf-8")
     assert len(_TEST_ENTRY.findall(diagnostic)) == len(EXPERIMENTAL)
     assert _active_lines(_TEST_ENTRY.sub("", diagnostic)) == _active_lines(example)
+
+
+# --- Écritures et consignes (v0.3) --------------------------------------------
+
+WRITABLE = {
+    0x2306: (3, 37),
+    0x2307: (3, 37),
+    0x3306: (3, 37),
+    0x3307: (3, 37),
+    0x6300: (10, 60),
+}
+
+
+def test_example_writes_disabled_by_default(repo_root, tmp_path):
+    text = (repo_root / EXAMPLE).read_text(encoding="utf-8")
+    assert "  enable_writes: false\n" in text
+    assert "enable_writes: true" not in text
+    # Sans l'option : désactivées aussi (défaut).
+    result = _run_config(
+        repo_root, tmp_path, lambda s: _drop_first(s, "  enable_writes: false\n")
+    )
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "enable_writes: false" in out, out
+    assert "WRITES ENABLED" not in out
+
+
+def test_enable_writes_is_explicit_and_warned(repo_root, tmp_path):
+    result = _run_config(
+        repo_root,
+        tmp_path,
+        lambda s: s.replace("enable_writes: false", "enable_writes: true"),
+    )
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "WRITES ENABLED" in out, out
+
+
+def test_example_setpoints_are_numbers(repo_root, tmp_path):
+    result = _run_config(repo_root, tmp_path)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    _, _, numbers = out.partition("\nnumber:\n")
+    numbers = numbers.partition("\nselect:\n")[0].partition("\ntext_sensor:\n")[0]
+    shown = {
+        int(a, 16): (int(lo), int(hi))
+        for a, lo, hi in re.findall(
+            r"address: (0x[0-9a-fA-F]+)\n    min_value: (\d+)\n    max_value: (\d+)",
+            numbers,
+        )
+    }
+    assert set(shown) == set(WRITABLE), numbers
+    for address, (lo, hi) in shown.items():
+        assert WRITABLE[address][0] <= lo < hi <= WRITABLE[address][1]
+    assert numbers.count("update_interval: 5min") == 5, numbers
+    assert numbers.count("step: 1") == 5, numbers
+    # Les consignes ne sont plus déclarées en capteurs (adresse unique).
+    sensors = _active_lines((repo_root / EXAMPLE).read_text(encoding="utf-8"))
+    sensors = sensors.partition("\nsensor:")[2].partition("\nbinary_sensor:")[0]
+    for address in WRITABLE:
+        assert f"address: 0x{address:04X}" not in sensors
+
+
+def test_target_number_syntax_is_accepted(repo_root, tmp_path):
+    # API cible de la v0.3, telle que spécifiée.
+    def transform(text):
+        head, _, _ = text.partition("\nnumber:\n")
+        return head + (
+            "\nnumber:\n"
+            "  - platform: visslink\n"
+            "    visslink_id: viessmann\n"
+            '    name: "Radiateurs - Consigne confort"\n'
+            "    address: 0x2306\n"
+            "    min_value: 16\n"
+            "    max_value: 24\n"
+            "    step: 1\n"
+            '    unit_of_measurement: "°C"\n'
+            "    mode: box\n"
+        )
+
+    result = _run_config(repo_root, tmp_path, transform)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("address", sorted(WRITABLE))
+def test_documented_bounds_are_accepted(repo_root, tmp_path, address):
+    lo, hi = WRITABLE[address]
+
+    def transform(text):
+        head, _, _ = text.partition("\nnumber:\n")
+        return head + (
+            "\nnumber:\n"
+            "  - platform: visslink\n"
+            '    name: "Consigne"\n'
+            f"    address: 0x{address:04X}\n"
+            f"    min_value: {lo}\n"
+            f"    max_value: {hi}\n"
+        )
+
+    result = _run_config(repo_root, tmp_path, transform)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_python_and_cpp_whitelists_match(repo_root):
+    cpp = (repo_root / "components/visslink/write_guard.h").read_text(encoding="utf-8")
+    cpp_table = {
+        int(a, 16): (int(lo), int(hi))
+        for a, lo, hi in re.findall(r"\{0x([0-9A-Fa-f]{4}), 1, (\d+), (\d+)\}", cpp)
+    }
+    py = (repo_root / "components/visslink/number.py").read_text(encoding="utf-8")
+    py_table = {
+        int(a, 16): (int(lo), int(hi))
+        for a, lo, hi in re.findall(r"0x([0-9A-Fa-f]{4}): \((\d+), (\d+)\)", py)
+    }
+    assert cpp_table == WRITABLE
+    assert py_table == WRITABLE
+
+
+# --- Compatibilité v0.2.1 / v0.2.2 ---------------------------------------------
+
+
+@pytest.mark.parametrize("fixture", [EXAMPLE_V022, DIAGNOSTIC_V022])
+def test_v022_configs_still_valid(repo_root, tmp_path, fixture):
+    result = _run_config(repo_root, tmp_path, example=fixture)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    # Sans `enable_writes`, la v0.2.2 reste en lecture seule.
+    assert "enable_writes: false" in out, out
+    assert "\nnumber:" not in (repo_root / fixture).read_text(encoding="utf-8")
+
+
+def test_cpp_writes_disabled_by_default_and_never_restored(repo_root):
+    # Côté C++, sans appel à set_enable_writes(), aucune écriture : le défaut
+    # du membre est false. La plateforme number ne restaure aucune valeur.
+    header = (repo_root / "components/visslink/visslink.h").read_text(encoding="utf-8")
+    assert "bool enable_writes_{false};" in header
+    assert "write_allowed(uint8_t /*value*/) const { return false; }" in header
+    sources = header + (repo_root / "components/visslink/visslink.cpp").read_text(
+        encoding="utf-8"
+    )
+    for forbidden in ("restore_value", "rtc_", "global_preferences", "load(&"):
+        assert forbidden not in sources, forbidden
+    number_py = (repo_root / "components/visslink/number.py").read_text(
+        encoding="utf-8"
+    )
+    assert "CONF_RESTORE_VALUE" not in number_py
+    assert "CONF_INITIAL_VALUE" not in number_py
+
+
+# --- Programmes de fonctionnement (v0.3, expérimental) -----------------------
+
+MODES = {0x00: "ECS seule", 0x03: "Chauffage + ECS", 0x05: "Arrêt"}
+
+
+def test_example_mode_writes_disabled_by_default(repo_root, tmp_path):
+    text = (repo_root / EXAMPLE).read_text(encoding="utf-8")
+    assert "  enable_mode_writes: false\n" in text
+    result = _run_config(
+        repo_root,
+        tmp_path,
+        lambda s: _drop_first(s, "  enable_mode_writes: false\n"),
+    )
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "enable_mode_writes: false" in out, out
+    assert "OPERATING MODE WRITES ENABLED" not in out
+
+
+def test_mode_writes_need_both_flags_and_warn(repo_root, tmp_path):
+    result = _run_config(
+        repo_root,
+        tmp_path,
+        lambda s: s.replace("enable_writes: false", "enable_writes: true").replace(
+            "enable_mode_writes: false", "enable_mode_writes: true"
+        ),
+    )
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "OPERATING MODE WRITES ENABLED" in out, out
+
+
+def test_example_mode_entities(repo_root, tmp_path):
+    # Une entité par circuit : A1 en select (modifiable si activé), M2 en
+    # text_sensor (lecture seule stricte), sans doublon numérique.
+    result = _run_config(repo_root, tmp_path)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    selects = out.partition("\nselect:\n")[2].partition("\ntext_sensor:\n")[0]
+    shown = re.findall(r"name: ([^\n]+)\n    address: (0x[0-9a-fA-F]+)", selects)
+    assert shown == [("Radiateurs - Mode actuel", "0x2301")], selects
+    texts = out.partition("\ntext_sensor:\n")[2]
+    assert re.search(
+        r"address: 0x3301\n(?:    [^\n]*\n)*?    type: operating_mode\n", texts
+    ), texts
+    assert "name: Plancher chauffant - Mode actuel" in texts, texts
+    assert out.count("divergence:") == 1, out
+    for address in ("0x2301", "0x3301"):
+        assert out.count(f"address: {address}\n") == 1, address  # aucun doublon
+
+
+def test_m2_never_select(repo_root, tmp_path):
+    def transform(text):
+        head, _, _ = text.partition("\nselect:\n")
+        tail = text.partition("\n# --- Programmations horaires")[2]
+        return (
+            head
+            + "\nselect:\n  - platform: visslink\n"
+            + '    name: "M2"\n    address: 0x3301\n'
+            + "\n# --- Programmations horaires"
+            + tail.replace("    address: 0x3301\n", "    address: 0x2301\n").replace(
+                '    divergence:\n      name: "Modes A1 et M2 différents"\n', ""
+            )
+        )
+
+    result = _run_config(repo_root, tmp_path, transform)
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, out
+    assert "0x3301" in out and "text_sensor" in out, out
+
+
+def test_mode_text_sensor_alone_is_valid(repo_root, tmp_path):
+    # A1 et M2 tous deux en lecture seule (aucun select) : valide.
+    def transform(text):
+        text = _drop_first(
+            text,
+            "  - platform: visslink\n"
+            "    visslink_id: viessmann\n"
+            '    name: "Radiateurs - Mode actuel"\n'
+            "    address: 0x2301\n"
+            "    update_interval: 5min\n",
+        )
+        return text + (
+            "\n  - platform: visslink\n"
+            "    type: operating_mode\n"
+            '    name: "Radiateurs - Mode actuel"\n'
+            "    address: 0x2301\n"
+        )
+
+    result = _run_config(repo_root, tmp_path, transform)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_mode_tables_match_cpp(repo_root):
+    cpp = (repo_root / "components/visslink/write_guard.h").read_text(encoding="utf-8")
+    values = re.search(r"OPERATING_MODE_VALUES\[\] = \{([^}]*)\}", cpp).group(1)
+    readable = re.search(r"MODE_REGISTERS\[\] = \{([^}]*)\}", cpp).group(1)
+    writable = re.search(r"MODE_WRITE_WHITELIST\[\] = \{([^}]*)\}", cpp).group(1)
+
+    def as_ints(text):
+        return [int(v, 16) for v in re.findall(r"0x[0-9A-Fa-f]+", text)]
+
+    assert as_ints(values) == list(MODES)
+    assert as_ints(readable) == [0x2301, 0x3301]
+    assert as_ints(writable) == [0x2301]  # 0x3301 : écriture non documentée
+    texts = re.findall(r'case 0x0([035]):\n\s+return "([^"]+)";', cpp)
+    assert [(int(v), t) for v, t in texts] == list(MODES.items())
+    assert 'return "Inconnu";' in cpp
+    py = (repo_root / "components/visslink/__init__.py").read_text(encoding="utf-8")
+    assert "MODE_REGISTERS = (0x2301, 0x3301)" in py
+    assert "MODE_WRITE_WHITELIST = (0x2301,)" in py
+    labels = re.findall(r'0x0([035]): "([^"]+)"', py)
+    assert [(int(v), label) for v, label in labels] == list(MODES.items())
+    for forbidden in ("Party", "Congé", "Ferien"):
+        assert f'"{forbidden}"' not in py

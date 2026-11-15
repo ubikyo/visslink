@@ -1,6 +1,6 @@
 #pragma once
 
-// Protocole Optolink KW, lecture seule, non bloquant.
+// Protocole Optolink KW, non bloquant : lecture, et écriture d'un octet.
 //
 // Indépendant d'ESPHome pour être testé sur PC : le temps est passé en
 // paramètre et loop() accepte tout port série exposant available(),
@@ -12,6 +12,16 @@
 //   Vitotronic -> 0x05                     synchro, ~toutes les 2 s au repos
 //   VissLink   -> 0x01 0xF7 AH AL LEN      début + lecture, adresse, longueur
 //   Vitotronic -> LEN octets               données brutes, sans en-tête ni CRC
+//
+// Écriture (v0.3, cf. docs/ecriture-kw.md) :
+//
+//   Vitotronic -> 0x05
+//   VissLink   -> 0x01 0xF4 AH AL LEN D1..DLEN
+//   Vitotronic -> 1 octet                  0x00 = accepté ; 0x05 ou autre = refus
+//
+// Le format et l'accusé 0x00 sont documentés (openv, vcontrold). La longueur
+// de la réponse n'est concordante entre les sources que pour LEN = 1 :
+// l'écriture est donc limitée à un octet (MAX_WRITE_LENGTH).
 //
 //   IDLE -> WAIT_SYNC -> WAIT_RESPONSE -> CHECK_TRAILING -> IDLE
 //              |               |                |
@@ -38,6 +48,7 @@ enum class KwResult : uint8_t {
   RESPONSE_TIMEOUT,    ///< aucun octet après la requête
   RESPONSE_TOO_SHORT,  ///< réponse incomplète à l'expiration du délai
   RESPONSE_TOO_LONG,   ///< octets en trop : liaison désynchronisée
+  WRITE_REJECTED,      ///< écriture : accusé différent de 0x00 (octet dans data())
 };
 
 inline const char *kw_result_to_string(KwResult result) {
@@ -52,6 +63,8 @@ inline const char *kw_result_to_string(KwResult result) {
       return "response too short";
     case KwResult::RESPONSE_TOO_LONG:
       return "response too long";
+    case KwResult::WRITE_REJECTED:
+      return "write rejected";
     default:
       return "none";
   }
@@ -64,6 +77,13 @@ class KwProtocol {
   static constexpr uint8_t SYNC_BYTE = 0x05;
   static constexpr uint8_t START_BYTE = 0x01;
   static constexpr uint8_t READ_COMMAND = 0xF7;
+  static constexpr uint8_t WRITE_COMMAND = 0xF4;
+  /// Accusé d'une écriture acceptée (« Bestätigung OK », openv ; « OK »,
+  /// vcontrold). Toute autre valeur est un refus.
+  static constexpr uint8_t WRITE_ACK = 0x00;
+  /// Seule longueur pour laquelle openv, vcontrold et VitoWiFi s'accordent
+  /// sur la réponse (un octet).
+  static constexpr uint8_t MAX_WRITE_LENGTH = 1;
   /// 8 octets : taille des futurs blocs de programmation horaire.
   static constexpr uint8_t MAX_READ_LENGTH = 8;
   /// Silence exigé après la réponse. Un octet dure ~2,5 ms à 4800 bauds 8E2 :
@@ -83,6 +103,25 @@ class KwProtocol {
     this->address_ = address;
     this->expected_ = length;
     this->received_ = 0;
+    this->write_ = false;
+    this->deadline_ms_ = now + this->sync_timeout_ms_;
+    this->state_ = State::WAIT_SYNC;
+    return true;
+  }
+
+  /// Démarre une écriture de `length` octets (1 au plus). Mêmes conditions
+  /// que request_read() : une seule transaction à la fois, et la trame ne
+  /// part qu'après un 0x05 frais. Aucune nouvelle tentative n'est faite ici.
+  bool request_write(uint16_t address, const uint8_t *data, uint8_t length, uint32_t now) {
+    if (this->state_ != State::IDLE || data == nullptr || length == 0 || length > MAX_WRITE_LENGTH)
+      return false;
+    for (uint8_t i = 0; i < length; i++)
+      this->write_data_[i] = data[i];
+    this->address_ = address;
+    this->write_length_ = length;
+    this->expected_ = 1;  // accusé
+    this->received_ = 0;
+    this->write_ = true;
     this->deadline_ms_ = now + this->sync_timeout_ms_;
     this->state_ = State::WAIT_SYNC;
     return true;
@@ -106,9 +145,17 @@ class KwProtocol {
         while (port.available() > 0 && port.read_byte(&byte))
           sync = (byte == SYNC_BYTE);
         if (sync) {
-          const uint8_t request[5] = {START_BYTE, READ_COMMAND, static_cast<uint8_t>(this->address_ >> 8),
-                                      static_cast<uint8_t>(this->address_), this->expected_};
-          port.write_array(request, sizeof(request));
+          if (this->write_) {
+            uint8_t request[5 + MAX_WRITE_LENGTH] = {START_BYTE, WRITE_COMMAND, static_cast<uint8_t>(this->address_ >> 8),
+                                                     static_cast<uint8_t>(this->address_), this->write_length_};
+            for (uint8_t i = 0; i < this->write_length_; i++)
+              request[5 + i] = this->write_data_[i];
+            port.write_array(request, 5 + this->write_length_);
+          } else {
+            const uint8_t request[5] = {START_BYTE, READ_COMMAND, static_cast<uint8_t>(this->address_ >> 8),
+                                        static_cast<uint8_t>(this->address_), this->expected_};
+            port.write_array(request, sizeof(request));
+          }
           this->deadline_ms_ = now + this->response_timeout_ms_;
           this->state_ = State::WAIT_RESPONSE;
           return KwResult::NONE;
@@ -136,6 +183,15 @@ class KwProtocol {
         if (port.available() > 0)
           return this->fail_(KwResult::RESPONSE_TOO_LONG, now);
         if (time_reached(now, this->deadline_ms_)) {
+          // Écriture : réponse bien cadrée, mais seul 0x00 vaut accord. Un
+          // refus rend l'état de la ligne incertain : resynchronisation.
+          if (this->write_ && this->buffer_[0] != WRITE_ACK) {
+            const uint8_t reply = this->buffer_[0];
+            const KwResult result = this->fail_(KwResult::WRITE_REJECTED, now);
+            this->buffer_[0] = reply;
+            this->received_ = 1;
+            return result;
+          }
           this->state_ = State::IDLE;
           return KwResult::SUCCESS;
         }
@@ -154,8 +210,11 @@ class KwProtocol {
   }
 
   bool is_idle() const { return this->state_ == State::IDLE; }
+  /// La transaction en cours (ou la dernière terminée) est une écriture.
+  bool is_write() const { return this->write_; }
   State state() const { return this->state_; }
-  /// Données de la dernière lecture réussie, valides jusqu'à la requête suivante.
+  /// Données de la dernière lecture réussie (ou accusé d'une écriture, y
+  /// compris refusée), valides jusqu'à la requête suivante.
   const uint8_t *data() const { return this->buffer_; }
   uint8_t data_length() const { return this->received_; }
 
@@ -183,6 +242,9 @@ class KwProtocol {
   uint8_t expected_{0};
   uint8_t received_{0};
   uint8_t buffer_[MAX_READ_LENGTH]{};
+  bool write_{false};
+  uint8_t write_length_{0};
+  uint8_t write_data_[MAX_WRITE_LENGTH]{};
 };
 
 }  // namespace visslink

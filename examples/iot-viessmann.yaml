@@ -1,4 +1,4 @@
-# VissLink v0.2.1 — Viessmann Vitotronic 300 KW3 via Optolink (lecture seule)
+# VissLink v0.3 — Viessmann Vitotronic 300 KW3 via Optolink
 # Matériel : Wemos D1 mini (ESP8266) + interface infrarouge Optolink.
 #
 # Les identifiants sont lus dans secrets.yaml (non versionné), voir
@@ -7,6 +7,12 @@
 # Registres actifs : ceux dont l'adresse et le type sont établis. Les registres
 # expérimentaux sont en commentaire en fin de fichier, avec la marche à suivre
 # pour les vérifier avant de les activer.
+#
+# Écritures : DÉSACTIVÉES (enable_writes: false). Les consignes sont exposées
+# en `number` mais restent en lecture seule : une modification depuis Home
+# Assistant est refusée, journalisée, et l'entité revient à la valeur lue.
+# Les écritures KW ne sont pas encore validées sur cette chaudière : lire
+# docs/ecriture-kw.md avant toute activation.
 #
 # Charge : ~7 lectures/min ici, ~13 avec les registres expérimentaux. Une
 # lecture prend ~2 à 3 s (attente du 0x05), soit 20 à 30 lectures/min au plus :
@@ -70,11 +76,18 @@ time:
     id: ha_time
 
 visslink:
+  id: viessmann
   uart_id: optolink_uart
   # Valeurs par défaut, affichées pour référence :
   sync_timeout: 10s       # attente maximale du caractère de synchro 0x05
   response_timeout: 1s    # attente maximale de la réponse après la requête
   max_retries: 2          # nouvelles tentatives avant d'abandonner le cycle
+  # Écritures Optolink (consignes de la liste blanche uniquement). Laisser à
+  # false tant que la procédure de docs/ecriture-kw.md n'est pas terminée.
+  enable_writes: false
+  # Programmes de fonctionnement (expérimental, 0x2301 seulement). Exige
+  # aussi enable_writes. Laisser à false avant l'essai de docs/ecriture-kw.md.
+  enable_mode_writes: false
 
 sensor:
   # --- Températures (int16, dixièmes de degré) ------------------------------
@@ -120,51 +133,7 @@ sensor:
     filters:
       - multiply: 0.1
 
-  # --- Consignes (uint8, degrés entiers) ------------------------------------
-  - platform: visslink
-    name: "Consigne A1 confort"
-    address: 0x2306
-    data_type: uint8
-    update_interval: 5min
-    unit_of_measurement: "°C"
-    device_class: temperature
-    accuracy_decimals: 0
-
-  - platform: visslink
-    name: "Consigne A1 réduit"
-    address: 0x2307
-    data_type: uint8
-    update_interval: 5min
-    unit_of_measurement: "°C"
-    device_class: temperature
-    accuracy_decimals: 0
-
-  - platform: visslink
-    name: "Consigne M2 confort"
-    address: 0x3306
-    data_type: uint8
-    update_interval: 5min
-    unit_of_measurement: "°C"
-    device_class: temperature
-    accuracy_decimals: 0
-
-  - platform: visslink
-    name: "Consigne M2 réduit"
-    address: 0x3307
-    data_type: uint8
-    update_interval: 5min
-    unit_of_measurement: "°C"
-    device_class: temperature
-    accuracy_decimals: 0
-
-  - platform: visslink
-    name: "Consigne ECS"
-    address: 0x6300
-    data_type: uint8
-    update_interval: 5min
-    unit_of_measurement: "°C"
-    device_class: temperature
-    accuracy_decimals: 0
+  # --- Consignes : voir `number:` ci-dessous (v0.3) -------------------------
 
   # --- Brûleur (compteurs uint32) -------------------------------------------
   - platform: visslink
@@ -259,6 +228,77 @@ binary_sensor:
   #   update_interval: 60s
   #   device_class: running
 
+# --- Consignes (v0.3) -----------------------------------------------------------
+# uint8, degrés entiers. L'état affiché est toujours la valeur LUE dans la
+# régulation (toutes les 5 min, et juste après une écriture). Adresses de la
+# liste blanche uniquement ; min/max obligatoires, compris dans la plage
+# documentée (3..37 °C ambiance, 10..60 °C ECS) : les valeurs ci-dessous sont
+# des exemples à adapter à l'installation.
+number:
+  - platform: visslink
+    visslink_id: viessmann
+    name: "Radiateurs - Consigne confort"
+    address: 0x2306
+    min_value: 16
+    max_value: 24
+    step: 1
+    unit_of_measurement: "°C"
+    mode: box
+
+  - platform: visslink
+    visslink_id: viessmann
+    name: "Radiateurs - Consigne réduite"
+    address: 0x2307
+    min_value: 10
+    max_value: 20
+    step: 1
+    unit_of_measurement: "°C"
+    mode: box
+
+  - platform: visslink
+    visslink_id: viessmann
+    name: "Plancher - Consigne confort"
+    address: 0x3306
+    min_value: 16
+    max_value: 24
+    step: 1
+    unit_of_measurement: "°C"
+    mode: box
+
+  - platform: visslink
+    visslink_id: viessmann
+    name: "Plancher - Consigne réduite"
+    address: 0x3307
+    min_value: 10
+    max_value: 20
+    step: 1
+    unit_of_measurement: "°C"
+    mode: box
+
+  - platform: visslink
+    visslink_id: viessmann
+    name: "ECS - Consigne"
+    address: 0x6300
+    min_value: 40
+    max_value: 60
+    step: 1
+    unit_of_measurement: "°C"
+    mode: box
+
+# --- Modes de fonctionnement (v0.3, expérimental) ------------------------------
+# Affichés en texte. Valeurs validées sur cette KW3 : 00 = ECS seule,
+# 03 = Chauffage + ECS, 05 = Arrêt ; toute autre valeur : inconnu.
+# A1 (0x2301) : sélecteur, seul registre dont l'écriture est documentée ;
+# modifiable seulement si enable_writes ET enable_mode_writes. Son état est
+# toujours la dernière valeur RELUE, jamais une commande en attente.
+# M2 (0x3301) : lecture seule stricte, en text_sensor (voir plus bas).
+select:
+  - platform: visslink
+    visslink_id: viessmann
+    name: "Radiateurs - Mode actuel"
+    address: 0x2301
+    update_interval: 5min
+
 # --- Programmations horaires (lecture seule) ---------------------------------
 # `address` est celle du lundi ; les 7 jours sont lus à address + 8 × jour.
 # État principal : la semaine, jours identiques regroupés
@@ -306,3 +346,16 @@ text_sensor:
       name: "Bouclage ECS - Programmation du jour"
     active:
       name: "Bouclage ECS - Plage active"
+
+  # Mode de M2, en lecture seule stricte : aucune commande possible depuis
+  # Home Assistant. « Inconnu » pour une valeur hors 00/03/05 ou un échec de
+  # lecture. `divergence` : A1 et M2 dans des modes différents (affiché,
+  # jamais corrigé automatiquement).
+  - platform: visslink
+    visslink_id: viessmann
+    type: operating_mode
+    name: "Plancher chauffant - Mode actuel"
+    address: 0x3301
+    update_interval: 5min
+    divergence:
+      name: "Modes A1 et M2 différents"

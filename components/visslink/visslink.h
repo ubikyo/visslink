@@ -16,6 +16,12 @@
 #ifdef USE_TEXT_SENSOR
 #include "esphome/components/text_sensor/text_sensor.h"
 #endif
+#ifdef USE_NUMBER
+#include "esphome/components/number/number.h"
+#endif
+#ifdef USE_SELECT
+#include "esphome/components/select/select.h"
+#endif
 #ifdef USE_TIME
 #include "esphome/components/time/real_time_clock.h"
 #endif
@@ -24,6 +30,7 @@
 #include "kw_protocol.h"
 #include "schedule.h"
 #include "scheduler.h"
+#include "write_guard.h"
 
 namespace esphome {
 namespace visslink {
@@ -52,6 +59,19 @@ class VissLinkRegister {
   virtual void publish_unknown(uint8_t block) = 0;
   /// Appelé une fois par seconde (états dépendant de l'heure locale).
   virtual void on_clock_tick() {}
+  /// Écriture (v0.3) : contrôle complet d'une valeur juste avant émission
+  /// (liste blanche, longueur, bornes configurées et documentées). Refus par
+  /// défaut : seul VissLinkNumber peut l'accepter.
+  virtual bool write_allowed(uint8_t /*value*/) const { return false; }
+  /// Écriture (v0.3) : une écriture de `value` vient d'être tentée, la
+  /// prochaine lecture est la relecture de vérification.
+  virtual void expect_written_value(uint8_t /*value*/) {}
+  /// Programme de fonctionnement (v0.3) : valeur brute lue (00, 03, 05), ou
+  /// -1 si inconnue ou si ce registre n'est pas un programme.
+  virtual int mode_raw() const { return -1; }
+  /// Écriture (v0.3) : demande refusée ou abandonnée ; republier la dernière
+  /// valeur lue pour que Home Assistant ne garde pas la valeur demandée.
+  virtual void restore_read_state() {}
   virtual void dump_register_config() = 0;
 
  protected:
@@ -136,6 +156,88 @@ class VissLinkSchedule : public text_sensor::TextSensor, public VissLinkRegister
 
 static_assert(SCHEDULE_BLOCK_LENGTH <= KwProtocol::MAX_READ_LENGTH, "schedule block exceeds KW read length");
 
+class VissLinkComponent;
+
+#ifdef USE_NUMBER
+/// Consigne réglable (v0.3) : registre uint8 de la liste blanche, lu
+/// périodiquement comme un capteur. L'état publié provient toujours d'une
+/// lecture, jamais de la valeur demandée. Une demande n'aboutit à une
+/// écriture que si `enable_writes: true` et si toutes les protections
+/// passent (cf. VissLinkComponent::submit_write).
+class VissLinkNumber : public number::Number, public VissLinkRegister {
+ public:
+  void set_parent(VissLinkComponent *parent) { this->parent_ = parent; }
+
+  uint8_t get_length() const override { return 1; }
+  bool publish_data(uint8_t block, const uint8_t *data) override;
+  void publish_unknown(uint8_t block) override;
+  void expect_written_value(uint8_t value) override { this->verification_.expect(value); }
+  void restore_read_state() override;
+  bool write_allowed(uint8_t value) const override;
+  void dump_register_config() override;
+  /// Une valeur lue est disponible.
+  bool has_read_value() const { return this->has_state() && !std::isnan(this->state); }
+
+ protected:
+  void control(float value) override;
+
+  VissLinkComponent *parent_{nullptr};
+  WriteVerification verification_;
+};
+#endif
+
+#ifdef USE_TEXT_SENSOR
+/// Programme de fonctionnement en lecture seule stricte (v0.3) : texte
+/// « ECS seule » (00), « Chauffage + ECS » (03), « Arrêt » (05), « Inconnu »
+/// pour toute autre valeur ou un échec de lecture. Jamais écrit : aucune
+/// commande n'existe pour cette entité (M2, 0x3301).
+class VissLinkModeText : public text_sensor::TextSensor, public VissLinkRegister {
+ public:
+  void set_parent(VissLinkComponent *parent) { this->parent_ = parent; }
+
+  uint8_t get_length() const override { return 1; }
+  bool publish_data(uint8_t block, const uint8_t *data) override;
+  void publish_unknown(uint8_t block) override;
+  int mode_raw() const override { return this->raw_; }
+  void dump_register_config() override;
+
+ protected:
+  void publish_text_(const char *text);
+
+  VissLinkComponent *parent_{nullptr};
+  int raw_{-1};
+};
+#endif
+
+#ifdef USE_SELECT
+/// Programme de fonctionnement modifiable (v0.3, expérimental) : 0x2301 (A1)
+/// seulement, le registre dont l'écriture est documentée. Options : ECS seule (00), Chauffage + ECS (03),
+/// Arrêt (05). Toute autre valeur lue rend l'état inconnu, avec un
+/// avertissement. L'état publié provient toujours d'une lecture. L'écriture
+/// exige `enable_writes` ET `enable_mode_writes`, et n'est possible que sur
+/// les adresses de MODE_WRITE_WHITELIST (0x2301 seulement).
+class VissLinkModeSelect : public select::Select, public VissLinkRegister {
+ public:
+  void set_parent(VissLinkComponent *parent) { this->parent_ = parent; }
+
+  uint8_t get_length() const override { return 1; }
+  bool publish_data(uint8_t block, const uint8_t *data) override;
+  void publish_unknown(uint8_t block) override;
+  void expect_written_value(uint8_t value) override { this->verification_.expect(value); }
+  void restore_read_state() override;
+  bool write_allowed(uint8_t value) const override;
+  int mode_raw() const override;
+  void dump_register_config() override;
+
+ protected:
+  void control(size_t index) override;
+  void publish_unknown_state_();
+
+  VissLinkComponent *parent_{nullptr};
+  WriteVerification verification_;
+};
+#endif
+
 /// Relie l'ordonnanceur, le protocole KW et les registres.
 class VissLinkComponent : public Component, public uart::UARTDevice {
  public:
@@ -155,14 +257,55 @@ class VissLinkComponent : public Component, public uart::UARTDevice {
   void set_sync_timeout(uint32_t ms) { this->kw_.set_sync_timeout(ms); }
   void set_response_timeout(uint32_t ms) { this->kw_.set_response_timeout(ms); }
   void set_max_retries(uint8_t retries) { this->scheduler_.set_max_retries(retries); }
+  /// Écritures Optolink (v0.3) : false par défaut, n'est activé que par
+  /// `enable_writes: true` dans le YAML.
+  void set_enable_writes(bool enable) { this->enable_writes_ = enable; }
+
+  /// Écriture des programmes de fonctionnement (v0.3, expérimental) : false
+  /// par défaut, exige aussi enable_writes.
+  void set_enable_mode_writes(bool enable) { this->enable_mode_writes_ = enable; }
+
+#ifdef USE_NUMBER
+  /// Demande d'écriture venant de Home Assistant (VissLinkNumber::control).
+  void submit_write(VissLinkNumber *number, float value);
+#endif
+  /// Registre de programme (select A1 ou text_sensor), au plus deux.
+  void add_mode_register(VissLinkRegister *reg);
+#ifdef USE_SELECT
+  /// Demande de programme venant de Home Assistant (VissLinkModeSelect::control).
+  void submit_mode_write(VissLinkModeSelect *select, size_t index);
+#endif
+#ifdef USE_BINARY_SENSOR
+  void set_mode_divergence_sensor(binary_sensor::BinarySensor *sensor) { this->mode_divergence_ = sensor; }
+#endif
+  /// Un programme a été lu (ou est devenu inconnu) : divergence A1/M2.
+  void on_mode_state_changed();
 
  protected:
   void handle_result_(KwResult result, uint32_t now);
+  void handle_write_result_(KwResult result, uint32_t now);
+  bool start_write_(uint32_t now);
+  void drop_expired_writes_(uint32_t now);
+  int index_of_(const VissLinkRegister *reg) const;
+  /// Registre de programme de l'autre circuit, ou NONE.
+  int mode_peer_of_(int index) const;
+  void read_back_done_(int index, uint32_t now);
+  void log_mode_divergence_after_write_();
 
   KwProtocol kw_;
   RegisterScheduler scheduler_;
   std::vector<VissLinkRegister *> registers_;  ///< même index que l'ordonnanceur
   bool link_ok_{false};
+  bool enable_writes_{false};
+  bool enable_mode_writes_{false};
+  ReadBackTracker read_back_;
+  bool mode_write_checked_{false};  ///< écriture de programme : divergence à journaliser après les relectures
+  VissLinkRegister *mode_registers_[2]{};  ///< sélecteurs de programme (A1, M2), au plus deux
+#ifdef USE_BINARY_SENSOR
+  binary_sensor::BinarySensor *mode_divergence_{nullptr};
+#endif
+  bool write_in_flight_{false};  ///< transaction KW en cours = écriture
+  WriteArbiter writes_;
   HighFrequencyLoopRequester high_freq_;
 };
 
