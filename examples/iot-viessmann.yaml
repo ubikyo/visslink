@@ -1,4 +1,4 @@
-# VissLink v0.4 — Viessmann Vitotronic 300 KW3 via Optolink
+# VissLink v0.4.1 — Viessmann Vitotronic 300 KW3 via Optolink
 # Matériel : Wemos D1 mini (ESP8266) + interface infrarouge Optolink.
 #
 # Les identifiants sont lus dans secrets.yaml (non versionné), voir

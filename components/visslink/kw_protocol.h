@@ -156,6 +156,7 @@ class KwProtocol {
                                         static_cast<uint8_t>(this->address_), this->expected_};
             port.write_array(request, sizeof(request));
           }
+          this->sent_ms_ = now;
           this->deadline_ms_ = now + this->response_timeout_ms_;
           this->state_ = State::WAIT_RESPONSE;
           return KwResult::NONE;
@@ -210,6 +211,22 @@ class KwProtocol {
   }
 
   bool is_idle() const { return this->state_ == State::IDLE; }
+  /// Requête acceptée mais encore rien d'émis (attente du 0x05).
+  bool is_waiting_sync() const { return this->state_ == State::WAIT_SYNC; }
+  /// Instant d'émission de la trame de la transaction en cours ou de la
+  /// dernière (sur le 0x05) : mesure des délais.
+  uint32_t sent_ms() const { return this->sent_ms_; }
+
+  /// Abandonne une requête qui n'a encore RIEN émis (WAIT_SYNC) : la ligne
+  /// n'a vu aucun octet, aucune transaction n'est interrompue. Refusé dans
+  /// tout autre état (trame émise, réponse attendue ou reprise en cours).
+  bool cancel_before_send() {
+    if (this->state_ != State::WAIT_SYNC)
+      return false;
+    this->state_ = State::IDLE;
+    this->write_ = false;
+    return true;
+  }
   /// La transaction en cours (ou la dernière terminée) est une écriture.
   bool is_write() const { return this->write_; }
   State state() const { return this->state_; }
@@ -243,6 +260,7 @@ class KwProtocol {
   uint8_t received_{0};
   uint8_t buffer_[MAX_READ_LENGTH]{};
   bool write_{false};
+  uint32_t sent_ms_{0};
   uint8_t write_length_{0};
   uint8_t write_data_[MAX_WRITE_LENGTH]{};
 };

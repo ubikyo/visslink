@@ -230,3 +230,35 @@ TEST(mode_texts) {
   for (size_t i = 0; i < OPERATING_MODE_COUNT; i++)
     CHECK(operating_mode_index(OPERATING_MODE_VALUES[i]) == static_cast<int>(i));
 }
+
+TEST(write_arbiter_ready_matches_next) {
+  WriteArbiter w;
+  CHECK(!w.ready(0, true));
+  w.submit(0, 0x2301, 0x00, 0);
+  CHECK(!w.ready(0, false));
+  CHECK(w.ready(0, true));
+  CHECK_EQ(w.pending_count(), 1u);  // ready() ne retire rien
+  WriteArbiter::Request r;
+  CHECK(w.next(0, true, &r));
+  w.submit(1, 0x3301, 0x00, 10);
+  CHECK(!w.ready(20, true));  // une écriture en cours
+  w.complete(1000);
+  CHECK(!w.ready(1000 + WriteArbiter::MIN_SPACING_MS - 1, true));  // espacement inchangé
+  CHECK(w.ready(1000 + WriteArbiter::MIN_SPACING_MS, true));
+}
+
+TEST(write_timing_components) {
+  WriteTiming t;
+  t.requested = 1000;
+  t.started = 1040;
+  t.sent = 3020;
+  t.acked = 3090;
+  t.read_back = 6135;
+  t.done = 9180;
+  CHECK_EQ(t.queue_ms(), 40u);
+  CHECK_EQ(t.sync_ms(), 1980u);
+  CHECK_EQ(t.ack_ms(), 70u);
+  CHECK_EQ(t.read_back_ms(), 3045u);
+  CHECK_EQ(t.applied_ms(), 5135u);
+  CHECK_EQ(t.total_ms(), 8180u);
+}

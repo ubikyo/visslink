@@ -275,6 +275,25 @@ class ReadBackTracker {
   int pending_[2]{NONE, NONE};
 };
 
+/// Chronologie d'une écriture (millis()), pour la mesure des délais :
+///   demande HA -> début de transaction -> trame émise (0x05 reçu)
+///   -> accusé -> relecture du registre écrit -> fin des relectures.
+struct WriteTiming {
+  uint32_t requested{0};   ///< dépôt de la demande (Home Assistant)
+  uint32_t started{0};     ///< request_write() : ligne obtenue
+  uint32_t sent{0};        ///< trame émise sur le 0x05
+  uint32_t acked{0};       ///< accusé (ou échec) reçu
+  uint32_t read_back{0};   ///< relecture du registre écrit terminée (état publié)
+  uint32_t done{0};        ///< toutes les relectures terminées
+
+  uint32_t queue_ms() const { return this->started - this->requested; }       ///< attente de la ligne
+  uint32_t sync_ms() const { return this->sent - this->started; }             ///< attente du 0x05
+  uint32_t ack_ms() const { return this->acked - this->sent; }                ///< émission + réponse
+  uint32_t read_back_ms() const { return this->read_back - this->acked; }     ///< relecture (dont son 0x05)
+  uint32_t applied_ms() const { return this->read_back - this->requested; }   ///< demande -> état publié
+  uint32_t total_ms() const { return this->done - this->requested; }
+};
+
 /// Comparaison de la relecture avec la valeur demandée.
 enum class VerifyResult : uint8_t { CONFIRMED, MISMATCH, UNVERIFIED };
 
@@ -376,6 +395,14 @@ class WriteArbiter {
       }
     }
     return false;
+  }
+
+  /// Une écriture partirait maintenant si la ligne était libre (sans rien
+  /// retirer de la file).
+  bool ready(uint32_t now, bool link_ok) const {
+    if (this->active_ || this->count_ == 0 || !link_ok)
+      return false;
+    return !this->has_completed_ || time_reached(now, this->completed_ms_ + MIN_SPACING_MS);
   }
 
   /// Écriture à envoyer maintenant, ou false. À n'appeler que lorsque la

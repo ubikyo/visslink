@@ -180,3 +180,43 @@ TEST(kw_write_reply_after_recovery_does_not_leak) {
   CHECK_EQ(f.settle(1350), KwResult::SUCCESS);
   CHECK_EQ(f.kw.data()[0], 20);
 }
+
+// --- v0.4.1 : préemption d'une requête non émise -----------------------------
+
+TEST(kw_cancel_only_before_anything_is_sent) {
+  // WAIT_SYNC : rien n'a été émis, annulation possible.
+  Fixture f;
+  CHECK(f.kw.request_read(0x0800, 2, 0));
+  CHECK(f.kw.is_waiting_sync());
+  CHECK(f.kw.cancel_before_send());
+  CHECK(f.kw.is_idle());
+  CHECK(f.serial.tx.empty());
+  // Ensuite, une écriture attend un 0x05 frais comme toute requête.
+  const uint8_t v = 0x00;
+  CHECK(f.kw.request_write(0x2301, &v, 1, 10));
+  f.loop(20);
+  CHECK(f.serial.tx.empty());
+  f.serial.push({0x05});
+  f.loop(30);
+  CHECK(f.serial.tx == (std::vector<uint8_t>{0x01, 0xF4, 0x23, 0x01, 0x01, 0x00}));
+  CHECK_EQ(f.kw.sent_ms(), 30u);
+
+  // Trame émise (WAIT_RESPONSE, CHECK_TRAILING) ou reprise (RECOVERY) :
+  // jamais annulée.
+  Fixture g;
+  CHECK(g.kw.request_read(0x0800, 2, 0));
+  g.serial.push({0x05});
+  g.loop(5);
+  CHECK(g.kw.state() == State::WAIT_RESPONSE);
+  CHECK(!g.kw.cancel_before_send());
+  g.serial.push({0x10, 0x00});
+  g.loop(50);
+  CHECK(g.kw.state() == State::CHECK_TRAILING);
+  CHECK(!g.kw.cancel_before_send());
+  g.serial.push({0x99});
+  CHECK_EQ(g.loop(60), KwResult::RESPONSE_TOO_LONG);
+  CHECK(g.kw.state() == State::RECOVERY);
+  CHECK(!g.kw.cancel_before_send());
+  Fixture h;
+  CHECK(!h.kw.cancel_before_send());  // IDLE : rien à annuler
+}

@@ -1,4 +1,4 @@
-# Écriture KW, consignes et programmes de fonctionnement (v0.3 – v0.4)
+# Écriture KW, consignes et programmes de fonctionnement (v0.3 – v0.4.1)
 
 > **Statut : aucune écriture n'a été faite sur la chaudière.** Le code
 > d'écriture est implémenté et testé **en simulation seulement**. Une
@@ -210,6 +210,7 @@ n'y a pas de migration automatique.
 | Pas de rafale | une écriture à la fois (envoi → relecture terminée), puis 10 s minimum (`MIN_SPACING_MS`) avant la suivante |
 | File bornée | une demande en attente par entité (6 au plus : 5 consignes + 1 programme) ; une nouvelle demande sur la même consigne **remplace** l'ancienne non encore envoyée ; pour un programme, elle est **refusée** |
 | Pas pendant une transaction | le moteur KW refuse toute requête hors de l'état `IDLE` ; l'écriture n'est lancée que si aucune lecture n'est en cours |
+| Priorité sans interruption (v0.4.1) | une commande prête ne remplace qu'une lecture ordinaire **pas encore émise** (attente du `0x05`) ; jamais une transaction dont la trame est partie, ni une relecture ; pendant les relectures, aucune lecture ordinaire (§ 14) |
 | Liaison désynchronisée | refus au dépôt et à l'émission si la dernière transaction a échoué sur un `sync timeout` ou si aucune lecture n'a encore réussi ; refus si la consigne n'a jamais été lue |
 | Demande périmée | abandonnée si elle n'est pas partie après 120 s (`REQUEST_EXPIRY_MS`) ; jamais envoyée plus tard |
 | Valeur inchangée | demande égale à la valeur lue : rien n'est écrit (usure de la mémoire de la régulation) |
@@ -512,13 +513,20 @@ négligeable.
 Pire cas simulé (`sim_v03_write_spam_keeps_periodic_reads`) : une demande
 toutes les 2 s pendant 6 h 30, sur les cinq consignes, avec les
 programmations. L'espacement plafonne alors les écritures à une toutes les
-~15 s (1 268 à 1 744 écritures).
+~15 s (v0.4.1 : 1 470 à 1 799 écritures).
 
-| Resynchro | Brûleur (30 s) : lectures perdues / 780, écart max | Écart max température extérieure (60 s) |
-|---|---|---|
-| 2 s | 0, 39 s | 65 s |
-| 3 s | 1, 50 s | 76 s |
-| 4 s | 18, 85 s | 101 s |
+| Resynchro | Brûleur (30 s) : lectures perdues / 780, écart max — v0.4 | — v0.4.1 (commandes prioritaires) | Écart max température extérieure (v0.4.1) |
+|---|---|---|---|
+| 2 s | 0, 39 s | 0, 38 s | 64 s |
+| 3 s | 1, 50 s | 1, 53 s | 79 s |
+| 4 s | 18, 85 s | 42, 84 s | 97 s |
+
+La priorité donnée aux commandes (§ 14) les fait partir plus vite, donc plus
+souvent dans ce scénario irréaliste. À 4 s de resynchro, le brûleur perd
+davantage de lectures, sans jamais sauter plus de deux cycles. L'espacement
+minimal de 10 s entre deux écritures est inchangé. En usage réel (une
+commande A1 toutes les 47 s, encore très au-delà d'un usage normal), le
+brûleur n'est pas pénalisé (§ 14).
 
 Les programmations restent lues intégralement. Aucune requête n'est
 dupliquée et deux écritures ne se suivent jamais sans relecture.
@@ -533,6 +541,7 @@ dupliquée et deux écritures ne se suivent jamais sans relecture.
 | Diagnostic v0.2.2 (inchangé) | 34 304 / 435 517 o | 34 676 (+372) / 438 377 (+2 860) o |
 | YAML v0.3 (inchangé : 5 `number`, select A1, text_sensor M2) | — | 35 292 (43,1 %) / 447 885 (42,9 %) o |
 | **Exemple v0.4** (5 `number`, 2 `select`) | — | **35 252 (43,0 %) / 447 313 (42,8 %) o** |
+| **Exemple v0.4.1** (même YAML, réactivité) | — | **35 284 (43,1 %) / 447 985 (42,9 %) o** (+32 o / +672 o) |
 
 Le moteur d'écriture, l'arbitre et les listes blanches coûtent ~350 o de RAM
 et ~2,8 Ko de Flash, même sans `number` ni `select`. Les trois options
@@ -564,3 +573,95 @@ d'autorisation ne changent pas l'empreinte : à peine 16 o de Flash entre
       KW3, faute de quoi elle reste non implémentée.
 - [ ] Décider ensuite, registre par registre, du passage à
       `enable_writes: true` en production.
+
+## 14. Réactivité des commandes (v0.4.1)
+
+### Analyse du délai (v0.4)
+
+La priorité des commandes existait déjà en v0.4. Dès que la ligne est
+libre, une écriture en attente passe avant toute lecture périodique,
+programmations horaires comprises, et ses relectures sont urgentes. Le
+délai provenait de :
+
+1. **L'attente du `0x05`, pour chaque transaction.** Après chaque réponse,
+   la Vitotronic ne renvoie un `0x05` qu'après 2 à 4 s. Une commande en
+   demande au moins deux : l'écriture, puis la relecture qui publie l'état
+   (une troisième pour l'autre circuit, après un programme). C'est la part
+   principale, **incompressible** tant qu'on respecte la synchronisation.
+2. **Une lecture périodique déjà acquise mais pas encore émise** (en attente
+   de son `0x05`) passait avant la commande : une synchronisation entière de
+   plus (2 à 4 s, jusqu'à `sync_timeout` si la chaudière se tait). Pendant
+   la lecture des programmations, la ligne est presque toujours dans ce cas.
+3. **L'ordre des relectures** suivait l'ordre de déclaration. Pour une
+   commande M2, A1 était relu avant M2 : l'état de M2 était publié une
+   synchronisation plus tard.
+4. **Une relecture en échec** laissait passer une lecture ordinaire pendant
+   son délai de nouvelle tentative (1 s).
+
+### Modifications (v0.4.1)
+
+| Point | Changement |
+|---|---|
+| 2 | Une commande prête **prend la place d'une lecture ordinaire en attente du `0x05`**. Rien n'a été émis pour cette lecture (`KwProtocol::cancel_before_send()` n'agit que dans l'état `WAIT_SYNC`), qui garde son échéance et repasse juste après. Une transaction dont la trame est partie (réponse attendue, fenêtre de silence, reprise) **n'est jamais interrompue**, ni une relecture de vérification. La commande attend ensuite un `0x05` frais, comme toute requête. |
+| 3 | Le registre écrit est **relu en premier**, puis l'autre circuit. |
+| 4 | Tant que des relectures de vérification sont en cours, **aucune lecture ordinaire** n'est démarrée (`acquire(now, urgent_only)`), même pendant un délai de nouvelle tentative. |
+| 1 | Inchangé. Aucun délai raccourci : `sync_timeout`, `response_timeout`, fenêtre de silence, reprise, espacement de 10 s entre écritures. L'enchaînement d'une trame sans attendre de `0x05` (openv) reste **non utilisé**, faute de confirmation. |
+
+Inchangés aussi : écritures désactivées par défaut, listes blanches,
+autorisations, une écriture à la fois, aucune réémission, demandes périmées
+abandonnées.
+
+### Journal de mesure (sur la chaudière)
+
+Chaque écriture se termine par une ligne de chronologie :
+
+```text
+[I][visslink]: 0x2301: write timing: line wait 12 ms, sync wait 1830 ms, send+ack 70 ms,
+               read-back 3045 ms; state published 4957 ms after the request, all read-backs 8002 ms
+```
+
+| Champ | Mesure | Contenu |
+|---|---|---|
+| `line wait` | demande Home Assistant → début de la transaction KW | fin de la trame éventuellement en cours ; 0 si la ligne est libre ou si une lecture non émise a été préemptée (journal DEBUG `periodic read deferred for a manual command`) |
+| `sync wait` | début → émission de la trame | **attente du `0x05`** |
+| `send+ack` | émission → accusé | **transmission** (6 octets, ~15 ms à 4800 bauds 8E2), réponse de la régulation, 25 ms de silence de contrôle |
+| `read-back` | accusé → relecture du registre écrit | **relecture**, dont son propre `0x05` (le plus long) |
+| `state published` | demande → état publié dans Home Assistant | total vu par l'utilisateur |
+| `all read-backs` | demande → fin des relectures | ajoute la relecture de l'autre circuit (programmes) |
+
+Le délai entre l'action dans Home Assistant et l'arrivée de la demande sur
+l'ESP (réseau, API) n'est pas compté ; il est normalement négligeable.
+
+### Temps de réponse simulés
+
+Chaudière simulée, une commande A1 toutes les 47 s pendant 6 h 20, avec
+brûleur (30 s), températures (60 s), consignes, programmes et les
+4 programmations horaires (lues au démarrage et à 6 h). Test
+`sim_v041_command_latency_under_load`. Moyenne / maximum, en ms :
+
+| Resynchro | Version | Attente de la ligne | Attente du `0x05` | Émission + accusé | Relecture | Demande → état publié |
+|---|---|---|---|---|---|---|
+| 2 s | v0.4 | 42 / 1 200 | 1 125 / 2 000 | 70 | 2 045 | 3 282 / 5 290 |
+| 2 s | v0.4.1 | 0 / 65 | 1 019 / 2 000 | 70 | 2 045 | **3 134 / 4 155** |
+| 3 s | v0.4 | 267 / 3 025 | 1 574 / 2 975 | 70 | 3 045 | 4 956 / 9 115 |
+| 3 s | v0.4.1 | 0 / 55 | 1 195 / 2 975 | 70 | 3 045 | **4 311 / 6 145** |
+| 4 s | v0.4 | 766 / 4 035 | 2 473 / 3 975 | 70 | 4 045 | 7 354 / 12 125 |
+| 4 s | v0.4.1 | 0 / 45 | 1 604 / 3 975 | 70 | 4 045 | **5 719 / 8 135** |
+
+- Le pire cas passe de ~3 à ~2 synchronisations : `état publié ≤ 2 ×
+  resynchro + ~0,3 s` (vérifié par le test).
+- Le brûleur garde la même cadence qu'en v0.4 (au plus 2 lectures d'écart
+  sur 6 h 20). Les programmations sont lues intégralement, sans aucune
+  lecture abandonnée après émission.
+- Pendant la lecture des 28 blocs de programmation, une commande passe
+  devant tous les blocs restants (`sim_v041_command_during_schedule_reading`).
+- Pour un programme, la relecture de l'autre circuit ajoute une
+  synchronisation **après** la publication de l'état du circuit commandé.
+
+Ces chiffres viennent de la **simulation**. Sur la chaudière, la ligne
+`write timing` donne les valeurs réelles. Si `sync wait` et `read-back`
+dominent (≈ délai de resynchro de la KW3), il n'y a plus de marge sans
+enchaîner les trames, ce qui demanderait une validation matérielle
+préalable. Si `line wait` est élevé, ou si l'écart entre la commande et
+l'afficheur de la Vitotronic dépasse `state published`, le retard vient
+d'ailleurs (régulation, réseau) et doit être analysé.

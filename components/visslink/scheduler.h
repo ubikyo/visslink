@@ -21,7 +21,11 @@
 //  - expedite() (v0.3) rend un registre échu immédiatement et prioritaire
 //    pour une seule lecture : relecture de vérification après une écriture.
 //    Il ne peut y en avoir qu'une à la fois (une écriture à la fois), donc
-//    l'attente des autres registres augmente au plus d'une lecture.
+//    l'attente des autres registres augmente au plus d'une lecture ;
+//  - v0.4.1 : acquire(now, true) ne délivre que les relectures urgentes
+//    (aucune lecture ordinaire intercalée tant qu'une vérification est en
+//    cours) ; release() rend une lecture acquise mais jamais émise, sans
+//    toucher à son échéance (préemption par une commande manuelle).
 
 #include <cstddef>
 #include <cstdint>
@@ -61,16 +65,27 @@ class RegisterScheduler {
   }
 
   /// Index du registre à lire maintenant (marqué en cours), ou NONE.
-  int acquire(uint32_t now) {
+  /// `urgent_only` : seulement une relecture demandée par expedite().
+  int acquire(uint32_t now, bool urgent_only = false) {
     if (this->current_ != NONE)
       return NONE;
+    // Relectures urgentes d'abord, la plus ancienne demandée en premier
+    // (le registre écrit avant l'autre circuit).
     uint32_t best_lateness = 0;
     for (size_t i = 0; i < this->entries_.size(); i++) {
-      if (this->entries_[i].urgent && time_reached(now, this->entries_[i].due_ms)) {
+      const Entry &e = this->entries_[i];
+      if (!e.urgent || !time_reached(now, e.due_ms))
+        continue;
+      if (this->current_ == NONE || now - e.due_ms > best_lateness) {
         this->current_ = static_cast<int>(i);
-        return this->current_;
+        best_lateness = now - e.due_ms;
       }
     }
+    if (this->current_ != NONE)
+      return this->current_;
+    best_lateness = 0;
+    if (urgent_only)
+      return NONE;
     for (size_t i = 0; i < this->entries_.size(); i++) {
       const Entry &e = this->entries_[i];
       if (!time_reached(now, e.due_ms))
@@ -83,6 +98,11 @@ class RegisterScheduler {
     }
     return this->current_;
   }
+
+  /// Rend la lecture en cours sans l'avoir faite (aucun octet émis) : ni
+  /// succès ni échec, échéance et tentatives inchangées. Le registre reste
+  /// échu et sera relu dès que possible.
+  void release() { this->current_ = NONE; }
 
   /// Registre en cours de lecture, ou NONE.
   int current() const { return this->current_; }

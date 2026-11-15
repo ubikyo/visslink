@@ -305,3 +305,46 @@ TEST(scheduler_expedite_refused_for_schedules_and_current) {
   CHECK_EQ(s.acquire(100), 1);
   CHECK(!s.expedite(1, 200));  // lecture en cours
 }
+
+// --- v0.4.1 : réactivité des commandes ---------------------------------------
+
+TEST(scheduler_release_keeps_due_and_failures) {
+  RegisterScheduler s;
+  s.add(60000, 0);
+  s.add(60000, 50000);
+  CHECK_EQ(s.acquire(1000), 0);
+  s.release();  // préemptée avant émission
+  CHECK_EQ(s.current(), RegisterScheduler::NONE);
+  CHECK_EQ(s.entry(0).due_ms, 0u);  // toujours échue
+  CHECK_EQ(s.entry(0).failures, 0);
+  CHECK_EQ(s.acquire(6000), 0);  // la plus en retard repasse en premier
+  CHECK(!s.finish(false, 7000));
+  CHECK_EQ(s.acquire(8000), 0);
+  s.release();
+  CHECK_EQ(s.entry(0).failures, 1);  // tentative non comptée deux fois
+}
+
+TEST(scheduler_urgent_only_and_owner_first) {
+  RegisterScheduler s;
+  s.add(60000, 0);   // 0 : ordinaire, échu
+  s.add(300000, 0);  // 1 : autre circuit
+  s.add(300000, 0);  // 2 : registre écrit
+  for (int i = 0; i < 3; i++) {
+    const int idx = s.acquire(1000 + i);
+    s.finish(true, 1500 + i);
+    CHECK(idx >= 0);
+  }
+  CHECK(s.expedite(2, 70000));      // écrit : relu en premier
+  CHECK(s.expedite(1, 70000 + 1));  // autre circuit ensuite
+  CHECK_EQ(s.acquire(70001, true), 2);
+  CHECK(!s.finish(false, 71000));        // échec : nouvelle tentative de 2 à 72 000
+  CHECK_EQ(s.acquire(71100, true), 1);  // l'autre relecture passe pendant ce délai
+  s.finish(true, 71500);
+  CHECK_EQ(s.acquire(71600, true), RegisterScheduler::NONE);  // pas de lecture ordinaire intercalée…
+  CHECK_EQ(s.acquire(71600, false), 0);                       // …alors que sans la restriction, 0 passerait
+  s.release();
+  CHECK_EQ(s.acquire(72000, true), 2);
+  s.finish(true, 74000);
+  CHECK_EQ(s.acquire(74000, true), RegisterScheduler::NONE);
+  CHECK_EQ(s.acquire(74000), 0);  // relectures terminées : lectures ordinaires
+}

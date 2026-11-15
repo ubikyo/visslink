@@ -364,6 +364,7 @@ void VissLinkComponent::loop() {
     }
   }
 
+  this->preempt_unsent_read_(now);
   if (this->kw_.is_idle() && this->scheduler_.current() == RegisterScheduler::NONE) {
     this->drop_expired_writes_(now);
     // Une écriture en attente passe avant les lectures (commande manuelle),
@@ -372,7 +373,9 @@ void VissLinkComponent::loop() {
   }
 
   if (this->kw_.is_idle()) {
-    const int index = this->scheduler_.acquire(now);
+    // Pendant les relectures de vérification, aucune lecture ordinaire
+    // intercalée (même pendant le délai d'une nouvelle tentative).
+    const int index = this->scheduler_.acquire(now, !this->read_back_.idle());
     if (index != RegisterScheduler::NONE) {
       const VissLinkRegister *reg = this->registers_[index];
       const uint16_t address = reg->get_block_address(this->scheduler_.block(index));
@@ -531,11 +534,46 @@ bool VissLinkComponent::start_write_(uint32_t now) {
   }
   ESP_LOGI(TAG, "0x%04X -> %02X (write)", request.address, request.value);
   this->write_in_flight_ = true;
+  this->timing_ = WriteTiming();
+  this->timing_.requested = request.requested_ms;
+  this->timing_.started = now;
   return true;
+}
+
+void VissLinkComponent::preempt_unsent_read_(uint32_t now) {
+  // Une commande manuelle prête prend la place d'une lecture ordinaire
+  // acquise mais encore en attente du 0x05 : aucun octet n'a été émis, rien
+  // n'est interrompu sur la ligne. La lecture garde son échéance et repasse
+  // après. Une transaction dont la trame est partie n'est jamais touchée,
+  // ni une relecture de vérification.
+  const int current = this->scheduler_.current();
+  if (!this->enable_writes_ || this->write_in_flight_ || current == RegisterScheduler::NONE ||
+      this->scheduler_.entry(current).urgent || !this->kw_.is_waiting_sync() ||
+      !this->writes_.ready(now, this->link_ok_))
+    return;
+  if (this->kw_.cancel_before_send()) {
+    this->scheduler_.release();
+    ESP_LOGD(TAG, "0x%04X: periodic read deferred for a manual command (nothing sent yet)",
+             this->registers_[current]->get_block_address(this->scheduler_.block(current)));
+  }
+}
+
+void VissLinkComponent::log_write_timing_(uint16_t address) {
+  if (!this->timing_valid_)
+    return;
+  const WriteTiming &t = this->timing_;
+  ESP_LOGI(TAG,
+           "0x%04X: write timing: line wait %" PRIu32 " ms, sync wait %" PRIu32 " ms, send+ack %" PRIu32
+           " ms, read-back %" PRIu32 " ms; state published %" PRIu32 " ms after the request, all read-backs %" PRIu32
+           " ms",
+           address, t.queue_ms(), t.sync_ms(), t.ack_ms(), t.read_back_ms(), t.applied_ms(), t.total_ms());
 }
 
 void VissLinkComponent::handle_write_result_(KwResult result, uint32_t now) {
   this->write_in_flight_ = false;
+  this->timing_.sent = this->kw_.sent_ms();
+  this->timing_.acked = now;
+  this->timing_valid_ = result != KwResult::SYNC_TIMEOUT;  // sinon, rien n'a été émis
   const WriteArbiter::Request &request = this->writes_.current();
   VissLinkRegister *reg = this->registers_[request.owner];
   switch (result) {
@@ -568,7 +606,9 @@ void VissLinkComponent::handle_write_result_(KwResult result, uint32_t now) {
   const int peer = this->mode_peer_of_(request.owner);
   this->mode_write_checked_ = is_mode_register(request.address);
   this->read_back_.start(request.owner, peer);
-  if (peer != WriteArbiter::NONE && !this->scheduler_.expedite(peer, now))
+  // Le registre écrit est relu en premier (état publié au plus tôt), puis
+  // l'autre circuit.
+  if (peer != WriteArbiter::NONE && !this->scheduler_.expedite(peer, now + 1))
     this->read_back_.done(peer);
   if (!this->scheduler_.expedite(request.owner, now)) {
     ESP_LOGE(TAG, "0x%04X: read-back could not be scheduled", request.address);
@@ -579,8 +619,12 @@ void VissLinkComponent::handle_write_result_(KwResult result, uint32_t now) {
 }
 
 void VissLinkComponent::read_back_done_(int index, uint32_t now) {
+  if (this->writes_.active() && this->writes_.current().owner == index && this->read_back_.waiting(index))
+    this->timing_.read_back = now;  // état du registre écrit publié
   if (!this->writes_.active() || !this->read_back_.done(index))
     return;
+  this->timing_.done = now;
+  this->log_write_timing_(this->writes_.current().address);
   this->writes_.complete(now);
   if (this->mode_write_checked_) {
     this->mode_write_checked_ = false;

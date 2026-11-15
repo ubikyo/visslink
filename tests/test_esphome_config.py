@@ -24,6 +24,8 @@ EXAMPLE_V022 = "tests/fixtures/iot-viessmann-v0.2.2.yaml"
 DIAGNOSTIC_V022 = "tests/fixtures/iot-viessmann-v0.2.2-diagnostic.yaml"
 # Exemple de la v0.3 (A1 en select, M2 en text_sensor), tel que publié.
 EXAMPLE_V03 = "tests/fixtures/iot-viessmann-v0.3.yaml"
+# Exemple de la v0.4 (deux select, trois autorisations), tel que publié.
+EXAMPLE_V04 = "tests/fixtures/iot-viessmann-v0.4.yaml"
 
 
 def _secrets() -> str:
@@ -797,3 +799,13 @@ def test_m2_as_text_sensor_is_valid(repo_root, tmp_path):
     # même transformation est valide.
     result = _run_config(repo_root, tmp_path, _m2_as_text)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_v04_config_still_valid(repo_root, tmp_path):
+    result = _run_config(repo_root, tmp_path, example=EXAMPLE_V04)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    text = (repo_root / EXAMPLE_V04).read_text(encoding="utf-8")
+    assert text.startswith("# VissLink v0.4 ")
+    for flag in ("enable_writes", "enable_mode_writes", "enable_m2_mode_write"):
+        assert f"{flag}: false" in out, flag

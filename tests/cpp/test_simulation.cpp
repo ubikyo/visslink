@@ -2,6 +2,7 @@
 // Vitotronic simulée. Ces tests éprouvent la logique, ils ne remplacent pas
 // un essai sur la chaudière réelle.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <map>
@@ -52,6 +53,12 @@ struct Bench {
   bool enable_writes{false};
   bool enable_mode_writes{false};
   bool enable_m2_mode_write{false};
+  // v0.4.1 (false = comportement v0.4, pour comparaison) :
+  bool preempt_unsent_reads{true};  ///< une commande prend la place d'une lecture pas encore émise
+  bool strict_read_back{true};      ///< aucune lecture ordinaire pendant les relectures
+  int preemptions{0};
+  WriteTiming timing;
+  std::vector<WriteTiming> timings;
   ReadBackTracker read_back;
   std::map<size_t, int> mode_state;  ///< programme publié (brut 00/03/05, -1 = inconnu)
   std::vector<ModeDivergence> divergence_log;  ///< divergence A1/M2 après chaque relecture de programme
@@ -169,8 +176,13 @@ struct Bench {
   }
   /// VissLinkComponent::read_back_done_.
   void read_back_done(size_t index, uint32_t now) {
+    if (writes.active() && writes.current().owner == static_cast<int>(index) &&
+        read_back.waiting(static_cast<int>(index)))
+      timing.read_back = now;  // état du registre écrit publié
     if (!writes.active() || !read_back.done(static_cast<int>(index)))
       return;
+    timing.done = now;
+    timings.push_back(timing);
     const bool mode_write = regs[writes.current().owner].mode;
     writes.complete(now);
     if (mode_write)
@@ -253,13 +265,15 @@ struct Bench {
       // VissLinkComponent::handle_write_result_
       write_in_flight = false;
       write_results.push_back(result);
+      timing.sent = kw.sent_ms();
+      timing.acked = now;
       if (result == KwResult::SYNC_TIMEOUT)
         link_ok = false;
       const WriteArbiter::Request &w = writes.current();
       verify[w.owner].expect(w.value);
       const int peer = mode_peer(w.owner);
       read_back.start(w.owner, peer);
-      if (peer != ReadBackTracker::NONE && !scheduler.expedite(peer, now))
+      if (peer != ReadBackTracker::NONE && !scheduler.expedite(peer, now + 1))  // écrit relu d'abord
         read_back.done(peer);
       if (!scheduler.expedite(w.owner, now)) {
         read_back.done(w.owner);
@@ -324,6 +338,13 @@ struct Bench {
         }
       }
     }
+    // VissLinkComponent::preempt_unsent_read_ (v0.4.1).
+    if (preempt_unsent_reads && enable_writes && !write_in_flight && kw.is_waiting_sync() &&
+        scheduler.current() != RegisterScheduler::NONE && !scheduler.entry(scheduler.current()).urgent &&
+        writes.ready(now, link_ok) && kw.cancel_before_send()) {
+      scheduler.release();
+      preemptions++;
+    }
     if (kw.is_idle() && scheduler.current() == RegisterScheduler::NONE) {
       WriteArbiter::Request w;
       while (writes.pop_expired(now, &w))
@@ -344,6 +365,9 @@ struct Bench {
         if (allowed && kw.request_write(w.address, &w.value, 1, now)) {
           write_in_flight = true;
           write_start_ms.push_back(now);
+          timing = WriteTiming();
+          timing.requested = w.requested_ms;
+          timing.started = now;
         } else {
           refused_at_send++;
           writes.complete(now);
@@ -351,7 +375,7 @@ struct Bench {
       }
     }
     if (kw.is_idle()) {
-      const int index = scheduler.acquire(now);
+      const int index = scheduler.acquire(now, strict_read_back && !read_back.idle());
       if (index != RegisterScheduler::NONE &&
           !kw.request_read(block_address(regs[index], scheduler.block(index)), length(regs[index]), now))
         scheduler.finish(false, now);
@@ -1302,15 +1326,16 @@ TEST(sim_v03_write_spam_keeps_periodic_reads) {
     }
     for (size_t i : {v.circuits->a1, v.circuits->m2, v.circuits->dhw, v.circuits->loop})
       CHECK_EQ(b.successes[i], 14);
-    // Relevé : 2 s -> 0 lecture du brûleur perdue sur 780 (écart 39 s) ;
-    // 3 s -> 1 (50 s) ; 4 s -> 18 (85 s). Ce rythme (une écriture toutes les
-    // ~15 s pendant 6 h) n'a rien de réaliste : il borne le pire cas.
+    // Relevé (v0.4.1, commandes prioritaires) : 2 s -> 0 lecture du brûleur
+    // perdue sur 780 ; 3 s -> 1 ; 4 s -> 42 (écart 85 s ; v0.4 : 18). Ce
+    // rythme (une écriture toutes les ~15 s pendant 6 h) n'a rien de
+    // réaliste : il borne le pire cas.
     const int lost = ref.successes[r.burner] - b.successes[v.burner];
     if (post <= 3000) {
       CHECK(lost <= 1);
       CHECK(b.max_gap_ms[v.burner] <= 55 * S);
     } else {
-      CHECK(lost <= 25);
+      CHECK(lost <= 50);
       CHECK(b.max_gap_ms[v.burner] <= 90 * S);  // jamais plus de deux cycles sautés
     }
     CHECK(b.max_gap_ms[v.outdoor] <= 110 * S);
@@ -1323,26 +1348,53 @@ TEST(sim_v03_write_spam_keeps_periodic_reads) {
 }
 
 TEST(sim_v03_link_loss_never_sends_a_stale_write) {
+  // Chemin « demande périmée » : une demande attend l'espacement minimal qui
+  // suit une écriture ; la liaison tombe pendant cette attente. La demande
+  // n'est jamais envoyée, puis elle est abandonnée, même après le retour de
+  // la liaison.
   Bench b;
   V03 v(b, false);
   b.run(0, BOOT);
-  // Demande déposée pendant une lecture, juste avant la coupure : la lecture
-  // échoue (pas de 0x05), la liaison est déclarée perdue, rien ne part.
+  CHECK(b.request(v.a1_comfort, 22, BOOT) == "queued");
   uint32_t t = BOOT;
-  while (b.kw.is_idle())
+  while (b.timings.empty() && t < BOOT + MIN)
     b.run(t, 5), t += 5;
+  CHECK_EQ(b.boiler.write_frames, 1);  // première écriture terminée
+  CHECK(b.request(v.dhw, 45, t) == "queued");  // en attente de l'espacement
   b.boiler.connected = false;
-  CHECK(b.request(v.dhw, 45, t) == "queued");
   b.run(t, 30 * S);
   CHECK(!b.link_ok);
-  CHECK(b.request(v.a1_comfort, 22, t + 30 * S) == "link");  // refusée tout de suite
+  CHECK(b.request(v.a1_reduced, 18, t + 30 * S) == "link");  // refusée tout de suite
   b.run(t + 30 * S, 3 * MIN);
   CHECK_EQ(b.expired_writes, 1);  // abandonnée après REQUEST_EXPIRY_MS
   b.boiler.connected = true;
   b.run(t + 210 * S, 20 * MIN);
-  CHECK_EQ(b.boiler.write_frames, 0);  // jamais envoyée plus tard
+  CHECK_EQ(b.boiler.write_frames, 1);  // jamais envoyée plus tard
   CHECK_EQ(b.boiler_value(0x6300), 50);
   CHECK(b.link_ok);
+  CHECK_EQ(b.number_state[v.dhw], 50);
+}
+
+TEST(sim_v041_link_loss_with_preempted_read_sends_nothing) {
+  // v0.4.1 : la demande prend la place d'une lecture en attente du 0x05 ;
+  // l'interface est débranchée : pas de 0x05, rien n'est émis
+  // (sync timeout), aucune nouvelle tentative après le retour de la liaison.
+  Bench b;
+  V03 v(b, false);
+  b.run(0, BOOT);
+  uint32_t t = BOOT;
+  while (!b.kw.is_waiting_sync())
+    b.run(t, 5), t += 5;
+  b.boiler.connected = false;
+  CHECK(b.request(v.dhw, 45, t) == "queued");
+  b.run(t, 30 * S);
+  CHECK_EQ(b.preemptions, 1);
+  CHECK(b.write_results == std::vector<KwResult>{KwResult::SYNC_TIMEOUT});
+  CHECK(!b.link_ok);
+  b.boiler.connected = true;
+  b.run(t + 30 * S, 20 * MIN);
+  CHECK_EQ(b.boiler.write_frames, 0);
+  CHECK_EQ(b.boiler_value(0x6300), 50);
   CHECK_EQ(b.number_state[v.dhw], 50);
 }
 
@@ -1489,7 +1541,7 @@ namespace {
 struct Modes {
   V03 base;
   size_t a1, m2;
-  Modes(Bench &b, bool mode_writes = true, bool m2_write = false) : base(b, false) {
+  Modes(Bench &b, bool mode_writes = true, bool m2_write = false, bool schedules = false) : base(b, schedules) {
     b.enable_mode_writes = mode_writes;
     b.enable_m2_mode_write = m2_write;
     b.boiler.registers[0x2301] = {0x03};
@@ -1820,4 +1872,155 @@ TEST(sim_v04_m2_send_time_check_blocks_bypassed_requests) {
   c.run(BOOT + MIN, MIN);
   CHECK_EQ(c.refused_at_send, 1);
   CHECK_EQ(c.boiler.write_frames_by_address[0x3301], 0);
+}
+
+// --- v0.4.1 : réactivité des commandes manuelles ------------------------------
+
+namespace {
+
+struct Latency {
+  uint32_t queue_max{0}, applied_max{0}, read_back_max{0};
+  double applied_mean{0};
+  size_t count{0};
+};
+
+Latency latency(const Bench &b) {
+  Latency l;
+  for (const auto &t : b.timings) {
+    l.queue_max = std::max(l.queue_max, t.queue_ms());
+    l.applied_max = std::max(l.applied_max, t.applied_ms());
+    l.read_back_max = std::max(l.read_back_max, t.read_back_ms());
+    l.applied_mean += t.applied_ms();
+  }
+  l.count = b.timings.size();
+  if (l.count > 0)
+    l.applied_mean /= l.count;
+  return l;
+}
+
+/// Une commande A1 toutes les 47 s (aller-retour 03 <-> 05) pendant 6 h 20,
+/// programmations horaires comprises (lecture complète au démarrage et à 6 h).
+void run_a1_commands(Bench &b, Modes &m) {
+  b.run(0, BOOT);
+  for (uint32_t t = BOOT; t < 6 * H + 20 * MIN; t += 47 * S) {
+    CHECK(b.request_mode(m.a1, b.mode_of(m.a1) == 0x03 ? OFF : HEATING_ECS, t) == "queued");
+    b.run(t, 47 * S);
+  }
+}
+
+}  // namespace
+
+TEST(sim_v041_command_latency_under_load) {
+  // Relevé (ms, moyenne / max de « demande -> état publié ») :
+  //   2 s : v0.4 3282/5290  -> v0.4.1 3134/4155
+  //   3 s : v0.4 4956/9115  -> v0.4.1 4311/6145
+  //   4 s : v0.4 7354/12125 -> v0.4.1 5719/8135
+  for (uint32_t post : {2000u, 3000u, 4000u}) {
+    Bench old_b, b;
+    old_b.boiler.post_response_delay_ms = b.boiler.post_response_delay_ms = post;
+    old_b.preempt_unsent_reads = old_b.strict_read_back = false;  // comportement v0.4
+    Modes old_m(old_b, true, false, true);
+    Modes m(b, true, false, true);
+    run_a1_commands(old_b, old_m);
+    run_a1_commands(b, m);
+    const Latency before = latency(old_b), after = latency(b);
+
+    CHECK_EQ(after.count, 483u);  // toutes les commandes exécutées
+    CHECK(b.preemptions > 0);
+    // La ligne est obtenue dès la fin de l'éventuelle trame en cours.
+    CHECK(after.queue_max <= 100);
+    // Ensuite : un 0x05 pour l'écriture, un pour la relecture (au plus la
+    // resynchro chacun), plus émission, réponse et fenêtres de silence.
+    CHECK(after.applied_max <= 2 * post + 300);
+    CHECK(after.read_back_max <= post + 100);  // aucune lecture intercalée
+    CHECK(after.applied_max <= before.applied_max);
+    CHECK(after.applied_mean <= before.applied_mean);
+    // Sans pénaliser les lectures périodiques ni les programmations.
+    CHECK(b.successes[m.base.burner] + 3 >= old_b.successes[old_m.base.burner]);
+    CHECK(b.failures.empty());
+    CHECK_EQ(b.boiler.requests, b.total_successes());  // aucune lecture abandonnée après émission
+    CHECK(both_read_back_after_each_write(b.boiler));
+    for (size_t i : {m.base.circuits->a1, m.base.circuits->m2, m.base.circuits->dhw, m.base.circuits->loop})
+      CHECK_EQ(b.successes[i], 14);
+    if (vltest::failures() > 0)
+      std::printf("    post=%u applied mean %.0f/%.0f max %u/%u queue max %u/%u\n", static_cast<unsigned>(post),
+                  before.applied_mean, after.applied_mean, static_cast<unsigned>(before.applied_max),
+                  static_cast<unsigned>(after.applied_max), static_cast<unsigned>(before.queue_max),
+                  static_cast<unsigned>(after.queue_max));
+  }
+}
+
+TEST(sim_v041_command_during_schedule_reading) {
+  // Pendant la lecture des 28 blocs de programmation (démarrage), une
+  // commande passe devant tous les blocs restants.
+  Bench b;
+  b.boiler.post_response_delay_ms = 3000;
+  Modes m(b, true, false, true);
+  b.run(0, 75 * S);  // A1 et M2 lus, programmations en cours de lecture
+  CHECK(b.mode_of(m.a1) == 0x03);
+  CHECK(b.successes[m.base.circuits->a1] < 7);
+  CHECK(b.request_mode(m.a1, ECS_ONLY, 75 * S) == "queued");
+  b.run(75 * S, 15 * S);
+  CHECK_EQ(b.timings.size(), 1u);
+  CHECK(b.timings[0].queue_ms() <= 100);
+  CHECK(b.timings[0].applied_ms() <= 2 * 3000 + 300);
+  CHECK_EQ(b.mode_of(m.a1), 0x00);
+  b.run(90 * S, 10 * MIN);
+  for (size_t i : {m.base.circuits->a1, m.base.circuits->m2, m.base.circuits->dhw, m.base.circuits->loop})
+    CHECK_EQ(b.successes[i], 7);  // programmations lues entièrement
+}
+
+TEST(sim_v041_written_register_read_back_first) {
+  // Commande M2 : M2 (le registre écrit, index plus grand) est relu avant
+  // A1 ; son état est publié une synchro plus tôt.
+  Bench b;
+  Modes m(b, true, true);
+  b.run(0, BOOT);
+  CHECK(b.request_mode(m.m2, ECS_ONLY, BOOT) == "queued");
+  b.run(BOOT, MIN);
+  const auto &log = b.boiler.frame_log;
+  size_t w = 0;
+  while (w < log.size() && log[w].first != 0xF4)
+    w++;
+  CHECK(w + 2 < log.size());
+  CHECK(log[w + 1] == (std::pair<uint8_t, uint16_t>{0xF7, 0x3301}));
+  CHECK(log[w + 2] == (std::pair<uint8_t, uint16_t>{0xF7, 0x2301}));
+  CHECK(b.timings[0].applied_ms() < b.timings[0].total_ms());
+}
+
+TEST(sim_v041_no_ordinary_read_inside_read_back_retries) {
+  // Écriture d'une consigne (une seule relecture) pendant la lecture des
+  // programmations ; la relecture échoue une fois. v0.4.1 : pendant le délai
+  // de nouvelle tentative, aucune lecture ordinaire n'est intercalée ;
+  // v0.4 : une lecture ordinaire passait.
+  for (bool strict : {false, true}) {
+    Bench b;
+    b.strict_read_back = b.preempt_unsent_reads = strict;
+    V03 v(b);  // programmations comprises
+    b.run(0, 75 * S);
+    CHECK(b.request(v.dhw, 45, 75 * S) == "queued");
+    bool armed = false, cleared = false;
+    for (uint32_t t = 75 * S; t < 3 * MIN; t += 5) {
+      b.boiler.tick(t);
+      b.step(t);
+      if (!armed && b.boiler.write_frames == 1) {
+        b.boiler.register_faults[0x6300] = SimBoiler::Fault::SHORT_RESPONSE;  // relecture tronquée
+        armed = true;
+      }
+      if (armed && !cleared && b.failures[v.dhw] > 0) {
+        b.boiler.register_faults.clear();
+        cleared = true;
+      }
+    }
+    const auto &log = b.boiler.frame_log;
+    size_t w = 0;
+    while (log[w].first != 0xF4)
+      w++;
+    CHECK(w + 2 < log.size());
+    CHECK(log[w + 1].second == 0x6300);  // relecture (échouée)
+    const bool next_is_retry = log[w + 2].second == 0x6300;
+    CHECK_EQ(next_is_retry, strict);
+    CHECK_EQ(b.number_state[v.dhw], 45);
+    CHECK_EQ(b.boiler.write_frames, 1);  // la relecture est retentée, jamais l'écriture
+  }
 }

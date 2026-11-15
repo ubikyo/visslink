@@ -290,6 +290,8 @@ class VissLinkComponent : public Component, public uart::UARTDevice {
   void handle_result_(KwResult result, uint32_t now);
   void handle_write_result_(KwResult result, uint32_t now);
   bool start_write_(uint32_t now);
+  void preempt_unsent_read_(uint32_t now);
+  void log_write_timing_(uint16_t address);
   void drop_expired_writes_(uint32_t now);
   int index_of_(const VissLinkRegister *reg) const;
   /// Registre de programme de l'autre circuit, ou NONE.
@@ -305,6 +307,8 @@ class VissLinkComponent : public Component, public uart::UARTDevice {
   bool enable_mode_writes_{false};
   bool enable_m2_mode_write_{false};
   ReadBackTracker read_back_;
+  WriteTiming timing_;         ///< chronologie de l'écriture en cours (v0.4.1)
+  bool timing_valid_{false};   ///< trame réellement émise
   bool mode_write_checked_{false};  ///< écriture de programme : divergence à journaliser après les relectures
   VissLinkRegister *mode_registers_[2]{};  ///< sélecteurs de programme (A1, M2), au plus deux
 #ifdef USE_BINARY_SENSOR

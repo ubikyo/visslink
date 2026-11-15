@@ -75,6 +75,7 @@ class SimBoiler {
   std::vector<std::vector<uint8_t>> write_log;  ///< trames d'écriture complètes reçues
   int discarded_partial_frames{0};
   std::vector<std::pair<uint8_t, uint16_t>> frame_log;  ///< (F7/F4, adresse), dans l'ordre reçu
+  std::vector<uint32_t> frame_ms;                      ///< instant de réception de chaque trame de frame_log
 
   int requests{0};
   std::map<uint16_t, int> requests_by_address;
@@ -115,6 +116,7 @@ class SimBoiler {
         pending_length_ = r[4];
         lengths_by_address[address].insert(r[4]);
         frame_log.push_back({0xF7, address});
+        frame_ms.push_back(now);
         pending_write_ = false;
         has_pending_ = true;
         respond_at_ = now + response_delay_ms;
@@ -128,6 +130,7 @@ class SimBoiler {
         write_frames_by_address[address]++;
         write_log.push_back(frame);
         frame_log.push_back({0xF4, address});
+        frame_ms.push_back(now);
         receive_write_(address, std::vector<uint8_t>(frame.begin() + 5, frame.end()), now);
       } else {
         consumed_++;
