@@ -348,3 +348,190 @@ TEST(scheduler_urgent_only_and_owner_first) {
   CHECK_EQ(s.acquire(74000, true), RegisterScheduler::NONE);
   CHECK_EQ(s.acquire(74000), 0);  // relectures terminées : lectures ordinaires
 }
+
+// --- v0.5.1 : jour courant d'abord, relecture d'un bloc ----------------------
+
+namespace {
+
+/// Lit tout ce qui est échu entre `from` et `to` (lectures de `read_ms`) et
+/// renvoie les (registre, bloc) lus dans l'ordre.
+std::vector<std::pair<int, int>> trace(RegisterScheduler &s, uint32_t from, uint32_t to, uint32_t read_ms,
+                                       uint32_t *now_out = nullptr) {
+  std::vector<std::pair<int, int>> out;
+  uint32_t now = from;
+  while (now - from < to - from) {
+    const int idx = s.acquire(now);
+    if (idx == RegisterScheduler::NONE) {
+      now += 100;
+      continue;
+    }
+    out.push_back({idx, s.block(idx)});
+    now += read_ms;
+    s.finish(true, now);
+  }
+  if (now_out != nullptr)
+    *now_out = now;
+  return out;
+}
+
+std::vector<int> blocks_of(const std::vector<std::pair<int, int>> &t, int reg) {
+  std::vector<int> out;
+  for (const auto &p : t)
+    if (p.first == reg)
+      out.push_back(p.second);
+  return out;
+}
+
+}  // namespace
+
+TEST(scheduler_block_delay_is_configurable_default_30s) {
+  RegisterScheduler s;
+  CHECK_EQ(s.block_delay(), 30000u);
+  CHECK_EQ(RegisterScheduler::BLOCK_DELAY_MS, 30000u);  // valeur de production inchangée
+  s.set_block_delay(10000);
+  s.add(3600000, 0, 7);
+  CHECK_EQ(s.acquire(0), 0);
+  s.finish(true, 500);
+  CHECK_EQ(s.entry(0).due_ms, 10500u);
+}
+
+TEST(scheduler_cycle_starts_at_chosen_block_and_wraps) {
+  RegisterScheduler s;
+  s.add(6UL * 3600 * 1000, 0, 7);
+  CHECK(s.set_cycle_start(0, 6));  // dimanche
+  const auto t = trace(s, 0, 10 * 60 * 1000, 500);
+  CHECK(blocks_of(t, 0) == (std::vector<int>{6, 0, 1, 2, 3, 4, 5}));
+  // Cadence calée sur le début du cycle, cycle suivant au même jour.
+  CHECK_EQ(s.entry(0).due_ms, 6UL * 3600 * 1000);
+  CHECK_EQ(s.block(0), 6);
+  const auto t2 = trace(s, 6UL * 3600 * 1000, 6UL * 3600 * 1000 + 10 * 60 * 1000, 500);
+  CHECK(blocks_of(t2, 0) == (std::vector<int>{6, 0, 1, 2, 3, 4, 5}));
+}
+
+TEST(scheduler_cycle_start_refused_once_cycle_started_or_invalid) {
+  RegisterScheduler s;
+  s.add(60000, 0);        // registre simple
+  s.add(3600000, 0, 7);   // programmation
+  CHECK(!s.set_cycle_start(0, 0));
+  CHECK(!s.set_cycle_start(1, 7));
+  CHECK(!s.set_cycle_start(9, 0));
+  CHECK_EQ(s.acquire(0), 0);
+  s.finish(true, 100);
+  CHECK_EQ(s.acquire(100), 1);
+  CHECK(!s.set_cycle_start(1, 3));  // en cours de lecture
+  s.finish(true, 600);
+  CHECK(!s.set_cycle_start(1, 3));  // cycle commencé : ordre inchangé
+  CHECK_EQ(s.block(1), 1);
+}
+
+TEST(scheduler_expedite_block_mid_cycle_then_cycle_resumes) {
+  RegisterScheduler s;
+  s.add(30000, 0);            // brûleur
+  s.add(6UL * 3600 * 1000, 0, 7);
+  uint32_t now = 0;
+  // Lundi et mardi lus.
+  auto t = trace(s, 0, 32000, 500, &now);
+  CHECK(blocks_of(t, 1) == (std::vector<int>{0, 1}));
+  CHECK(s.expedite_block(1, 6, now));
+  CHECK_EQ(s.entry(1).urgent, RegisterScheduler::URGENT_REFRESH);
+  // Servi avant le brûleur échu.
+  CHECK_EQ(s.acquire(now + 30000), 1);
+  CHECK_EQ(s.block(1), 6);
+  s.finish(true, now + 30500);
+  CHECK_EQ(s.entry(1).urgent, RegisterScheduler::URGENT_NONE);
+  CHECK_EQ(s.block(1), 2);                           // reprise au mercredi
+  CHECK(s.entry(1).due_ms - (now + 30500) >= 30000);  // jamais deux blocs à la suite
+  // Le cycle se termine normalement : chaque jour lu une fois de plus.
+  t = trace(s, now + 30500, now + 10 * 60 * 1000, 500);
+  CHECK(blocks_of(t, 1) == (std::vector<int>{2, 3, 4, 5, 6}));
+  CHECK_EQ(s.entry(1).due_ms, 6UL * 3600 * 1000);  // cadence du cycle conservée
+}
+
+TEST(scheduler_expedite_block_while_waiting_for_next_cycle) {
+  RegisterScheduler s;
+  s.add(6UL * 3600 * 1000, 0, 7);
+  trace(s, 0, 10 * 60 * 1000, 500);  // cycle complet
+  const uint32_t next = s.entry(0).due_ms;
+  CHECK(s.expedite_block(0, 4, 20 * 60 * 1000));
+  CHECK_EQ(s.acquire(20 * 60 * 1000), 0);
+  CHECK_EQ(s.block(0), 4);
+  s.finish(true, 20 * 60 * 1000 + 500);
+  CHECK_EQ(s.entry(0).due_ms, next);  // prochain cycle inchangé
+  CHECK_EQ(s.block(0), 0);
+  CHECK_EQ(s.entry(0).done, 0);
+}
+
+TEST(scheduler_expedite_block_refusals) {
+  RegisterScheduler s;
+  s.add(3600000, 0, 7);
+  CHECK(!s.expedite_block(0, 7, 0));   // bloc inexistant
+  CHECK(!s.expedite_block(1, 0, 0));   // registre inexistant
+  CHECK(!s.expedite_block(0, 0, 0, RegisterScheduler::URGENT_NONE));
+  CHECK(!s.expedite(0, 0));            // expedite() reste réservé aux registres simples
+  CHECK(s.expedite_block(0, 3, 0));
+  CHECK(s.expedite_block(0, 3, 0));    // même bloc : accepté, sans effet
+  CHECK(!s.expedite_block(0, 5, 0));   // une seule relecture hors cycle à la fois
+  CHECK_EQ(s.acquire(0), 0);
+  CHECK(!s.expedite_block(0, 3, 0));   // en cours de lecture
+}
+
+TEST(scheduler_refresh_never_served_during_verification) {
+  RegisterScheduler s;
+  s.add(60000, 0);        // registre écrit
+  s.add(3600000, 0, 7);   // programmation
+  trace(s, 0, 31000, 500);
+  CHECK(s.expedite_block(1, 6, 40000));
+  CHECK(s.expedite(0, 40000));
+  // Relecture de vérification d'abord, même plus récente.
+  CHECK_EQ(s.acquire(40001), 0);
+  s.finish(true, 40500);
+  // Pendant une vérification (urgent_only), jamais le rafraîchissement.
+  CHECK_EQ(s.acquire(40600, true), RegisterScheduler::NONE);
+  CHECK_EQ(s.acquire(40600), 1);
+  CHECK_EQ(s.block(1), 6);
+}
+
+TEST(scheduler_expedite_block_retries_then_gives_up_and_resumes) {
+  RegisterScheduler s;
+  s.add(3600000, 0, 7);
+  trace(s, 0, 31000, 500);  // lundi et mardi
+  CHECK(s.expedite_block(0, 5, 40000));
+  uint32_t now = 40000;
+  bool gave_up = false;
+  for (int attempt = 0; attempt < 3; attempt++) {
+    CHECK_EQ(s.acquire(now), 0);
+    CHECK_EQ(s.block(0), 5);  // la tentative suivante relit le même bloc
+    gave_up = s.finish(false, now + 500);
+    now += 1500;
+  }
+  CHECK(gave_up);
+  CHECK_EQ(s.entry(0).urgent, RegisterScheduler::URGENT_NONE);
+  CHECK_EQ(s.block(0), 2);
+  CHECK_EQ(s.entry(0).failures, 0);
+}
+
+TEST(scheduler_cancel_refresh_restores_cycle_untouched) {
+  RegisterScheduler s;
+  s.add(60000, 0);
+  s.add(6UL * 3600 * 1000, 0, 7);
+  uint32_t now = 0;
+  trace(s, 0, 32000, 500, &now);  // lundi, mardi
+  const RegisterScheduler::Entry before = s.entry(1);
+  CHECK(s.expedite_block(1, 6, now));
+  CHECK(s.refresh_pending(1, 6));
+  CHECK(!s.cancel_refresh(1, 5));  // autre bloc
+  CHECK(s.cancel_refresh(1, 6));
+  CHECK(!s.refresh_pending(1, 6));
+  CHECK_EQ(s.entry(1).urgent, RegisterScheduler::URGENT_NONE);
+  CHECK_EQ(s.entry(1).block, before.block);
+  CHECK_EQ(s.entry(1).due_ms, before.due_ms);
+  CHECK_EQ(s.entry(1).done, before.done);
+  // Vérification (expedite) et lecture en cours : jamais retirées.
+  CHECK(s.expedite(0, now));
+  CHECK(!s.cancel_refresh(0, 0));
+  CHECK(s.expedite_block(1, 6, now));
+  CHECK_EQ(s.acquire(now + 1), 0);
+  s.finish(true, now + 500);
+  CHECK_EQ(s.acquire(now + 600), 1);
+  CHECK(!s.cancel_refresh(1, 6));  // en cours de lecture
+}

@@ -296,8 +296,8 @@ changé.
 | A1 radiateurs | `0x2302` | `0x2303` | vcontrold KW (200 KW2) : `getBetriebSparM1`, `getBetriebPartyM1`, 1 octet, unité `RT` (`00` → 0, `01` → 1) | **non** |
 | M2 plancher | `0x3302` | `0x3303` | vcontrold KW : `getBetriebSparM2`, `getBetriebPartyM2`, idem | **non** |
 
-Mise en œuvre (exemple v0.5) : quatre `binary_sensor` en **lecture seule**,
-toutes les 30 s.
+Mise en œuvre : quatre `binary_sensor` en **lecture seule**, toutes les
+60 s depuis la v0.5.1 (30 s en v0.5).
 
 | Entité | Adresse |
 |---|---|
@@ -367,6 +367,9 @@ la validation, 30 s convient. Pour l'usage courant (présence),
 **60 s est recommandé** si la resynchro réelle dépasse 3 s : la ligne
 `write timing` (v0.4.1) donne l'attente du `0x05` mesurée sur la chaudière.
 
+**v0.5.1 : 60 s retenu dans tous les exemples** (production et essai), pour
+éviter une saturation inutile de la liaison.
+
 ### Perspectives (non implémentées)
 
 Ces états serviront plus tard au pilotage par présence depuis Home
@@ -387,3 +390,71 @@ Assistant. Rien n'est automatisé. Avant toute écriture, il faudra étudier :
 
 Principe inchangé : la régulation climatique reste assurée par la
 Vitotronic. VissLink ne ferait que demander une dérogation, puis la relire.
+
+## 7. Consignes de départ `0x2544` / `0x3544` (v0.5.1)
+
+### Constat
+
+Sur cette KW3, les deux registres sont lus `FF FF`. En `int16 × 0,1`, cela
+donne -0,1 °C, une valeur publiée comme une vraie température alors qu'elle
+n'en est pas une.
+
+### Ce qui est établi, ce qui ne l'est pas
+
+- **Attribution** : dans les définitions communautaires (openv / vcontrold),
+  `0x2544` et `0x3544` sont décrits comme « Vorlaufsolltemperatur » A1M1 et
+  M2 (`int16`, dixièmes de degré) pour d'autres unités KW. **Aucune source
+  consultée ne le confirme pour la Vitotronic 300 KW3.** Ce n'est donc pas
+  établi pour cette installation.
+- **`FF FF` sur A1** : vraisemblable. A1 est le circuit **sans mélangeur** :
+  il n'a pas de consigne de départ propre, c'est la température chaudière
+  qui s'applique. `FF FF` serait alors le marqueur « non disponible ».
+  Hypothèse à vérifier.
+- **`FF FF` sur M2** : moins attendu, puisque M2 a un mélangeur et doit avoir
+  une consigne de départ quand il chauffe. Trois explications restent
+  possibles :
+  - pas de demande de chauffe au moment de la lecture (« ECS seule »,
+    coupure été, plage réduite sans besoin) ;
+  - adresse non utilisée par ce firmware ;
+  - autre codage.
+
+### Traitement (v0.5.1)
+
+L'option `invalid_values` de la plateforme `sensor` liste des valeurs brutes
+(octets lus, petit-boutiste, non signées) à publier comme **inconnues**.
+Elles ne sont jamais converties.
+
+- Elle est opt-in et vide par défaut, car `FF FF` reste -0,1 °C sur un
+  registre où c'est une valeur réelle, comme la température extérieure
+  `0x0800`.
+- Elle accepte au plus 4 valeurs, et chacune doit tenir dans la longueur du
+  type.
+- La réponse est valide : aucune nouvelle tentative, donc aucune charge
+  supplémentaire.
+- Le journal donne un avertissement au premier `FF FF` d'un épisode, puis
+  `value available again` quand une vraie valeur revient.
+
+```yaml
+  - platform: visslink
+    name: "Plancher chauffant - Consigne départ"
+    address: 0x3544
+    data_type: int16
+    invalid_values: [0xFFFF]
+    update_interval: 5min
+    filters:
+      - multiply: 0.1
+```
+
+### Validation proposée (lecture seule)
+
+1. Relever `0x3544` à deux moments :
+   - pendant une plage de chauffe de M2, en mode « Chauffage + ECS », avec le
+     circulateur M2 en marche ;
+   - en « ECS seule ».
+2. Comparer la valeur à la consigne de départ M2 affichée dans le menu
+   diagnostic du panneau (Diagnostic › circuit M2).
+3. Même chose pour `0x2544`. Si A1 reste à `FF FF` en toute circonstance,
+   c'est cohérent avec un circuit sans mélangeur : retirer le capteur.
+4. Si M2 reste à `FF FF` pendant une chauffe effective, l'adresse n'est pas
+   celle de la consigne sur cette KW3 : retirer le capteur et ne rien
+   déduire de cette valeur.

@@ -45,9 +45,26 @@ class BoostDurationSelect : public select::Select {
   void control(size_t index) override { this->publish_state(index); }
 };
 
-class VissLinkBoost : public Component, public visslink::VissLinkBlockClient {
+/// v0.5.1 : BoostRefreshPort sur le composant visslink.
+class ComponentRefreshPort : public visslink::BoostRefreshPort {
  public:
   void set_parent(visslink::VissLinkComponent *parent) { this->parent_ = parent; }
+  bool is_schedule_block(uint16_t address) const override { return this->parent_->is_schedule_block(address); }
+  bool request_refresh(uint16_t address) override { return this->parent_->request_block_refresh(address); }
+  bool cancel_refresh(uint16_t address) override { return this->parent_->cancel_block_refresh(address); }
+  bool refresh_pending(uint16_t address) const override { return this->parent_->block_refresh_pending(address); }
+  bool writes_idle() const override { return this->parent_->writes_idle(); }
+
+ protected:
+  visslink::VissLinkComponent *parent_{nullptr};
+};
+
+class VissLinkBoost : public Component, public visslink::VissLinkBlockClient {
+ public:
+  void set_parent(visslink::VissLinkComponent *parent) {
+    this->parent_ = parent;
+    this->port_.set_parent(parent);
+  }
   void set_time(time::RealTimeClock *clock) { this->clock_ = clock; }
   void set_validated_days_mask(uint8_t mask) { this->config_.validated_days_mask = mask; }
   void set_duration_select(BoostDurationSelect *s) { this->duration_ = s; }
@@ -71,6 +88,7 @@ class VissLinkBoost : public Component, public visslink::VissLinkBlockClient {
 
  protected:
   void dispatch_(uint32_t now);
+  void refresh_display_(uint32_t now);
   bool persist_(const visslink::BoostRecord &record);
   void publish_();
   void refuse_(const std::string &why);
@@ -79,6 +97,8 @@ class VissLinkBoost : public Component, public visslink::VissLinkBlockClient {
   time::RealTimeClock *clock_{nullptr};
   visslink::BoostConfig config_;
   BoostSequencer sequencer_;
+  visslink::BoostRefreshRelay refresh_;
+  ComponentRefreshPort port_;
   ESPPreferenceObject pref_;
   BoostAction pending_;          ///< action émise mais pas encore acceptée (lecture refusée : ligne occupée)
   bool has_pending_{false};

@@ -82,6 +82,38 @@ inline double decode_value(DataType type, const uint8_t *data) {
   return 0;
 }
 
+/// Valeur brute non signée de `length` octets (petit-boutiste), pour la
+/// comparer aux valeurs déclarées « non disponibles » (v0.5.1).
+inline uint32_t decode_raw_le(const uint8_t *data, uint8_t length) {
+  uint32_t raw = 0;
+  for (uint8_t i = 0; i < length && i < 4; i++)
+    raw |= static_cast<uint32_t>(data[i]) << (8 * i);
+  return raw;
+}
+
+/// Valeurs brutes publiées « inconnu » au lieu d'être converties (v0.5.1).
+/// Opt-in, par capteur : 0xFFFF n'est invalide que sur les registres où la
+/// régulation l'utilise comme marqueur ; ailleurs c'est -0,1 °C (int16).
+struct InvalidRawValues {
+  static constexpr uint8_t MAX = 4;
+  uint32_t values[MAX]{};
+  uint8_t count{0};
+
+  bool add(uint32_t value) {
+    if (this->count >= MAX)
+      return false;
+    this->values[this->count++] = value;
+    return true;
+  }
+  bool contains(uint32_t raw) const {
+    for (uint8_t i = 0; i < this->count; i++) {
+      if (this->values[i] == raw)
+        return true;
+    }
+    return false;
+  }
+};
+
 /// État binaire lu sur 1 octet. Seules les valeurs 0x00 et 0x01 sont
 /// interprétées ; toute autre valeur est signalée invalide plutôt que
 /// devinée (registre mal identifié, octet d'état multi-bits...).

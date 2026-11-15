@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <string>
 #include <memory>
@@ -36,6 +37,8 @@ struct Bench {
     bool number{false};    ///< consigne réglable (v0.3), uint8
     bool mode{false};      ///< programme de fonctionnement (v0.3), sélecteur
     float min{0}, max{0};  ///< bornes configurées (number)
+    uint8_t raw_len{0};    ///< lecture brute de N octets (horloge 0x088E)
+    InvalidRawValues invalid{};  ///< v0.5.1 : valeurs publiées inconnues (sensor)
   };
 
   MockSerial serial;
@@ -49,6 +52,13 @@ struct Bench {
   std::map<size_t, uint32_t> last_success_ms, max_gap_ms;
   std::map<size_t, WeekSchedule> weeks;  ///< programmations décodées
   std::map<size_t, int> rejected;        ///< blocs bien cadrés mais rejetés au décodage
+  /// v0.5.1 : instant de la première publication de chaque jour.
+  std::map<size_t, std::map<uint8_t, uint32_t>> day_published_ms;
+  /// v0.5.1 : jour courant selon l'horloge `time` (0 = lundi), -1 = inconnue.
+  int today{-1};
+  bool today_first{true};  ///< false = comportement v0.5 (lundi d'abord, pas de relecture du jour)
+  std::map<size_t, int> today_requested;  ///< VissLinkSchedule::requested_day_
+  std::vector<std::pair<uint32_t, uint16_t>> schedule_reads;  ///< (instant, adresse) des blocs reçus
   uint32_t stagger_ms{2000};  ///< VissLinkComponent::STARTUP_STAGGER_MS
 
   // v0.3 : écritures (même logique que VissLinkComponent).
@@ -143,6 +153,64 @@ struct Bench {
     params.push_back({interval_ms, 1});
     scheduler.add(interval_ms, now + stagger_ms * (regs.size() - 1));
     return regs.size() - 1;
+  }
+  size_t add_raw(uint16_t address, uint8_t len, uint32_t interval_ms, uint32_t now) {
+    Reg r{address, DataType::UINT8, false, 1};
+    r.raw_len = len;
+    regs.push_back(r);
+    params.push_back({interval_ms, 1});
+    scheduler.add(interval_ms, now + stagger_ms * (regs.size() - 1));
+    return regs.size() - 1;
+  }
+  /// VissLinkComponent::clock_tick_ (une fois par seconde) : cycle des
+  /// programmations commencé par le jour courant, et relecture de ce jour
+  /// s'il n'est pas encore connu.
+  void clock_tick(uint32_t now) {
+    if (!today_first || today < 0)
+      return;
+    const uint8_t d = static_cast<uint8_t>(today);
+    for (size_t i = 0; i < regs.size(); i++) {
+      if (!regs[i].schedule || params[i].second != SCHEDULE_DAYS)
+        continue;
+      scheduler.set_cycle_start(i, d);
+      const auto &e = scheduler.entry(i);
+      auto it = today_requested.find(i);
+      const bool requested = it != today_requested.end() && it->second == today;
+      const bool next_in_cycle = e.urgent == RegisterScheduler::URGENT_NONE && e.done == 0 && e.block == d;
+      if (!weeks[i].is_known(d) && !requested && !next_in_cycle && scheduler.expedite_block(i, d, now))
+        today_requested[i] = today;
+    }
+  }
+  /// VissLinkComponent::find_schedule_block_.
+  bool find_schedule_block(uint16_t address, size_t *index, uint8_t *block) const {
+    for (size_t i = 0; i < regs.size(); i++) {
+      if (params[i].second < 2)
+        continue;
+      for (uint8_t blk = 0; blk < params[i].second; blk++) {
+        if (block_address(regs[i], blk) == address) {
+          *index = i;
+          *block = blk;
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+  /// VissLinkComponent::request_block_refresh.
+  bool request_block_refresh(uint16_t address, uint32_t now) {
+    size_t i;
+    uint8_t blk;
+    return find_schedule_block(address, &i, &blk) && scheduler.expedite_block(i, blk, now);
+  }
+  bool cancel_block_refresh(uint16_t address) {
+    size_t i;
+    uint8_t blk;
+    return find_schedule_block(address, &i, &blk) && scheduler.cancel_refresh(i, blk);
+  }
+  bool block_refresh_pending(uint16_t address) const {
+    size_t i;
+    uint8_t blk;
+    return find_schedule_block(address, &i, &blk) && scheduler.refresh_pending(i, blk);
   }
   size_t add_schedule(uint16_t address, uint32_t interval_ms, uint32_t now, uint8_t blocks = SCHEDULE_DAYS) {
     regs.push_back({address, DataType::UINT8, false, 1, true});
@@ -274,9 +342,14 @@ struct Bench {
   /// (registres, enable_writes) est inchangée ; la chaudière et la ligne aussi.
   void reboot(uint32_t now) {
     kw = KwProtocol();
+    const uint32_t delay = scheduler.block_delay();
     scheduler = RegisterScheduler();
+    scheduler.set_block_delay(delay);
     for (size_t i = 0; i < params.size(); i++)
       scheduler.add(params[i].first, now + stagger_ms * i, params[i].second);
+    today_requested.clear();
+    weeks.clear();  // programmations publiées perdues avec la RAM
+    day_published_ms.clear();
     writes = WriteArbiter();
     write_in_flight = false;
     link_ok = false;
@@ -305,6 +378,8 @@ struct Bench {
       return 1;
     if (r.schedule)
       return SCHEDULE_BLOCK_LENGTH;
+    if (r.raw_len)
+      return r.raw_len;
     return r.binary ? 1 : data_type_length(r.type);
   }
   static uint16_t block_address(const Reg &r, uint8_t block) {
@@ -379,9 +454,11 @@ struct Bench {
       if (accepted && r.schedule) {
         DaySchedule day;
         accepted = decode_schedule_day(kw.data(), kw.data_length(), &day) == ScheduleError::NONE;
-        if (accepted)
+        if (accepted) {
           weeks[index].set_day(block, day);
-        else
+          day_published_ms[index].emplace(block, now);
+          schedule_reads.push_back({now, block_address(r, block)});
+        } else
           rejected[index]++;
       }
       if (accepted) {
@@ -404,6 +481,8 @@ struct Bench {
           read_back_done(index, now);
         } else if (r.binary)
           last_binary[index] = decode_binary(kw.data()[0]);
+        else if (r.invalid.contains(decode_raw_le(kw.data(), length(r))))
+          last_value[index] = NAN;  // VissLinkSensor::publish_data : « inconnu »
         else
           last_value[index] = decode_value(r.type, kw.data()) * r.scale;
         if (last_success_ms.count(index) && now - last_success_ms[index] > max_gap_ms[index])
@@ -428,7 +507,7 @@ struct Bench {
     // VissLinkComponent::preempt_unsent_read_ (v0.4.1, lectures ponctuelles v0.5).
     const bool direct_ready = direct.pending && !direct.in_flight && time_reached(now, direct.due_ms);
     if (preempt_unsent_reads && !write_in_flight && !direct.in_flight && kw.is_waiting_sync() &&
-        scheduler.current() != RegisterScheduler::NONE && !scheduler.entry(scheduler.current()).urgent &&
+        scheduler.current() != RegisterScheduler::NONE && scheduler.entry(scheduler.current()).urgent != RegisterScheduler::URGENT_VERIFY &&
         ((enable_writes && writes.ready(now, link_ok)) || direct_ready) && kw.cancel_before_send()) {
       scheduler.release();
       preemptions++;
@@ -498,6 +577,8 @@ struct Bench {
   void run(uint32_t from, uint32_t duration_ms) {
     for (uint32_t t = from; t - from < duration_ms; t += 5) {
       boiler.tick(t);
+      if (t % 1000 == 0)
+        clock_tick(t);
       step(t);
     }
   }
@@ -2157,6 +2238,39 @@ struct BoostGlue {
   int saves{0};
   BoostAction pending;
   bool has_pending{false};
+  /// v0.5.1 : VissLinkBoost::refresh_display_ (ComponentRefreshPort).
+  struct Port : BoostRefreshPort {
+    Bench &b;
+    uint32_t now{0};
+    explicit Port(Bench &bench) : b(bench) {}
+    bool is_schedule_block(uint16_t a) const override {
+      size_t i;
+      uint8_t blk;
+      return b.find_schedule_block(a, &i, &blk);
+    }
+    bool request_refresh(uint16_t a) override { return b.request_block_refresh(a, now); }
+    bool cancel_refresh(uint16_t a) override { return b.cancel_block_refresh(a); }
+    bool refresh_pending(uint16_t a) const override { return b.block_refresh_pending(a); }
+    bool writes_idle() const override { return b.writes_idle(); }
+  } port{b};
+  BoostRefreshRelay relay;
+  bool relay_enabled{true};
+  std::vector<std::pair<BoostRefreshRelay::Event, uint32_t>> relay_events;
+
+  void refresh(uint32_t now) {
+    if (!relay_enabled)
+      return;
+    port.now = now;
+    const auto e = relay.poll(seq, port, now);
+    if (e != BoostRefreshRelay::Event::NONE)
+      relay_events.push_back({e, now});
+  }
+  int relay_count(BoostRefreshRelay::Event e) const {
+    int n = 0;
+    for (const auto &p : relay_events)
+      n += p.first == e;
+    return n;
+  }
 
   BoostGlue(Bench &bench, uint8_t validated_mask) : b(bench) {
     config.validated_days_mask = validated_mask;
@@ -2164,6 +2278,7 @@ struct BoostGlue {
   }
   void boot() {
     seq = BoostSequencer();
+    relay = BoostRefreshRelay();
     seq.configure(config);
     seq.boot(flash_has ? &flash : nullptr);
     has_pending = false;
@@ -2263,11 +2378,14 @@ HaTime ha_now(uint32_t now_ms) {
 /// Pas de 5 ms : chaudière, composant, colle du bouclage, horloge.
 void run_boost(Bench &b, BoostGlue &g, uint32_t from, uint32_t duration_ms) {
   for (uint32_t t = from; t - from < duration_ms; t += 5) {
-    if (t % 1000 == 0)
+    if (t % 1000 == 0) {
       set_vito_clock(b.boiler, t);
+      b.clock_tick(t);
+    }
     b.boiler.tick(t);
     b.step(t);
     g.dispatch(t);
+    g.refresh(t);
   }
 }
 
@@ -2550,5 +2668,565 @@ TEST(sim_v05_boost_refused_on_unvalidated_day_or_bad_clock) {
     run_boost(b, x.glue, BOOT, MIN);
     CHECK(x.glue.seq.idle());
     CHECK_EQ(b.boiler.write_frames, 0);
+  }
+}
+
+// --- v0.5.1 : rafraîchissement des programmations ------------------------------
+//
+// Configurations v0.5 réelles (ordre d'inscription du firmware = ordre du
+// YAML) et mesures de délai de publication des programmations, à 2, 3 et
+// 4 s de resynchro. VL_REPORT=1 affiche le tableau des mesures.
+
+namespace {
+
+struct V05Config {
+  size_t outdoor{0}, burner{0}, clock{0}, circulation{0};
+  std::vector<size_t> eco_party, schedules;
+
+  /// `trial` : examples/iot-viessmann-essai-lecture-v0.5.yaml (0x0846 à 60 s,
+  /// programmation du bouclage à 10 min) ; sinon examples/iot-viessmann.yaml.
+  /// `eco_ms` : intervalle Éco/Party (60 s dans les exemples depuis la
+  /// v0.5.1 ; 30 s pour reproduire les mesures de la v0.5).
+  V05Config(Bench &b, bool trial, uint32_t eco_ms = 60 * S) {
+    auto &r = b.boiler.registers;
+    r[0x0842] = {0x01};
+    for (uint16_t a : {0x2302, 0x2303, 0x3302, 0x3303, 0x0846})
+      r[a] = {0x00};
+    r[0x2306] = {20};
+    r[0x2307] = {16};
+    r[0x3306] = {21};
+    r[0x3307] = {17};
+    r[0x6300] = {50};
+    r[0x2301] = {0x03};
+    r[0x3301] = {0x03};
+    load_real_schedules(b.boiler);
+    set_vito_clock(b.boiler, 0);
+    outdoor = b.add(0x0800, 60 * S, 0);
+    b.add(0x0802, 60 * S, 0);
+    b.add(0x0804, 60 * S, 0);
+    b.add(0x3900, 60 * S, 0);
+    b.add(0x088A, H, 0, DataType::UINT32, 1);
+    b.add(0x08A7, H, 0, DataType::UINT32, 1);
+    if (trial)
+      circulation = b.add(0x0846, 60 * S, 0, DataType::UINT8, 1);
+    burner = b.add_binary(0x0842, 30 * S, 0);
+    for (uint16_t a : {0x2302, 0x2303, 0x3302, 0x3303})
+      eco_party.push_back(b.add_binary(a, eco_ms, 0));
+    b.add_number(0x2306, 16, 24, 5 * MIN, 0);
+    b.add_number(0x2307, 10, 20, 5 * MIN, 0);
+    b.add_number(0x3306, 16, 24, 5 * MIN, 0);
+    b.add_number(0x3307, 10, 20, 5 * MIN, 0);
+    b.add_number(0x6300, 40, 60, 5 * MIN, 0);
+    b.add_mode(0x2301, 5 * MIN, 0);
+    b.add_mode(0x3301, 5 * MIN, 0);
+    for (uint16_t base : {A1, M2, DHW})
+      schedules.push_back(b.add_schedule(base, 6 * H, 0));
+    schedules.push_back(b.add_schedule(LOOP, trial ? 10 * MIN : 6 * H, 0));
+    clock = b.add_raw(VITO_CLOCK_ADDRESS, 8, 10 * MIN, 0);
+  }
+};
+
+struct RefreshMeasure {
+  uint32_t today_ms{0};  ///< dernier des 4 circuits à publier le jour courant
+  uint32_t week_ms{0};   ///< dernier des 28 blocs publié
+  int burner{0};         ///< lectures du brûleur sur la durée
+  uint32_t burner_gap{0}, eco_gap{0}, outdoor_gap{0};
+  bool ok{true};
+};
+
+/// Démarrage à t = 0, horloge `time` valide dès `clock_valid_ms` (jour
+/// `today`), mesure sur `duration`.
+RefreshMeasure measure_refresh(bool trial, uint32_t post, uint32_t delay, bool today_first, int today,
+                               uint32_t duration, uint32_t clock_valid_ms = 0) {
+  Bench b;
+  b.boiler.post_response_delay_ms = post;
+  b.scheduler.set_block_delay(delay);
+  b.today_first = today_first;
+  V05Config c(b, trial, 30 * S);  // tableaux de docs/programmations-v0.5.1.md (Éco/Party v0.5)
+  if (clock_valid_ms > 0)
+    b.run(0, clock_valid_ms);
+  b.today = today;
+  b.run(clock_valid_ms, duration - clock_valid_ms);
+  RefreshMeasure m;
+  for (size_t i : c.schedules) {
+    auto &days = b.day_published_ms[i];
+    if (days.size() != SCHEDULE_DAYS || !days.count(static_cast<uint8_t>(today))) {
+      m.ok = false;
+      continue;
+    }
+    m.today_ms = std::max(m.today_ms, days[static_cast<uint8_t>(today)]);
+    for (const auto &kv : days)
+      m.week_ms = std::max(m.week_ms, kv.second);
+  }
+  // Une lecture peut être en cours à la fin de la mesure.
+  m.ok &= b.failures.empty() && b.boiler.requests - b.total_successes() <= 1;
+  m.burner = b.successes[c.burner];
+  m.burner_gap = b.max_gap_ms[c.burner];
+  m.outdoor_gap = b.max_gap_ms[c.outdoor];
+  for (size_t i : c.eco_party)
+    m.eco_gap = std::max(m.eco_gap, b.max_gap_ms[i]);
+  return m;
+}
+
+bool report_enabled() { return std::getenv("VL_REPORT") != nullptr; }
+
+}  // namespace
+
+TEST(sim_v051_report_refresh_times) {
+  if (!report_enabled())
+    return;
+  std::printf("\n  config  resync delai  mode        jour(Di)  jour(Lu)  semaine  brul/6h30 ecart_brul ecart_eco ecart_ext\n");
+  for (bool trial : {false, true}) {
+    for (uint32_t post : {2000u, 3000u, 4000u}) {
+      for (uint32_t delay : {30000u, 20000u, 15000u, 10000u}) {
+        for (bool tf : {false, true}) {
+          const RefreshMeasure sun = measure_refresh(trial, post, delay, tf, 6, 6 * H + 30 * MIN);
+          const RefreshMeasure mon = measure_refresh(trial, post, delay, tf, 0, 15 * MIN);
+          std::printf("  %-7s %4.1fs %4us  %-10s %7.0fs %8.0fs %7.0fs %9d %9.1fs %8.1fs %8.1fs%s\n",
+                      trial ? "essai" : "prod", post / 1000.0, static_cast<unsigned>(delay / 1000),
+                      tf ? "jour-1er" : "v0.5", sun.today_ms / 1000.0, mon.today_ms / 1000.0, sun.week_ms / 1000.0,
+                      sun.burner, sun.burner_gap / 1000.0, sun.eco_gap / 1000.0, sun.outdoor_gap / 1000.0,
+                      sun.ok && mon.ok ? "" : "  (ECHEC)");
+        }
+      }
+    }
+  }
+}
+
+namespace {
+
+uint32_t published(Bench &b, size_t reg, uint8_t day) {
+  auto it = b.day_published_ms[reg].find(day);
+  return it == b.day_published_ms[reg].end() ? UINT32_MAX : it->second;
+}
+
+int requests_to(const SimBoiler &boiler, uint16_t address) {
+  auto it = boiler.requests_by_address.find(address);
+  return it == boiler.requests_by_address.end() ? 0 : it->second;
+}
+
+}  // namespace
+
+TEST(sim_v051_current_day_published_first_without_extra_load) {
+  // Production v0.5, horloge valide dès le démarrage, dimanche (pire cas de
+  // l'ordre lundi -> dimanche). Mesuré : 47 / 69 / 91 s au lieu de
+  // 238 / 364 / 471 s. Même nombre de lectures, même cadence du brûleur.
+  const uint32_t limit[] = {60 * S, 80 * S, 105 * S};
+  int k = 0;
+  for (uint32_t post : {2000u, 3000u, 4000u}) {
+    Bench ref, b;
+    ref.boiler.post_response_delay_ms = b.boiler.post_response_delay_ms = post;
+    ref.today_first = false;
+    V05Config rc(ref, false), c(b, false);
+    ref.today = b.today = 6;
+    ref.run(0, 6 * H + 30 * MIN);
+    b.run(0, 6 * H + 30 * MIN);
+    CHECK(b.failures.empty());
+    for (size_t i : c.schedules) {
+      const uint32_t today = published(b, i, 6);
+      CHECK(today <= limit[k]);
+      for (uint8_t d = 0; d < 6; d++)
+        CHECK(published(b, i, d) > today);  // le jour courant avant les autres
+      CHECK_EQ(b.successes[i], 14);            // deux cycles complets, aucun bloc en plus
+      CHECK(published(ref, i, 6) > 3 * MIN);   // v0.5 : dimanche en dernier
+    }
+    // Charge identique (à la lecture en cours près).
+    CHECK(std::abs(b.boiler.requests - ref.boiler.requests) <= 1);
+    CHECK(std::abs(b.successes[c.burner] - ref.successes[rc.burner]) <= 1);
+    CHECK(b.max_gap_ms[c.burner] <= ref.max_gap_ms[rc.burner] + 1 * S);
+    if (vltest::failures() > 0)
+      std::printf("    post=%u today %u ms (v0.5 %u ms) burner %d/%d\n", static_cast<unsigned>(post),
+                  static_cast<unsigned>(published(b, c.schedules[0], 6)),
+                  static_cast<unsigned>(published(ref, rc.schedules[0], 6)), b.successes[c.burner],
+                  ref.successes[rc.burner]);
+    k++;
+  }
+}
+
+TEST(sim_v051_clock_valid_late_current_day_refreshed_once) {
+  // L'heure n'arrive qu'à t = 120 s (premiers cycles commencés par lundi) :
+  // le dimanche est relu hors cycle, une fois par programmation.
+  for (uint32_t post : {2000u, 3000u, 4000u}) {
+    Bench b;
+    b.boiler.post_response_delay_ms = post;
+    V05Config c(b, false);
+    b.run(0, 120 * S);
+    for (size_t i : c.schedules)
+      CHECK(!b.weeks[i].is_known(6));
+    b.today = 6;
+    b.run(120 * S, 15 * MIN);
+    CHECK(b.failures.empty());
+    for (size_t i : c.schedules) {
+      // Quatre rafraîchissements en file, chacun derrière au plus une
+      // lecture en cours : <= 5 transactions.
+      CHECK(published(b, i, 6) <= 120 * S + 5 * (post + 1000));
+      CHECK(b.weeks[i].all_known());
+      CHECK_EQ(requests_to(b.boiler, schedule_day_address(b.regs[i].address, 6)), 2);  // relecture + cycle
+      CHECK_EQ(b.successes[i], 8);
+    }
+  }
+}
+
+TEST(sim_v051_block_refresh_after_panel_change) {
+  // Programmation modifiée sur le panneau (dimanche, bouclage) : une
+  // relecture ponctuelle la publie en quelques secondes au lieu de 6 h.
+  for (uint32_t post : {2000u, 3000u, 4000u}) {
+    Bench b;
+    b.boiler.post_response_delay_ms = post;
+    V05Config c(b, false);
+    b.today = 6;
+    b.run(0, 20 * MIN);
+    const size_t loop = c.schedules[3];
+    const uint32_t next_cycle = b.scheduler.entry(loop).due_ms;
+    const int before = b.boiler.requests;
+    b.boiler.registers[0x2230] = {0x31, 0x43, 0x70, 0x71, 0xAC, 0xAD, 0xFF, 0xFF};  // + 14:00-14:10
+    CHECK(!b.request_block_refresh(0x2238, 20 * MIN));  // hors programmation
+    CHECK(!b.request_block_refresh(0x0800, 20 * MIN));  // registre simple
+    CHECK(b.request_block_refresh(0x2230, 20 * MIN));
+    uint32_t t = 20 * MIN;
+    while (format_day(b.weeks[loop].days[6]) != "06:10-08:30, 14:00-14:10, 21:40-21:50" && t < 21 * MIN) {
+      b.run(t, 100);
+      t += 100;
+    }
+    // Au plus la lecture en cours puis le bloc : 2 transactions.
+    CHECK(t - 20 * MIN <= 2 * (post + 1000));
+    CHECK(b.boiler.requests - before <= 2);
+    CHECK_EQ(b.scheduler.entry(loop).due_ms, next_cycle);  // cycle hebdomadaire inchangé
+    for (uint8_t d = 0; d < 6; d++)
+      CHECK_EQ(requests_to(b.boiler, schedule_day_address(LOOP, d)), 1);
+    if (vltest::failures() > 0)
+      std::printf("    post=%u refresh %u ms\n", static_cast<unsigned>(post), static_cast<unsigned>(t - 20 * MIN));
+  }
+}
+
+TEST(sim_v051_refresh_never_inside_write_read_back) {
+  Bench b;
+  b.boiler.post_response_delay_ms = 3000;
+  Modes m(b, true, false, true);
+  b.today = 6;
+  b.run(0, BOOT + 5 * MIN);
+  CHECK(b.request_mode(m.a1, OFF, BOOT + 5 * MIN) == "queued");
+  CHECK(b.request_block_refresh(0x2230, BOOT + 5 * MIN));
+  b.run(BOOT + 5 * MIN, 2 * MIN);
+  CHECK_EQ(b.boiler.write_frames, 1);
+  CHECK(both_read_back_after_each_write(b.boiler));  // A1 puis M2, rien entre
+  CHECK_EQ(requests_to(b.boiler, 0x2230), 2);        // cycle + relecture, après les vérifications
+}
+
+TEST(sim_v051_unreadable_current_day_is_not_read_in_a_loop) {
+  Bench b;
+  b.boiler.post_response_delay_ms = 3000;
+  V05Config c(b, false);
+  b.boiler.register_faults[schedule_day_address(A1, 6)] = SimBoiler::Fault::NO_RESPONSE;
+  b.run(0, 120 * S);
+  b.today = 6;
+  b.run(120 * S, 30 * MIN);
+  // 3 tentatives dans le cycle + 3 pour la relecture, puis plus rien avant
+  // le cycle suivant (6 h).
+  CHECK(requests_to(b.boiler, schedule_day_address(A1, 6)) <= 6);
+  CHECK(!b.weeks[c.schedules[0]].is_known(6));
+  CHECK(b.max_gap_ms[c.burner] < 60 * S);
+}
+
+TEST(sim_v051_invalid_raw_values_published_unknown) {
+  // 0x2544 / 0x3544 lus FF FF sur la KW3 : « inconnu », pas -0,1 °C. Sans
+  // liste, FF FF reste -0,1 °C (température extérieure légitime).
+  Bench b;
+  b.boiler.registers[0x0800] = {0xFF, 0xFF};
+  b.boiler.registers[0x2544] = {0xFF, 0xFF};
+  b.boiler.registers[0x3544] = {0xFF, 0xFF};
+  const size_t outdoor = b.add(0x0800, 60 * S, 0);
+  const size_t a1 = b.add(0x2544, 60 * S, 0);
+  const size_t m2 = b.add(0x3544, 60 * S, 0);
+  b.regs[a1].invalid.add(0xFFFF);
+  b.regs[m2].invalid.add(0xFFFF);
+  b.run(0, 2 * MIN);
+  CHECK(b.failures.empty());
+  CHECK_EQ(b.boiler.requests, b.total_successes());  // réponse valide : aucune nouvelle tentative
+  CHECK_NEAR(b.last_value[outdoor], -0.1, 1e-9);
+  CHECK(std::isnan(b.last_value[a1]));
+  CHECK(std::isnan(b.last_value[m2]));
+  b.boiler.registers[0x2544] = {0xC2, 0x01};  // 45,0 °C
+  b.run(2 * MIN, 2 * MIN);
+  CHECK_NEAR(b.last_value[a1], 45.0, 1e-9);
+  CHECK(std::isnan(b.last_value[m2]));
+}
+
+TEST(sim_v051_report_refresh_latency) {
+  if (!report_enabled())
+    return;
+  std::printf("\n  resync  heure_tardive(120s)->jour  relecture_ponctuelle  cycle_6h(jour-1er, 28 blocs)\n");
+  for (uint32_t post : {2000u, 3000u, 4000u}) {
+    Bench late;
+    late.boiler.post_response_delay_ms = post;
+    V05Config lc(late, false, 30 * S);  // mesures v0.5 (docs)
+    late.run(0, 120 * S);
+    late.today = 6;
+    late.run(120 * S, 10 * MIN);
+    uint32_t late_ms = 0;
+    for (size_t i : lc.schedules)
+      late_ms = std::max(late_ms, published(late, i, 6) - 120 * S);
+
+    Bench b;
+    b.boiler.post_response_delay_ms = post;
+    V05Config c(b, false, 30 * S);
+    b.today = 6;
+    b.run(0, 20 * MIN);
+    b.boiler.registers[0x2230] = {0x31, 0x43, 0x70, 0x71, 0xAC, 0xAD, 0xFF, 0xFF};
+    b.request_block_refresh(0x2230, 20 * MIN);
+    uint32_t t = 20 * MIN;
+    while (format_day(b.weeks[c.schedules[3]].days[6]) != "06:10-08:30, 14:00-14:10, 21:40-21:50" && t < 21 * MIN) {
+      b.run(t, 100);
+      t += 100;
+    }
+    // Rafraîchissement à 6 h : durée entre le premier et le dernier bloc.
+    b.schedule_reads.clear();
+    b.run(21 * MIN, 6 * H + 15 * MIN - 21 * MIN);
+    uint32_t first = UINT32_MAX, last = 0;
+    for (const auto &r : b.schedule_reads) {
+      if (r.first < 6 * H - 5 * MIN)
+        continue;
+      first = std::min(first, r.first);
+      last = std::max(last, r.first);
+    }
+    std::printf("  %4.1fs  %24.1fs  %19.1fs  %22.0fs\n", post / 1000.0, late_ms / 1000.0, (t - 20 * MIN) / 1000.0,
+                (last - first) / 1000.0);
+  }
+}
+
+// --- v0.5.1 : bouclage ECS, actualisation de la programmation publiée --------
+
+namespace {
+
+std::string day_text(const std::vector<uint8_t> &block) {
+  DaySchedule d;
+  if (decode_schedule_day(block.data(), block.size(), &d) != ScheduleError::NONE)
+    return "?";
+  return format_day(d);
+}
+
+std::string day_text(const uint8_t *block) { return day_text(std::vector<uint8_t>(block, block + 8)); }
+
+/// Trames F7/F4 vers `address` à partir de l'indice `from` de frame_log.
+std::vector<uint8_t> frames_to(const SimBoiler &boiler, uint16_t address, size_t from) {
+  std::vector<uint8_t> out;
+  for (size_t i = from; i < boiler.frame_log.size(); i++)
+    if (boiler.frame_log[i].second == address)
+      out.push_back(boiler.frame_log[i].first);
+  return out;
+}
+
+/// Chaque écriture de bloc est immédiatement suivie de SA relecture (rien
+/// entre les deux, ni actualisation ni autre lecture).
+bool block_writes_verified_next(const SimBoiler &boiler) {
+  const auto &log = boiler.frame_log;
+  for (size_t i = 0; i < log.size(); i++) {
+    if (log[i].first != 0xF4 || log[i].second != 0x2230)
+      continue;
+    if (i + 1 >= log.size() || log[i + 1] != std::pair<uint8_t, uint16_t>{0xF7, 0x2230})
+      return false;
+  }
+  return true;
+}
+
+void run_until(Bench &b, BoostGlue &g, uint32_t &t, BoostState state, uint32_t limit) {
+  const uint32_t end = t + limit;
+  while (g.seq.state() != state && t < end)
+    run_boost(b, g, t, 5), t += 5;
+}
+
+}  // namespace
+
+TEST(sim_v051_boost_display_follows_write_and_restore) {
+  for (uint32_t post : {2000u, 3000u, 4000u}) {
+    Bench b;
+    b.boiler.post_response_delay_ms = post;
+    b.today = 6;
+    BoostBench x(b);
+    const size_t loop = x.modes.base.circuits->loop;
+    run_boost(b, x.glue, 0, 10 * MIN);
+    CHECK(format_day(b.weeks[loop].days[6]) == day_text(LOOP_SUNDAY));
+    const size_t from = b.boiler.frame_log.size();
+    CHECK(x.glue.start(10, ha_now(10 * MIN), 10 * MIN) == "accepted");
+    uint32_t t = 10 * MIN;
+    run_until(b, x.glue, t, BoostState::ACTIVE, 2 * MIN);
+    CHECK(x.glue.seq.state() == BoostState::ACTIVE);
+    const std::string temporary = day_text(x.glue.seq.record().temporary);
+    const uint32_t active_at = t;
+    // Affichage actualisé en quelques secondes (au lieu de 6 h).
+    while (format_day(b.weeks[loop].days[6]) != temporary && t < active_at + MIN)
+      run_boost(b, x.glue, t, 5), t += 5;
+    CHECK(format_day(b.weeks[loop].days[6]) == temporary);
+    CHECK(t - active_at <= 2 * (post + 1000));
+    // Restauration automatique en fin de plage.
+    run_until(b, x.glue, t, BoostState::IDLE, 40 * MIN);
+    CHECK(x.glue.seq.status() == "Programmation restaurée (vérifiée par relecture)");
+    run_boost(b, x.glue, t, 30 * S);
+    t += 30 * S;
+    CHECK(format_day(b.weeks[loop].days[6]) == day_text(LOOP_SUNDAY));
+    // 0x2230 : lecture, écriture, vérification, actualisation ; puis
+    // relecture, restauration, vérification, actualisation. Rien d'autre.
+    CHECK(frames_to(b.boiler, 0x2230, from) ==
+          (std::vector<uint8_t>{0xF7, 0xF4, 0xF7, 0xF7, 0xF7, 0xF4, 0xF7, 0xF7}));
+    CHECK(block_writes_verified_next(b.boiler));
+    CHECK_EQ(x.glue.relay_count(BoostRefreshRelay::Event::SUBMITTED), 2);
+    CHECK_EQ(x.glue.relay_count(BoostRefreshRelay::Event::CANCELLED), 0);
+    CHECK_EQ(writes_to(b.boiler, 0x2230), 2);
+    CHECK_EQ(writes_to(b.boiler, 0x0846), 0);
+    CHECK(b.failures.empty());
+    if (vltest::failures() > 0)
+      std::printf("    post=%u\n", static_cast<unsigned>(post));
+  }
+}
+
+TEST(sim_v051_boost_early_restore_cancels_unserved_refresh) {
+  // Restauration demandée dans le même passage que la confirmation : la
+  // relecture d'affichage n'est jamais émise, la vérification reste seule.
+  Bench b;
+  b.today = 6;
+  BoostBench x(b);
+  run_boost(b, x.glue, 0, 10 * MIN);
+  const size_t from = b.boiler.frame_log.size();
+  x.glue.start(10, ha_now(10 * MIN), 10 * MIN);
+  uint32_t t = 10 * MIN;
+  x.glue.relay_enabled = false;  // pas de passage du relais entre les deux
+  run_until(b, x.glue, t, BoostState::ACTIVE, 2 * MIN);
+  x.glue.relay_enabled = true;
+  x.glue.refresh(t);  // demandée...
+  CHECK(x.glue.restore(t));  // ... puis restauration aussitôt
+  run_boost(b, x.glue, t, 5);
+  t += 5;
+  CHECK_EQ(x.glue.relay_count(BoostRefreshRelay::Event::CANCELLED), 1);
+  run_until(b, x.glue, t, BoostState::IDLE, 5 * MIN);
+  run_boost(b, x.glue, t, 30 * S);
+  CHECK(frames_to(b.boiler, 0x2230, from) ==
+        (std::vector<uint8_t>{0xF7, 0xF4, 0xF7, 0xF7, 0xF4, 0xF7, 0xF7}));  // une seule actualisation, à la fin
+  CHECK(block_writes_verified_next(b.boiler));
+  CHECK(format_day(b.weeks[x.modes.base.circuits->loop].days[6]) == day_text(LOOP_SUNDAY));
+}
+
+TEST(sim_v051_boost_recovery_refreshes_display) {
+  Bench b;
+  b.today = 6;
+  BoostBench x(b);
+  run_boost(b, x.glue, 0, 10 * MIN);
+  x.glue.start(10, ha_now(10 * MIN), 10 * MIN);
+  uint32_t t = 10 * MIN;
+  run_until(b, x.glue, t, BoostState::ACTIVE, 2 * MIN);
+  b.reboot(t);  // coupure pendant la plage
+  x.glue.boot();
+  b.boiler_only(t, 5 * S);
+  t += 5 * S;
+  run_boost(b, x.glue, t, 5 * MIN);  // relu par le cycle : plage temporaire affichée
+  t += 5 * MIN;
+  const size_t loop = x.modes.base.circuits->loop;
+  CHECK(x.glue.seq.recovery_required());
+  CHECK(format_day(b.weeks[loop].days[6]) == day_text(LOOP_SUNDAY_BOOST.data()) ||
+        format_day(b.weeks[loop].days[6]) == day_text(x.glue.flash.temporary));
+  CHECK_EQ(x.glue.relay_count(BoostRefreshRelay::Event::SUBMITTED), 1);  // avant la coupure
+  const size_t from = b.boiler.frame_log.size();
+  CHECK(x.glue.restore(t));
+  run_until(b, x.glue, t, BoostState::IDLE, 2 * MIN);
+  run_boost(b, x.glue, t, 30 * S);
+  CHECK(x.glue.seq.idle());
+  CHECK(format_day(b.weeks[loop].days[6]) == day_text(LOOP_SUNDAY));
+  CHECK(frames_to(b.boiler, 0x2230, from) == (std::vector<uint8_t>{0xF7, 0xF4, 0xF7, 0xF7}));
+  CHECK(block_writes_verified_next(b.boiler));
+  CHECK_EQ(x.glue.relay_count(BoostRefreshRelay::Event::SUBMITTED), 2);
+}
+
+TEST(sim_v051_boost_no_display_refresh_without_confirmed_change) {
+  // Écriture ignorée par la régulation : la vérification relit l'origine,
+  // rien n'a changé, aucune lecture de plus.
+  Bench b;
+  b.today = 6;
+  BoostBench x(b);
+  b.boiler.writable.erase(0x2230);
+  run_boost(b, x.glue, 0, 10 * MIN);
+  const size_t from = b.boiler.frame_log.size();
+  x.glue.start(10, ha_now(10 * MIN), 10 * MIN);
+  uint32_t t = 10 * MIN;
+  run_boost(b, x.glue, t, 2 * MIN);
+  CHECK(!x.glue.seq.active());
+  CHECK(frames_to(b.boiler, 0x2230, from) == (std::vector<uint8_t>{0xF7, 0xF4, 0xF7}));
+  CHECK_EQ(x.glue.relay_count(BoostRefreshRelay::Event::SUBMITTED), 0);
+}
+
+TEST(sim_v051_boost_refresh_waits_for_a1_command) {
+  // Commande A1 déposée pendant la vérification du bloc : elle passe d'abord
+  // (écriture puis relecture A1 et M2, rien entre), l'actualisation après.
+  Bench b;
+  b.today = 6;
+  BoostBench x(b);
+  run_boost(b, x.glue, 0, 10 * MIN);
+  const size_t from = b.boiler.frame_log.size();
+  x.glue.start(10, ha_now(10 * MIN), 10 * MIN);
+  uint32_t t = 10 * MIN;
+  run_until(b, x.glue, t, BoostState::VERIFY_PENDING, 2 * MIN);
+  CHECK(b.request_mode(x.modes.a1, OFF, t) == "queued");
+  run_boost(b, x.glue, t, 2 * MIN);
+  t += 2 * MIN;
+  const auto &log = b.boiler.frame_log;
+  size_t a1_write = 0, refresh = 0;
+  int reads_2230 = 0;
+  for (size_t i = from; i < log.size(); i++) {
+    if (log[i] == std::pair<uint8_t, uint16_t>{0xF4, 0x2301})
+      a1_write = i;
+    if (log[i] == std::pair<uint8_t, uint16_t>{0xF7, 0x2230} && ++reads_2230 == 3)
+      refresh = i;
+  }
+  CHECK(a1_write > 0 && refresh > 0);
+  CHECK(refresh > a1_write + 2);  // après l'écriture A1 et ses deux relectures
+  std::set<uint16_t> next = {log[a1_write + 1].second, log[a1_write + 2].second};
+  CHECK(next == (std::set<uint16_t>{0x2301, 0x3301}));
+  CHECK(block_writes_verified_next(b.boiler));
+  CHECK_EQ(b.boiler_value(0x2301), 0x05);
+  CHECK_EQ(b.boiler_value(0x3301), 0x03);  // M2 jamais écrit
+  CHECK_EQ(x.glue.relay_count(BoostRefreshRelay::Event::SUBMITTED), 1);
+}
+
+TEST(sim_v051_boost_without_loop_schedule_reads_nothing_more) {
+  Bench b;
+  Modes m(b, true, false, false);  // aucune programmation déclarée
+  BoostGlue g(b, 1u << 6);
+  b.enable_schedule_writes = true;
+  b.boiler.writable.insert(0x2230);
+  b.boiler.registers[0x2230] = LOOP_SUNDAY;
+  set_vito_clock(b.boiler, 0);
+  run_boost(b, g, 0, BOOT);
+  const size_t from = b.boiler.frame_log.size();
+  CHECK(g.start(10, ha_now(BOOT), BOOT) == "accepted");
+  run_boost(b, g, BOOT, MIN);
+  CHECK(g.seq.state() == BoostState::ACTIVE);
+  CHECK(frames_to(b.boiler, 0x2230, from) == (std::vector<uint8_t>{0xF7, 0xF4, 0xF7}));
+  CHECK_EQ(g.relay_count(BoostRefreshRelay::Event::NOT_DECLARED), 1);
+  (void) m;
+}
+
+TEST(sim_v051_trial_config_eco_party_60s_load) {
+  // Essai en lecture seule, Éco/Party à 60 s (v0.5.1) contre 30 s (v0.5).
+  // Mesuré : 780/780 lectures du brûleur à 2 et 3 s ; à 4 s, 719 au lieu de
+  // 593 (la liaison reste chargée : ~13 requêtes/min).
+  for (uint32_t post : {2000u, 3000u, 4000u}) {
+    Bench b30, b60;
+    b30.boiler.post_response_delay_ms = b60.boiler.post_response_delay_ms = post;
+    V05Config c30(b30, true, 30 * S), c60(b60, true);
+    b30.today = b60.today = 6;
+    b30.run(0, 6 * H + 30 * MIN);
+    b60.run(0, 6 * H + 30 * MIN);
+    CHECK(b60.failures.empty());
+    CHECK(b60.successes[c60.burner] >= b30.successes[c30.burner]);
+    if (post <= 3000)
+      CHECK(b60.successes[c60.burner] >= 778);  // 780 attendues en 6 h 30
+    else
+      CHECK(b60.successes[c60.burner] >= b30.successes[c30.burner] + 100);
+    for (size_t i : c60.eco_party)
+      CHECK(b60.max_gap_ms[i] <= 2 * MIN);  // jamais deux cycles perdus
+    if (report_enabled() || vltest::failures() > 0)
+      std::printf("    essai post=%u : brûleur %d (Éco/Party 30 s : %d), écart max %.1f s (%.1f s), "
+                  "requêtes/min %.1f (%.1f)\n",
+                  static_cast<unsigned>(post), b60.successes[c60.burner], b30.successes[c30.burner],
+                  b60.max_gap_ms[c60.burner] / 1000.0, b30.max_gap_ms[c30.burner] / 1000.0,
+                  b60.boiler.requests / 390.0, b30.boiler.requests / 390.0);
   }
 }

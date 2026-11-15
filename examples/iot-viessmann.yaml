@@ -177,6 +177,31 @@ sensor:
   #   filters:
   #     - multiply: 0.1
 
+  # Consignes de départ A1 / M2 (v0.5.1). Adresses NON confirmées sur la KW3 :
+  # lues FF FF sur cette installation (affiché -0,1 °C sans traitement).
+  # `invalid_values` publie FF FF comme « inconnu » ; ne l'utiliser que sur
+  # un registre où FF FF n'est pas une valeur réelle (cf. registres.md § 7).
+  # - platform: visslink
+  #   name: "Radiateurs - Consigne départ"
+  #   address: 0x2544
+  #   data_type: int16
+  #   invalid_values: [0xFFFF]
+  #   update_interval: 5min
+  #   unit_of_measurement: "°C"
+  #   device_class: temperature
+  #   filters:
+  #     - multiply: 0.1
+  # - platform: visslink
+  #   name: "Plancher chauffant - Consigne départ"
+  #   address: 0x3544
+  #   data_type: int16
+  #   invalid_values: [0xFFFF]
+  #   update_interval: 5min
+  #   unit_of_measurement: "°C"
+  #   device_class: temperature
+  #   filters:
+  #     - multiply: 0.1
+
   # Vérification d'un état binaire (étape 1) : lire d'abord l'octet brut en
   # uint8 et observer ses valeurs pendant quelques jours (journaux DEBUG :
   # "0x0846 <- 01"). Ne passer en binary_sensor (étape 2) que si seules les
@@ -206,34 +231,35 @@ binary_sensor:
   # Toute autre valeur : état inconnu + avertissement, sans interprétation ;
   # l'octet brut reste dans le journal DEBUG (« 0x3302 <- 01 »). Aucune
   # écriture possible : ces adresses ne sont dans aucune liste blanche.
-  # 30 s : choix initial. La liaison passe de ~7,7 à ~15,7 lectures/min ; si
-  # la resynchro de la chaudière dépasse 3 s, passer à 60 s (§ 6, « Charge de la liaison »).
+  # 60 s (v0.5.1 ; 30 s en v0.5) : ~11,7 lectures/min au lieu de ~15,7,
+  # sans saturer la liaison au-delà de 3 s de resynchro (§ 6, « Charge de la
+  # liaison »).
   - platform: visslink
     visslink_id: viessmann
     name: "Radiateurs - Éco"
     address: 0x2302
-    update_interval: 30s
+    update_interval: 60s
     icon: mdi:leaf
 
   - platform: visslink
     visslink_id: viessmann
     name: "Radiateurs - Party"
     address: 0x2303
-    update_interval: 30s
+    update_interval: 60s
     icon: mdi:party-popper
 
   - platform: visslink
     visslink_id: viessmann
     name: "Plancher chauffant - Éco"
     address: 0x3302
-    update_interval: 30s
+    update_interval: 60s
     icon: mdi:leaf
 
   - platform: visslink
     visslink_id: viessmann
     name: "Plancher chauffant - Party"
     address: 0x3303
-    update_interval: 30s
+    update_interval: 60s
     icon: mdi:party-popper
 
   # --- Expérimental : à vérifier avant activation (voir étape 1 ci-dessus) --

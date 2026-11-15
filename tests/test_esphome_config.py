@@ -991,7 +991,7 @@ def test_example_eco_party_binary_sensors(repo_root, tmp_path):
         entry = re.search(rf"name: {re.escape(name)}\n((?:    [^\n]*\n)*)", binaries)
         assert entry, name
         assert f"address: 0x{address:X}\n" in entry.group(1), name
-        assert "update_interval: 30s" in entry.group(1), name
+        assert "update_interval: 60s" in entry.group(1), name  # v0.5.1 (30 s en v0.5)
         # Une seule déclaration de chaque adresse, toutes plateformes confondues.
         assert out.count(f"address: 0x{address:X}\n") == 1, hex(address)
 
@@ -1057,3 +1057,122 @@ def test_read_only_trial_only_adds_read_entities(repo_root):
         r"saturday|sunday):)$"
     )
     assert all(allowed.match(line) for line in added), added
+
+
+# --- v0.5.1 : valeurs « non disponibles » (invalid_values) ------------------
+
+
+def _flow_setpoint_sensor(extra, data_type="int16", address="0x2544"):
+    def transform(text):
+        sensor = (
+            "sensor:\n"
+            "  - platform: visslink\n"
+            '    name: "TEST consigne départ"\n'
+            f"    address: {address}\n"
+            f"    data_type: {data_type}\n"
+            f"{extra}"
+            "    filters:\n"
+            "      - multiply: 0.1\n"
+        )
+        assert text.count("\nsensor:\n") == 1
+        return text.replace("\nsensor:\n", "\n" + sensor, 1)
+
+    return transform
+
+
+@pytest.mark.parametrize(
+    "extra, data_type",
+    [
+        ("    invalid_values: 0xFFFF\n", "int16"),
+        ("    invalid_values: [0xFFFF, 0x7FFF]\n", "int16"),
+        ("    invalid_values: [0xFF]\n", "uint8"),
+        ("    invalid_values: [0xFFFFFFFF]\n", "uint32"),
+    ],
+)
+def test_invalid_values_accepted(repo_root, tmp_path, extra, data_type):
+    result = _run_config(repo_root, tmp_path, _flow_setpoint_sensor(extra, data_type))
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "invalid_values" in out
+
+
+@pytest.mark.parametrize(
+    "extra, data_type, message",
+    [
+        ("    invalid_values: [0x10000]\n", "int16", "does not fit in int16"),
+        ("    invalid_values: [0x100]\n", "uint8", "does not fit in uint8"),
+        ("    invalid_values: [0xFFFF, 0xFFFF]\n", "int16", "duplicate value"),
+        ("    invalid_values: [1, 2, 3, 4, 5]\n", "int16", "at most 4"),
+        ("    invalid_values: []\n", "int16", "at least 1"),
+    ],
+)
+def test_invalid_values_rejected(repo_root, tmp_path, extra, data_type, message):
+    result = _run_config(repo_root, tmp_path, _flow_setpoint_sensor(extra, data_type))
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, out
+    assert message in out, out
+
+
+def test_invalid_values_opt_in_only(repo_root):
+    """Aucune valeur n'est invalide par défaut : FF FF reste -0,1 °C sur la
+    température extérieure (0x0800), et l'option n'existe que pour `sensor`."""
+    sensor_py = (repo_root / "components/visslink/sensor.py").read_text(
+        encoding="utf-8"
+    )
+    assert "cv.Optional(CONF_INVALID_VALUES)" in sensor_py
+    assert "CONF_INVALID_VALUES, default" not in sensor_py
+    for name in ("binary_sensor.py", "number.py", "select.py", "text_sensor.py"):
+        text = (repo_root / "components/visslink" / name).read_text(encoding="utf-8")
+        assert "invalid_values" not in text
+
+
+# --- v0.5.1 : décisions de configuration --------------------------------------
+
+_ECO_PARTY = ("0x2302", "0x2303", "0x3302", "0x3303")
+
+
+def _interval_after(text, address):
+    match = re.search(
+        rf"^    address: {address}\n    update_interval: (\S+)$", text, re.MULTILINE
+    )
+    assert match, address
+    return match.group(1)
+
+
+@pytest.mark.parametrize("example", [EXAMPLE, ESSAI_V05])
+def test_eco_party_read_every_60s(repo_root, example):
+    text = (repo_root / example).read_text(encoding="utf-8")
+    for address in _ECO_PARTY:
+        assert _interval_after(text, address) == "60s", address
+
+
+@pytest.mark.parametrize("example", [EXAMPLE, ESSAI_V05])
+def test_flow_setpoints_commented_with_invalid_values(repo_root, example):
+    text = (repo_root / example).read_text(encoding="utf-8")
+    for address in ("0x2544", "0x3544"):
+        block = re.search(
+            rf"  # - platform: visslink\n(  #   [^\n]*\n)*?  #   address: {address}\n"
+            rf"(  #   [^\n]*\n)*?",
+            text,
+        )
+        assert block, address
+        start = block.start()
+        following = text[start : start + 400]
+        assert f"  #   address: {address}\n" in following
+        assert "  #   invalid_values: [0xFFFF]\n" in following
+        # Jamais actif par défaut.
+        assert f"    address: {address}\n" not in _active_lines(text)
+
+
+def test_no_write_path_for_loop_pump_0x0846(repo_root):
+    """0x0846 n'est inscriptible par aucun chemin : listes blanches C++ et
+    Python (consignes, programmes), blocs horaires du bouclage (0x2200..0x2237
+    seulement, testé en C++). Seule mention permise : une phrase de
+    documentation rappelant qu'il n'est jamais commandé."""
+    root = repo_root / "components"
+    for path in sorted(root.rglob("*")):
+        if path.suffix not in (".py", ".h", ".cpp") or "__pycache__" in path.parts:
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if "0846" in line:
+                assert "jamais" in line, f"{path}: {line}"

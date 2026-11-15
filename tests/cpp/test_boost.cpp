@@ -663,3 +663,249 @@ TEST(boost_rate_limits) {
   CHECK(p.idle());
   CHECK(p.start(10, ha_at(843), s.now) == BoostStart::RATE_LIMITED);  // 15 min minimum
 }
+
+// --- v0.5.1 : actualisation de l'affichage après une modification confirmée ----
+
+TEST(boost_take_refresh_only_after_confirmed_change) {
+  Rig r;
+  BoostSequencer q;
+  q.configure(sunday_validated());
+  q.boot(nullptr);
+  CHECK_EQ(q.take_refresh(), 0);
+  q.start(10, ha_at(14 * 60 + 3), r.now);
+  // Pendant toute la préparation, l'écriture et la vérification : rien.
+  while (q.state() != BoostState::ACTIVE) {
+    CHECK_EQ(q.take_refresh(), 0);
+    if (!r.step(q))
+      break;
+  }
+  CHECK(q.state() == BoostState::ACTIVE);
+  CHECK_EQ(q.take_refresh(), 0x2230);  // plage temporaire confirmée par la relecture
+  CHECK_EQ(q.take_refresh(), 0);       // une seule fois
+  // Restauration : rien pendant RESTORE_*, une fois revenu au repos.
+  q.request_restore(r.now);
+  while (r.step(q)) {
+    if (!q.idle())
+      CHECK_EQ(q.take_refresh(), 0);
+  }
+  CHECK(q.idle());
+  CHECK(q.status() == "Programmation restaurée (vérifiée par relecture)");
+  CHECK_EQ(q.take_refresh(), 0x2230);
+  CHECK_EQ(q.take_refresh(), 0);
+}
+
+TEST(boost_no_refresh_without_confirmed_change) {
+  {
+    Rig r;  // écriture ignorée par la régulation : rien n'a changé
+    r.write_ignored = true;
+    BoostSequencer q;
+    q.configure(sunday_validated());
+    q.boot(nullptr);
+    q.start(10, ha_at(843), r.now);
+    r.run(q, 2000);
+    CHECK(q.idle());
+    CHECK(q.status() == "Refusé par la régulation : bloc inchangé après écriture");
+    CHECK_EQ(q.take_refresh(), 0);
+  }
+  {
+    Rig r;  // relecture illisible : état indéterminé, aucune lecture de plus
+    BoostSequencer q;
+    q.configure(sunday_validated());
+    q.boot(nullptr);
+    q.start(10, ha_at(843), r.now);
+    while (q.state() != BoostState::VERIFY_PENDING && r.step(q)) {
+    }
+    r.read_fails = true;
+    r.run(q, 2000);
+    CHECK(q.recovery_required());
+    CHECK_EQ(q.take_refresh(), 0);
+  }
+  {
+    Rig r;  // refus avant toute écriture (jour non validé)
+    BoostSequencer q;
+    q.configure(BoostConfig());
+    q.boot(nullptr);
+    q.start(10, ha_at(843), r.now);
+    r.run(q, 2000);
+    CHECK(q.idle());
+    CHECK_EQ(q.take_refresh(), 0);
+  }
+  {
+    Rig r;  // sauvegarde oubliée : aucune relecture confirmée
+    BoostSequencer q;
+    q.configure(sunday_validated());
+    BoostRecord rec;
+    rec.magic = BOOST_RECORD_MAGIC;
+    rec.version = BOOST_RECORD_VERSION;
+    rec.weekday = 6;
+    rec.address = 0x2230;
+    std::memcpy(rec.original, REAL.data(), 8);
+    const Block temp = {0x31, 0x43, 0x70, 0x72, 0xAC, 0xAD, 0xFF, 0xFF};
+    std::memcpy(rec.temporary, temp.data(), 8);
+    rec.check = boost_record_checksum(rec);
+    q.boot(&rec);
+    CHECK(q.forget());
+    r.run(q, 2000);
+    CHECK(q.idle());
+    CHECK_EQ(q.take_refresh(), 0);
+  }
+}
+
+TEST(boost_refresh_after_recovery) {
+  for (bool already_original : {false, true}) {
+    Rig r;
+    BoostSequencer q;
+    q.configure(sunday_validated());
+    q.boot(nullptr);
+    q.start(10, ha_at(843), r.now);
+    r.run(q, 2000);
+    CHECK(q.state() == BoostState::ACTIVE);
+    // Coupure pendant la plage : nouvelle instance, sauvegarde relue.
+    BoostSequencer after;
+    after.configure(sunday_validated());
+    after.boot(&r.flash);
+    CHECK(after.recovery_required());
+    CHECK_EQ(after.take_refresh(), 0);
+    if (already_original)
+      r.regs[0x2230] = REAL;  // corrigé depuis le panneau
+    CHECK(after.request_restore(r.now));
+    r.run(after, 2000);
+    CHECK(after.idle());
+    CHECK_EQ(after.take_refresh(), 0x2230);
+    CHECK(r.regs[0x2230] == REAL);
+  }
+}
+
+namespace {
+
+struct FakePort : BoostRefreshPort {
+  bool declared = true, idle = true, accept = true;
+  std::vector<uint16_t> pending;
+  int requests = 0, cancels = 0;
+  bool is_schedule_block(uint16_t a) const override { return declared && a == 0x2230; }
+  bool request_refresh(uint16_t a) override {
+    requests++;
+    if (!accept)
+      return false;
+    pending.push_back(a);
+    return true;
+  }
+  bool cancel_refresh(uint16_t a) override {
+    for (auto it = pending.begin(); it != pending.end(); ++it) {
+      if (*it == a) {
+        pending.erase(it);
+        cancels++;
+        return true;
+      }
+    }
+    return false;
+  }
+  bool refresh_pending(uint16_t a) const override {
+    for (uint16_t p : pending)
+      if (p == a)
+        return true;
+    return false;
+  }
+  bool writes_idle() const override { return idle; }
+};
+
+/// Séquenceur amené en ACTIVE (plage confirmée).
+void to_active(Rig &r, BoostSequencer &q) {
+  q.configure(sunday_validated());
+  q.boot(nullptr);
+  q.start(10, ha_at(843), r.now);
+  r.run(q, 2000);
+}
+
+}  // namespace
+
+TEST(boost_relay_submits_once_when_quiescent) {
+  Rig r;
+  BoostSequencer q;
+  FakePort port;
+  BoostRefreshRelay relay;
+  CHECK(relay.poll(q, port, r.now) == BoostRefreshRelay::Event::NONE);
+  to_active(r, q);
+  CHECK(relay.poll(q, port, r.now) == BoostRefreshRelay::Event::SUBMITTED);
+  CHECK_EQ(relay.address(), 0x2230);
+  CHECK(relay.poll(q, port, r.now + 5000) == BoostRefreshRelay::Event::NONE);
+  CHECK_EQ(port.requests, 1);
+}
+
+TEST(boost_relay_waits_for_other_commands_then_gives_up) {
+  Rig r;
+  BoostSequencer q;
+  FakePort port;
+  BoostRefreshRelay relay;
+  to_active(r, q);
+  port.idle = false;  // commande A1/M2 en attente
+  uint32_t t = r.now;
+  for (; t < r.now + 10000; t += 100)
+    CHECK(relay.poll(q, port, t) == BoostRefreshRelay::Event::NONE);
+  CHECK_EQ(port.requests, 0);  // jamais demandée pendant une autre commande
+  port.idle = true;
+  CHECK(relay.poll(q, port, t) == BoostRefreshRelay::Event::SUBMITTED);
+
+  // Registre occupé en continu : un essai par seconde, abandon après 60 s.
+  Rig r2;
+  BoostSequencer q2;
+  FakePort busy;
+  busy.accept = false;
+  BoostRefreshRelay relay2;
+  to_active(r2, q2);
+  int gave_up = 0;
+  for (uint32_t u = r2.now; u < r2.now + 70000; u += 50)
+    gave_up += relay2.poll(q2, busy, u) == BoostRefreshRelay::Event::GAVE_UP;
+  CHECK_EQ(gave_up, 1);
+  CHECK(busy.requests >= 60 && busy.requests <= 62);
+}
+
+TEST(boost_relay_not_declared_reads_nothing) {
+  Rig r;
+  BoostSequencer q;
+  FakePort port;
+  port.declared = false;
+  BoostRefreshRelay relay;
+  to_active(r, q);
+  CHECK(relay.poll(q, port, r.now) == BoostRefreshRelay::Event::NOT_DECLARED);
+  CHECK(relay.poll(q, port, r.now + 2000) == BoostRefreshRelay::Event::NONE);
+  CHECK_EQ(port.requests, 0);
+}
+
+TEST(boost_relay_cancelled_when_a_new_operation_starts) {
+  // Restauration demandée avant que l'actualisation soit servie : elle est
+  // retirée (rien d'émis), la vérification de la restauration reste seule.
+  Rig r;
+  BoostSequencer q;
+  FakePort port;
+  BoostRefreshRelay relay;
+  to_active(r, q);
+  CHECK(relay.poll(q, port, r.now) == BoostRefreshRelay::Event::SUBMITTED);
+  CHECK(q.request_restore(r.now));
+  const BoostAction a = q.poll(r.now);  // relecture avant restauration émise
+  CHECK(a.type == BoostActionType::READ);
+  CHECK(relay.poll(q, port, r.now) == BoostRefreshRelay::Event::CANCELLED);
+  CHECK(port.pending.empty());
+  CHECK(relay.poll(q, port, r.now) == BoostRefreshRelay::Event::NONE);
+  // Fin de la restauration : une nouvelle actualisation.
+  q.on_read(true, r.regs[0x2230].data(), 8, r.now);
+  while (r.step(q)) {
+  }
+  CHECK(q.idle());
+  CHECK(relay.poll(q, port, r.now) == BoostRefreshRelay::Event::SUBMITTED);
+  CHECK_EQ(port.cancels, 1);
+
+  // Déjà servie : rien à retirer.
+  Rig r2;
+  BoostSequencer q2;
+  FakePort port2;
+  BoostRefreshRelay relay2;
+  to_active(r2, q2);
+  relay2.poll(q2, port2, r2.now);
+  port2.pending.clear();  // lue par l'ordonnanceur
+  relay2.poll(q2, port2, r2.now + 1000);
+  q2.request_restore(r2.now);
+  q2.poll(r2.now);
+  CHECK(relay2.poll(q2, port2, r2.now + 2000) == BoostRefreshRelay::Event::NONE);
+  CHECK_EQ(port2.cancels, 0);
+}

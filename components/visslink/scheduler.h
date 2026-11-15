@@ -25,7 +25,13 @@
 //  - v0.4.1 : acquire(now, true) ne délivre que les relectures urgentes
 //    (aucune lecture ordinaire intercalée tant qu'une vérification est en
 //    cours) ; release() rend une lecture acquise mais jamais émise, sans
-//    toucher à son échéance (préemption par une commande manuelle).
+//    toucher à son échéance (préemption par une commande manuelle) ;
+//  - v0.5.1 : un cycle multi-blocs peut commencer par un bloc choisi
+//    (set_cycle_start : le jour courant d'abord) et parcourt ensuite les
+//    blocs en rond ; expedite_block() relit un seul bloc hors cycle, avec une
+//    priorité inférieure aux relectures de vérification (URGENT_REFRESH) ou
+//    égale (URGENT_VERIFY), puis le cycle reprend là où il en était ; la
+//    pause entre blocs est réglable (set_block_delay), 30 s par défaut.
 
 #include <cstddef>
 #include <cstdint>
@@ -40,10 +46,18 @@ class RegisterScheduler {
  public:
   static constexpr int NONE = -1;
   static constexpr uint32_t RETRY_DELAY_MS = 1000;
-  /// Pause entre deux blocs d'un même registre : étale les 7 lectures d'une
-  /// programmation sur ~4 min au lieu d'une rafale. Valeur choisie par
-  /// simulation (cf. tests sim_v021_* et README, « Charge de la liaison »).
+  /// Pause par défaut entre deux blocs d'un même registre : étale les 7
+  /// lectures d'une programmation sur ~3 min au lieu d'une rafale. Valeur
+  /// choisie par simulation (cf. tests sim_v021_* et sim_v051_*).
   static constexpr uint32_t BLOCK_DELAY_MS = 30000;
+
+  /// Niveaux de priorité d'une relecture hors cycle.
+  static constexpr uint8_t URGENT_NONE = 0;
+  /// Rafraîchissement d'un bloc (jour courant, demande ponctuelle) : avant
+  /// les lectures ordinaires, jamais pendant une vérification d'écriture.
+  static constexpr uint8_t URGENT_REFRESH = 1;
+  /// Relecture de vérification après une écriture (expedite) : en premier.
+  static constexpr uint8_t URGENT_VERIFY = 2;
 
   struct Entry {
     uint32_t interval_ms;
@@ -51,52 +65,47 @@ class RegisterScheduler {
     uint32_t cycle_ms;  ///< échéance du premier bloc du cycle (registres multi-blocs)
     uint8_t failures;   ///< échecs consécutifs dans le cycle en cours
     uint8_t blocks;     ///< nombre de blocs lus à chaque cycle (>= 1)
-    uint8_t block;      ///< bloc à lire
-    bool urgent;        ///< relecture demandée par expedite(), servie en premier
+    uint8_t block;      ///< bloc à lire (celui de la relecture hors cycle si urgent)
+    uint8_t urgent;     ///< URGENT_NONE, URGENT_REFRESH ou URGENT_VERIFY
+    uint8_t start;      ///< premier bloc du cycle (multi-blocs)
+    uint8_t done;       ///< blocs terminés dans le cycle en cours
+    // État du cycle mis de côté pendant une relecture hors cycle.
+    uint32_t saved_due_ms;
+    uint8_t saved_block;
+    uint8_t saved_failures;
   };
 
   void set_max_retries(uint8_t max_retries) { this->max_retries_ = max_retries; }
   uint8_t max_retries() const { return this->max_retries_; }
+  void set_block_delay(uint32_t delay_ms) { this->block_delay_ms_ = delay_ms; }
+  uint32_t block_delay() const { return this->block_delay_ms_; }
 
   /// Ajoute un registre de `blocks` blocs, échu à `now`. À appeler depuis
   /// setup() : loop() n'alloue jamais.
   void add(uint32_t interval_ms, uint32_t now, uint8_t blocks = 1) {
-    this->entries_.push_back({interval_ms, now, now, 0, blocks > 0 ? blocks : uint8_t(1), 0, false});
+    Entry e{};
+    e.interval_ms = interval_ms;
+    e.due_ms = now;
+    e.cycle_ms = now;
+    e.blocks = blocks > 0 ? blocks : uint8_t(1);
+    this->entries_.push_back(e);
   }
 
   /// Index du registre à lire maintenant (marqué en cours), ou NONE.
-  /// `urgent_only` : seulement une relecture demandée par expedite().
+  /// `urgent_only` : seulement une relecture de vérification (expedite()).
   int acquire(uint32_t now, bool urgent_only = false) {
     if (this->current_ != NONE)
       return NONE;
-    // Relectures urgentes d'abord, la plus ancienne demandée en premier
-    // (le registre écrit avant l'autre circuit).
-    uint32_t best_lateness = 0;
-    for (size_t i = 0; i < this->entries_.size(); i++) {
-      const Entry &e = this->entries_[i];
-      if (!e.urgent || !time_reached(now, e.due_ms))
-        continue;
-      if (this->current_ == NONE || now - e.due_ms > best_lateness) {
-        this->current_ = static_cast<int>(i);
-        best_lateness = now - e.due_ms;
-      }
-    }
-    if (this->current_ != NONE)
-      return this->current_;
-    best_lateness = 0;
-    if (urgent_only)
-      return NONE;
-    for (size_t i = 0; i < this->entries_.size(); i++) {
-      const Entry &e = this->entries_[i];
-      if (!time_reached(now, e.due_ms))
-        continue;
-      const uint32_t lateness = now - e.due_ms;
-      if (this->current_ == NONE || lateness > best_lateness) {
-        this->current_ = static_cast<int>(i);
-        best_lateness = lateness;
-      }
-    }
-    return this->current_;
+    // Vérifications d'abord, la plus ancienne demandée en premier (le
+    // registre écrit avant l'autre circuit) ; puis les rafraîchissements de
+    // bloc ; puis les lectures ordinaires.
+    int index = this->most_late_(now, URGENT_VERIFY);
+    if (index == NONE && !urgent_only)
+      index = this->most_late_(now, URGENT_REFRESH);
+    if (index == NONE && !urgent_only)
+      index = this->most_late_(now, URGENT_NONE);
+    this->current_ = index;
+    return index;
   }
 
   /// Rend la lecture en cours sans l'avoir faite (aucun octet émis) : ni
@@ -122,58 +131,141 @@ class RegisterScheduler {
     }
     const bool gave_up = !success;
     e.failures = 0;
-    if (e.urgent) {
-      // Relecture hors cycle : la cadence normale du registre reprend.
-      e.urgent = false;
-      e.due_ms = e.cycle_ms;
-      if (time_reached(now, e.due_ms))
-        e.due_ms = now + e.interval_ms;
+    if (e.urgent != URGENT_NONE) {
+      // Relecture hors cycle : le cycle reprend là où il en était.
+      e.urgent = URGENT_NONE;
+      e.block = e.saved_block;
+      e.failures = e.saved_failures;
+      e.due_ms = e.saved_due_ms;
+      if (e.blocks == 1) {
+        if (time_reached(now, e.due_ms))
+          e.due_ms = now + e.interval_ms;  // lecture prévue déjà faite
+      } else if (time_reached(now + this->block_delay_ms_, e.due_ms)) {
+        e.due_ms = now + this->block_delay_ms_;  // pas deux blocs à la suite
+      }
       return gave_up;
     }
     // Bloc suivant, y compris après un abandon : un jour illisible ne prive
     // pas les autres de leur lecture.
-    if (e.block + 1 < e.blocks) {
-      if (e.block == 0)
+    if (e.done + 1 < e.blocks) {
+      if (e.done == 0)
         e.cycle_ms = e.due_ms;
-      e.block++;
-      e.due_ms = now + BLOCK_DELAY_MS;
+      e.done++;
+      e.block = static_cast<uint8_t>((e.block + 1) % e.blocks);
+      e.due_ms = now + this->block_delay_ms_;
       return gave_up;
     }
-    if (e.block > 0) {
-      e.block = 0;
+    if (e.done > 0) {
+      e.done = 0;
       e.due_ms = e.cycle_ms;  // cadence calée sur le début du cycle
     }
+    e.block = e.start;
     e.due_ms += e.interval_ms;
     if (time_reached(now, e.due_ms))
       e.due_ms = now + e.interval_ms;
     return gave_up;
   }
 
+  /// Registre multi-blocs : bloc par lequel commencera le cycle, tant
+  /// qu'aucun bloc du cycle n'a été lu (sinon refusé, l'ordre d'un cycle
+  /// commencé ne change pas). Les cycles suivants commencent au même bloc,
+  /// jusqu'au prochain appel.
+  bool set_cycle_start(size_t index, uint8_t block) {
+    if (index >= this->entries_.size() || static_cast<int>(index) == this->current_)
+      return false;
+    Entry &e = this->entries_[index];
+    if (e.blocks < 2 || block >= e.blocks || e.done != 0 || e.urgent != URGENT_NONE || e.failures != 0)
+      return false;
+    e.start = block;
+    e.block = block;
+    return true;
+  }
+
   /// Lecture prioritaire et immédiate d'un registre à un seul bloc (sans
   /// effet sur un registre multi-blocs ou en cours de lecture). Sa cadence
   /// normale reprend ensuite : l'échéance prévue est conservée.
   bool expedite(size_t index, uint32_t now) {
-    if (index >= this->entries_.size() || static_cast<int>(index) == this->current_)
+    if (index >= this->entries_.size() || this->entries_[index].blocks != 1)
+      return false;
+    return this->expedite_block(index, 0, now, URGENT_VERIFY);
+  }
+
+  /// Relecture immédiate d'un seul bloc, hors cycle (v0.5.1). Refusée si le
+  /// registre est en cours de lecture ou si une autre relecture hors cycle
+  /// est déjà demandée pour lui (une seule à la fois par registre). Le cycle
+  /// en cours n'est ni avancé ni recommencé.
+  bool expedite_block(size_t index, uint8_t block, uint32_t now, uint8_t level = URGENT_REFRESH) {
+    if (index >= this->entries_.size() || static_cast<int>(index) == this->current_ || level == URGENT_NONE)
       return false;
     Entry &e = this->entries_[index];
-    if (e.blocks != 1)
+    if (block >= e.blocks)
       return false;
-    if (!e.urgent)
-      e.cycle_ms = e.due_ms;  // échéance normale, mise de côté
-    e.urgent = true;
+    if (e.urgent != URGENT_NONE) {
+      if (e.block != block)
+        return false;
+    } else {
+      e.saved_due_ms = e.due_ms;  // échéance normale, mise de côté
+      e.saved_block = e.block;
+      e.saved_failures = e.failures;
+    }
+    if (level > e.urgent)
+      e.urgent = level;
+    e.block = block;
     e.failures = 0;
     e.due_ms = now;
     return true;
   }
 
+  /// Retire un rafraîchissement de ce bloc pas encore commencé (rien
+  /// d'émis) : le cycle reprend comme si rien n'avait été demandé. Sans
+  /// effet sur une vérification (URGENT_VERIFY), un autre bloc ou une
+  /// lecture en cours.
+  bool cancel_refresh(size_t index, uint8_t block) {
+    if (index >= this->entries_.size() || static_cast<int>(index) == this->current_)
+      return false;
+    Entry &e = this->entries_[index];
+    if (e.urgent != URGENT_REFRESH || e.block != block)
+      return false;
+    e.urgent = URGENT_NONE;
+    e.block = e.saved_block;
+    e.failures = e.saved_failures;
+    e.due_ms = e.saved_due_ms;
+    return true;
+  }
+  /// Un rafraîchissement de ce bloc est en attente (ou en cours).
+  bool refresh_pending(size_t index, uint8_t block) const {
+    return index < this->entries_.size() && this->entries_[index].urgent == URGENT_REFRESH &&
+           this->entries_[index].block == block;
+  }
+
   const Entry &entry(size_t index) const { return this->entries_[index]; }
+  size_t size() const { return this->entries_.size(); }
   /// Bloc à lire (ou en cours de lecture) pour un registre.
   uint8_t block(size_t index) const { return this->entries_[index].block; }
 
  protected:
+  /// Registre échu de ce niveau le plus en retard (à égalité, le premier
+  /// déclaré), ou NONE.
+  int most_late_(uint32_t now, uint8_t level) const {
+    int best = NONE;
+    uint32_t best_lateness = 0;
+    for (size_t i = 0; i < this->entries_.size(); i++) {
+      const Entry &e = this->entries_[i];
+      if (e.urgent != level || !time_reached(now, e.due_ms))
+        continue;
+      const uint32_t lateness = now - e.due_ms;
+      if (best == NONE || lateness > best_lateness) {
+        best = static_cast<int>(i);
+        best_lateness = lateness;
+      }
+    }
+    return best;
+  }
+
   std::vector<Entry> entries_;
   int current_{NONE};
   uint8_t max_retries_{2};
+  uint32_t block_delay_ms_{BLOCK_DELAY_MS};
 };
 
 }  // namespace visslink

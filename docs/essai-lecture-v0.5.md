@@ -42,15 +42,17 @@ demande) restent présentes, mais toute commande est refusée.
 
 ## 1. Délai de resynchronisation (charge)
 
-La configuration fait ~17 lectures/min. Simulé : sans effet sur le brûleur
-jusqu'à 3 s de resynchro. À 3,5 s, environ 8 % de ses lectures sont
-perdues, et 24 % à 4 s.
+Les quatre Éco/Party sont lus toutes les 60 s, comme en production depuis
+la v0.5.1 : ~13 lectures/min au lieu de ~17. Simulé : brûleur lu
+780 fois sur 780 en 6 h 30 à 2 et 3 s de resynchro. À 4 s, 719 lectures au
+lieu de 593 avec Éco/Party à 30 s : environ 8 % de lectures du brûleur
+retardées.
 
 - Dans la première minute du journal, mesurer l'écart entre deux lignes
   ` <- ` consécutives. Au-delà de 2 s, cet écart est le délai de
   resynchro réel.
-- **Si l'écart dépasse 3 s**, passer les quatre Éco/Party à
-  `update_interval: 60s` et recompiler.
+- **Si l'écart dépasse 3 s**, le noter : c'est la limite au-delà de
+  laquelle la liaison devient chargée.
 - Pendant tout l'essai, « Brûleur actif » doit rester lu toutes les ~30 s
   (lignes `0x0842 <- 0x`).
 

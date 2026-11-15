@@ -60,6 +60,14 @@ class VissLinkRegister {
   virtual void publish_unknown(uint8_t block) = 0;
   /// Appelé une fois par seconde (états dépendant de l'heure locale).
   virtual void on_clock_tick() {}
+  /// Registre multi-blocs (v0.5.1) : bloc à lire en premier à chaque cycle
+  /// (jour courant), ou -1 si aucun (heure inconnue, registre simple).
+  virtual int preferred_first_block() const { return -1; }
+  /// v0.5.1 : ce bloc doit-il être relu sans attendre son tour (jour courant
+  /// pas encore connu, et pas déjà demandé) ?
+  virtual bool wants_block_refresh(uint8_t /*block*/) const { return false; }
+  /// v0.5.1 : la relecture de ce bloc vient d'être demandée.
+  virtual void on_block_refresh_requested(uint8_t /*block*/) {}
   /// Écriture (v0.3) : contrôle complet d'une valeur juste avant émission
   /// (liste blanche, longueur, bornes configurées et documentées). Refus par
   /// défaut : seul VissLinkNumber peut l'accepter.
@@ -86,6 +94,8 @@ class VissLinkSensor : public sensor::Sensor, public VissLinkRegister {
  public:
   void set_data_type(DataType type) { this->data_type_ = type; }
   DataType get_data_type() const { return this->data_type_; }
+  /// v0.5.1 : valeur brute signifiant « non disponible » (publiée inconnue).
+  void add_invalid_raw_value(uint32_t raw) { this->invalid_raw_.add(raw); }
 
   uint8_t get_length() const override { return data_type_length(this->data_type_); }
   bool publish_data(uint8_t block, const uint8_t *data) override;
@@ -94,6 +104,8 @@ class VissLinkSensor : public sensor::Sensor, public VissLinkRegister {
 
  protected:
   DataType data_type_{DataType::INT16};  ///< défaut v0.1 : température
+  InvalidRawValues invalid_raw_;
+  bool invalid_logged_{false};  ///< avertissement émis une fois par épisode
 };
 #endif
 
@@ -123,6 +135,13 @@ class VissLinkSchedule : public text_sensor::TextSensor, public VissLinkRegister
   bool publish_data(uint8_t block, const uint8_t *data) override;
   void publish_unknown(uint8_t block) override;
   void on_clock_tick() override { this->refresh_clock_(); }
+  int preferred_first_block() const override;
+  /// Une seule demande par jour courant : un bloc illisible n'est pas relu
+  /// en boucle, il attend le cycle suivant.
+  bool wants_block_refresh(uint8_t block) const override {
+    return !this->week_.is_known(block) && this->requested_day_ != block;
+  }
+  void on_block_refresh_requested(uint8_t block) override { this->requested_day_ = block; }
   void dump_register_config() override;
 
   void set_day_sensor(uint8_t day, text_sensor::TextSensor *sensor) {
@@ -144,6 +163,7 @@ class VissLinkSchedule : public text_sensor::TextSensor, public VissLinkRegister
 
   WeekSchedule week_;
   bool first_pass_done_{false};  ///< les 7 blocs ont été tentés au moins une fois
+  int requested_day_{-1};        ///< dernier jour dont la relecture a été demandée
   text_sensor::TextSensor *day_sensors_[SCHEDULE_DAYS]{};
 #ifdef USE_TIME
   time::RealTimeClock *clock_{nullptr};
@@ -307,6 +327,18 @@ class VissLinkComponent : public Component, public uart::UARTDevice {
   /// octets. Refusée si une autre est en cours ou si l'adresse n'est pas
   /// autorisée.
   bool request_direct_read(uint16_t address, uint8_t length);
+  /// v0.5.1 : relecture prioritaire d'un seul bloc d'une programmation
+  /// déclarée (adresse du jour), publiée comme une lecture normale ; le
+  /// cycle hebdomadaire n'est ni avancé ni recommencé. Jamais servie pendant
+  /// une vérification d'écriture. Refusée si le registre est en cours de
+  /// lecture ou a déjà une relecture en attente : réessayer plus tard.
+  bool request_block_refresh(uint16_t address);
+  /// Adresse d'un bloc d'une programmation déclarée (v0.5.1).
+  bool is_schedule_block(uint16_t address) const;
+  /// Retire un rafraîchissement demandé mais pas encore émis (v0.5.1).
+  bool cancel_block_refresh(uint16_t address);
+  /// Un rafraîchissement de ce bloc attend encore son tour (v0.5.1).
+  bool block_refresh_pending(uint16_t address) const;
   /// Écriture d'un bloc du bouclage (8 octets), via l'arbitre. Refusée sans
   /// les autorisations, hors liste blanche ou si le bloc est invalide.
   bool submit_block_write(uint16_t address, const uint8_t *data, uint32_t now);
@@ -336,6 +368,8 @@ class VissLinkComponent : public Component, public uart::UARTDevice {
   bool block_write_allowed_(uint16_t address, const uint8_t *data) const;
   bool start_write_(uint32_t now);
   void preempt_unsent_read_(uint32_t now);
+  void current_day_first_(uint32_t now);
+  bool find_schedule_block_(uint16_t address, size_t *index, uint8_t *block) const;
   void log_write_timing_(uint16_t address);
   void drop_expired_writes_(uint32_t now);
   int index_of_(const VissLinkRegister *reg) const;

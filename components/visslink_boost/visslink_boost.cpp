@@ -42,8 +42,33 @@ void VissLinkBoost::dump_config() {
 }
 
 void VissLinkBoost::loop() {
-  this->dispatch_(millis());
+  const uint32_t now = millis();
+  this->dispatch_(now);
+  this->refresh_display_(now);
   this->publish_();
+}
+
+void VissLinkBoost::refresh_display_(uint32_t now) {
+  if (this->parent_ == nullptr)
+    return;
+  // Affichage seulement : la relecture de vérification a déjà décidé.
+  switch (this->refresh_.poll(this->sequencer_, this->port_, now)) {
+    case visslink::BoostRefreshRelay::Event::SUBMITTED:
+      ESP_LOGD(TAG, "0x%04X: schedule display refresh requested", this->refresh_.address());
+      break;
+    case visslink::BoostRefreshRelay::Event::NOT_DECLARED:
+      ESP_LOGD(TAG, "0x%04X: no schedule entity for this block, display not refreshed", this->refresh_.address());
+      break;
+    case visslink::BoostRefreshRelay::Event::CANCELLED:
+      ESP_LOGD(TAG, "0x%04X: display refresh cancelled (new operation)", this->refresh_.address());
+      break;
+    case visslink::BoostRefreshRelay::Event::GAVE_UP:
+      ESP_LOGW(TAG, "0x%04X: display refresh not possible, next periodic read will update it",
+               this->refresh_.address());
+      break;
+    case visslink::BoostRefreshRelay::Event::NONE:
+      break;
+  }
 }
 
 void VissLinkBoost::refuse_(const std::string &why) {

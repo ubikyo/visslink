@@ -394,6 +394,7 @@ class BoostSequencer {
     this->duration_ = duration_min;
     this->ha_ = ha;
     this->restore_requested_ = false;
+    this->refresh_address_ = 0;  // la nouvelle opération en demandera une à sa fin
     this->enter_(BoostState::READ_CLOCK, VL_TEXT("Lecture de l'horloge de la Vitotronic"));
     return BoostStart::ACCEPTED;
   }
@@ -494,6 +495,7 @@ class BoostSequencer {
         } else if (std::memcmp(data, this->record_.temporary, SCHEDULE_BLOCK_LENGTH) == 0) {
           this->restore_at_ms_ = this->clock_ms_ + (this->plan_.restore_at_s - this->clock_.second_of_day()) * 1000u;
           this->attempts_ = 0;
+          this->refresh_address_ = this->record_.address;  // plage temporaire confirmée
           this->enter_(BoostState::ACTIVE, VL_TEXT("Bouclage programmé ") + hhmm_(this->plan_.start_min) + VL_TEXT("-") +
                                                hhmm_(this->plan_.end_min) + VL_TEXT(" (restauration vers ") +
                                                hhmm_(this->plan_.restore_at_s / 60u) + VL_TEXT(")"));
@@ -528,6 +530,7 @@ class BoostSequencer {
           this->enter_(BoostState::RESTORE_WRITE, VL_TEXT("Restauration : écriture du bloc d'origine"));
         } else if (std::memcmp(data, this->record_.original, SCHEDULE_BLOCK_LENGTH) == 0) {
           this->final_message_ = VL_TEXT("Programmation déjà conforme à l'origine (vérifié)");
+          this->refresh_address_ = this->record_.address;
           this->enter_(BoostState::CLEAR_PENDING, VL_TEXT("Effacement de la sauvegarde"));
         } else {
           this->enter_(BoostState::RECOVERY_REQUIRED,
@@ -539,6 +542,7 @@ class BoostSequencer {
         if (ok && length == SCHEDULE_BLOCK_LENGTH &&
             std::memcmp(data, this->record_.original, SCHEDULE_BLOCK_LENGTH) == 0) {
           this->final_message_ = VL_TEXT("Programmation restaurée (vérifiée par relecture)");
+          this->refresh_address_ = this->record_.address;
           this->enter_(BoostState::CLEAR_PENDING, VL_TEXT("Effacement de la sauvegarde"));
         } else if (ok && length == SCHEDULE_BLOCK_LENGTH &&
                    std::memcmp(data, this->record_.temporary, SCHEDULE_BLOCK_LENGTH) != 0) {
@@ -557,6 +561,7 @@ class BoostSequencer {
           this->enter_(BoostState::RECOVERY_WRITE, VL_TEXT("Récupération : écriture du bloc d'origine"));
         } else if (std::memcmp(data, this->record_.original, SCHEDULE_BLOCK_LENGTH) == 0) {
           this->final_message_ = VL_TEXT("Récupération : programmation déjà conforme à l'origine (vérifié)");
+          this->refresh_address_ = this->record_.address;
           this->enter_(BoostState::CLEAR_PENDING, VL_TEXT("Effacement de la sauvegarde"));
         } else {
           this->enter_(BoostState::RECOVERY_REQUIRED,
@@ -568,6 +573,7 @@ class BoostSequencer {
         if (ok && length == SCHEDULE_BLOCK_LENGTH &&
             std::memcmp(data, this->record_.original, SCHEDULE_BLOCK_LENGTH) == 0) {
           this->final_message_ = VL_TEXT("Récupération terminée : programmation restaurée (vérifiée)");
+          this->refresh_address_ = this->record_.address;
           this->enter_(BoostState::CLEAR_PENDING, VL_TEXT("Effacement de la sauvegarde"));
         } else {
           this->enter_(BoostState::RECOVERY_REQUIRED,
@@ -664,6 +670,24 @@ class BoostSequencer {
     if (this->state_ == BoostState::RESTORE_WRITE || this->state_ == BoostState::RECOVERY_WRITE)
       return std::memcmp(data, this->record_.original, SCHEDULE_BLOCK_LENGTH) == 0;
     return false;
+  }
+  /// Aucune transaction ni étape en cours : IDLE, ou ACTIVE en attente de la
+  /// fin de plage.
+  bool quiescent() const {
+    return !this->waiting_ && (this->state_ == BoostState::IDLE || this->state_ == BoostState::ACTIVE);
+  }
+  /// v0.5.1 : bloc dont l'affichage (programmation publiée) doit être
+  /// actualisé, après une modification CONFIRMÉE par la relecture de
+  /// vérification (plage temporaire en place, ou bloc d'origine relu). Rendu
+  /// une seule fois, et seulement au repos : jamais pendant une écriture,
+  /// une restauration ou une récupération. 0 = rien. Indépendant de la
+  /// relecture de vérification, qui reste obligatoire et la seule preuve.
+  uint16_t take_refresh() {
+    if (!this->quiescent())
+      return 0;
+    const uint16_t address = this->refresh_address_;
+    this->refresh_address_ = 0;
+    return address;
   }
   const std::string &status() const { return this->status_; }
   const BoostRecord &record() const { return this->record_; }
@@ -842,6 +866,85 @@ class BoostSequencer {
   uint8_t count_{0};
   bool clear_failed_{false};
   bool last_ack_{false};
+  uint16_t refresh_address_{0};  ///< v0.5.1, cf. take_refresh()
+};
+
+/// v0.5.1 : accès du relais au composant visslink (testé sur PC).
+class BoostRefreshPort {
+ public:
+  virtual bool is_schedule_block(uint16_t address) const = 0;
+  virtual bool request_refresh(uint16_t address) = 0;
+  virtual bool cancel_refresh(uint16_t address) = 0;
+  virtual bool refresh_pending(uint16_t address) const = 0;
+  virtual bool writes_idle() const = 0;
+};
+
+/// v0.5.1 : actualise la programmation publiée du bouclage après une
+/// modification confirmée (BoostSequencer::take_refresh), par une relecture
+/// ciblée (VissLinkComponent::request_block_refresh).
+///
+///  - demandée seulement au repos du séquenceur et sans autre commande en
+///    attente (A1/M2, consignes) ; jamais servie pendant une vérification ;
+///  - annulée si une nouvelle opération commence avant d'avoir été servie :
+///    aucune lecture superflue pendant une écriture ou une restauration ;
+///  - abandonnée après GIVE_UP_MS (le cycle normal la remplacera) ;
+///  - n'est jamais une vérification : elle ne décide de rien.
+class BoostRefreshRelay {
+ public:
+  static constexpr uint32_t RETRY_MS = 1000;
+  static constexpr uint32_t GIVE_UP_MS = 60000;
+  enum class Event : uint8_t { NONE, SUBMITTED, NOT_DECLARED, CANCELLED, GAVE_UP };
+
+  Event poll(BoostSequencer &seq, BoostRefreshPort &port, uint32_t now) {
+    if (!seq.quiescent()) {
+      this->pending_ = 0;  // la nouvelle opération en demandera une à sa fin
+      if (this->submitted_ != 0) {
+        const uint16_t address = this->submitted_;
+        this->submitted_ = 0;
+        if (port.cancel_refresh(address)) {
+          this->address_ = address;
+          return Event::CANCELLED;
+        }
+      }
+      return Event::NONE;
+    }
+    if (this->submitted_ != 0 && !port.refresh_pending(this->submitted_))
+      this->submitted_ = 0;  // servie
+    if (this->pending_ == 0) {
+      const uint16_t address = seq.take_refresh();
+      if (address == 0)
+        return Event::NONE;
+      this->address_ = address;
+      if (!port.is_schedule_block(address))
+        return Event::NOT_DECLARED;  // programmation du bouclage non déclarée
+      this->pending_ = address;
+      this->since_ms_ = now;
+      this->retry_at_ms_ = now;
+    }
+    if (!time_reached(now, this->retry_at_ms_))
+      return Event::NONE;
+    this->retry_at_ms_ = now + RETRY_MS;
+    if (port.writes_idle() && port.request_refresh(this->pending_)) {
+      this->submitted_ = this->pending_;
+      this->pending_ = 0;
+      return Event::SUBMITTED;
+    }
+    if (time_reached(now, this->since_ms_ + GIVE_UP_MS)) {
+      this->pending_ = 0;
+      return Event::GAVE_UP;
+    }
+    return Event::NONE;
+  }
+  /// Adresse concernée par le dernier événement.
+  uint16_t address() const { return this->address_; }
+  bool waiting() const { return this->pending_ != 0; }
+
+ protected:
+  uint16_t pending_{0};    ///< à demander
+  uint16_t submitted_{0};  ///< demandée, pas encore servie
+  uint16_t address_{0};
+  uint32_t since_ms_{0};
+  uint32_t retry_at_ms_{0};
 };
 
 }  // namespace visslink

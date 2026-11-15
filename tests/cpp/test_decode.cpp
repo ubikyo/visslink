@@ -101,3 +101,27 @@ TEST(decode_binary_states) {
   CHECK(decode_binary(0x80) == BinaryValue::INVALID);
   CHECK(decode_binary(0xFF) == BinaryValue::INVALID);
 }
+
+// --- v0.5.1 : valeurs « non disponibles » -----------------------------------
+
+TEST(decode_raw_le_all_lengths) {
+  const uint8_t d[] = {0xFF, 0xFF, 0x34, 0x12};
+  CHECK_EQ(decode_raw_le(d, 1), 0xFFu);
+  CHECK_EQ(decode_raw_le(d, 2), 0xFFFFu);
+  CHECK_EQ(decode_raw_le(d, 4), 0x1234FFFFu);
+  const uint8_t t[] = {0xC2, 0x01};
+  CHECK_EQ(decode_raw_le(t, 2), 0x01C2u);
+}
+
+TEST(invalid_raw_values_opt_in_and_bounded) {
+  InvalidRawValues none;
+  const uint8_t ffff[] = {0xFF, 0xFF};
+  CHECK(!none.contains(decode_raw_le(ffff, 2)));  // aucune par défaut
+  InvalidRawValues v;
+  CHECK(v.add(0xFFFF));
+  CHECK(v.contains(decode_raw_le(ffff, 2)));
+  CHECK(!v.contains(0x7FFF));
+  CHECK(!v.contains(0xFFFFFFFF));  // comparaison sur la longueur du type
+  CHECK(v.add(1) && v.add(2) && v.add(3));
+  CHECK(!v.add(4));  // InvalidRawValues::MAX
+}

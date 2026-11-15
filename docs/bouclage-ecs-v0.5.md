@@ -189,6 +189,46 @@ explicitement et seule la relecture décide.
 | Flash ESP8266 (un secteur, effacé à chaque `sync`) | 2 effacements (sauvegarde, effacement) | 8 opérations/jour, 15 min entre deux | ≤ 16 effacements/jour, soit ~5 800/an ; endurance typique 10 000 à 100 000 cycles par secteur : quelques années au pire à ce rythme maximal |
 | Mémoire de la régulation | 2 écritures de 8 octets | idem | endurance inconnue ; usage ponctuel recommandé |
 
+### Actualisation de l'affichage (v0.5.1)
+
+Après une modification **confirmée par la relecture de vérification**, la
+programmation publiée du bouclage (entités `Bouclage ECS - Programmation…`)
+est actualisée par une relecture ciblée du bloc :
+`BoostSequencer::take_refresh()`, `BoostRefreshRelay`, puis
+`VissLinkComponent::request_block_refresh()`. Sans elle, l'affichage
+attendait le cycle suivant, jusqu'à 6 h plus tard.
+
+- **Quand** : la plage temporaire est confirmée (`ACTIVE`), ou le bloc
+  d'origine est relu après une restauration ou une récupération (vérifiée
+  ou déjà conforme).
+- **Pas d'actualisation** dans ces cas :
+  - écriture ignorée par la régulation (bloc inchangé) ;
+  - relecture illisible ou bloc inattendu (récupération nécessaire) ;
+  - refus avant écriture ;
+  - sauvegarde oubliée.
+- **Ce n'est pas une vérification.** La relecture des 8 octets juste après
+  chaque écriture reste obligatoire, indépendante et seule décisive. Elle
+  suit toujours immédiatement l'écriture, sans aucune trame entre les deux.
+  L'actualisation ne décide de rien : elle met seulement l'affichage à jour.
+- **Pas de lecture redondante** :
+  - l'actualisation n'est demandée qu'au repos du séquenceur (`IDLE`, ou
+    `ACTIVE` en attente), et sans autre commande en attente (A1/M2,
+    consignes) ;
+  - elle n'est jamais servie pendant une vérification ;
+  - si une restauration commence avant qu'elle soit servie, elle est
+    retirée sans rien émettre ;
+  - elle est abandonnée après 60 s si le registre reste occupé (le cycle
+    normal prend le relais) ;
+  - sans entité de programmation du bouclage déclarée, rien n'est lu.
+
+Séquence simulée sur `0x2230` :
+
+- **plage** : lecture, écriture, vérification, actualisation ;
+- **restauration** : relecture, écriture, vérification, actualisation.
+
+L'affichage est à jour 0,3 à 7,5 s après la confirmation (resynchro de 2 à
+4 s).
+
 ## 6. Coupures d'alimentation
 
 Test `boost_power_cut_after_every_action` : coupure après **chacune** des

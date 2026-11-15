@@ -20,6 +20,23 @@ static const char *const TAG = "visslink";
 
 #ifdef USE_SENSOR
 bool VissLinkSensor::publish_data(uint8_t /*block*/, const uint8_t *data) {
+  const uint8_t length = this->get_length();
+  if (this->invalid_raw_.contains(decode_raw_le(data, length))) {
+    // Réponse bien reçue (pas de nouvelle tentative), mais la régulation
+    // n'a pas de valeur : « inconnu », jamais une mesure.
+    if (!this->invalid_logged_) {
+      ESP_LOGW(TAG, "0x%04X: raw value 0x%0*" PRIX32 " means 'not available', published as unknown", this->address_,
+               2 * length, decode_raw_le(data, length));
+      this->invalid_logged_ = true;
+    }
+    if (!this->has_state() || !std::isnan(this->get_raw_state()))
+      this->publish_state(NAN);
+    return true;
+  }
+  if (this->invalid_logged_) {
+    ESP_LOGI(TAG, "0x%04X: value available again", this->address_);
+    this->invalid_logged_ = false;
+  }
   this->publish_state(static_cast<float>(decode_value(this->data_type_, data)));
   return true;
 }
@@ -33,6 +50,9 @@ void VissLinkSensor::dump_register_config() {
   LOG_SENSOR("  ", "Sensor", this);
   ESP_LOGCONFIG(TAG, "    Address: 0x%04X, type: %s, interval: %" PRIu32 " ms", this->address_,
                 data_type_to_string(this->data_type_), this->interval_ms_);
+  for (uint8_t i = 0; i < this->invalid_raw_.count; i++)
+    ESP_LOGCONFIG(TAG, "    Not available: 0x%0*" PRIX32 " (published as unknown)", 2 * this->get_length(),
+                  this->invalid_raw_.values[i]);
 }
 #endif
 
@@ -108,6 +128,17 @@ void VissLinkSchedule::publish_week_() {
 void VissLinkSchedule::publish_text_(text_sensor::TextSensor *sensor, const std::string &text) {
   if (!sensor->has_state() || sensor->get_state() != text)
     sensor->publish_state(text);
+}
+
+int VissLinkSchedule::preferred_first_block() const {
+#ifdef USE_TIME
+  if (this->clock_ == nullptr)
+    return -1;
+  const ESPTime now = this->clock_->now();
+  return now.is_valid() ? weekday_from_esphome(now.day_of_week) : -1;
+#else
+  return -1;
+#endif
 }
 
 void VissLinkSchedule::refresh_clock_() {
@@ -371,7 +402,77 @@ void VissLinkComponent::setup() {
   this->set_interval("clock", CLOCK_TICK_MS, [this]() {
     for (auto *reg : this->registers_)
       reg->on_clock_tick();
+    this->current_day_first_(millis());
   });
+}
+
+void VissLinkComponent::current_day_first_(uint32_t now) {
+  // Programmations (v0.5.1) : chaque cycle commence par le jour courant, et
+  // ce jour est relu sans attendre son tour tant qu'il n'est pas connu (au
+  // démarrage, l'heure arrive souvent après le début du premier cycle).
+  for (size_t i = 0; i < this->registers_.size(); i++) {
+    VissLinkRegister *reg = this->registers_[i];
+    const int first = reg->preferred_first_block();
+    if (first < 0 || first >= reg->get_block_count())
+      continue;
+    const uint8_t day = static_cast<uint8_t>(first);
+    this->scheduler_.set_cycle_start(i, day);  // sans effet sur un cycle commencé
+    const RegisterScheduler::Entry &e = this->scheduler_.entry(i);
+    const bool next_in_cycle = e.urgent == RegisterScheduler::URGENT_NONE && e.done == 0 && e.block == day;
+    if (next_in_cycle || !reg->wants_block_refresh(day) || !this->scheduler_.expedite_block(i, day, now))
+      continue;
+    reg->on_block_refresh_requested(day);
+    ESP_LOGD(TAG, "0x%04X: current day read first", reg->get_block_address(day));
+  }
+}
+
+bool VissLinkComponent::find_schedule_block_(uint16_t address, size_t *index, uint8_t *block) const {
+  for (size_t i = 0; i < this->registers_.size(); i++) {
+    const VissLinkRegister *reg = this->registers_[i];
+    if (reg->get_block_count() < 2)
+      continue;
+    for (uint8_t b = 0; b < reg->get_block_count(); b++) {
+      if (reg->get_block_address(b) == address) {
+        *index = i;
+        *block = b;
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool VissLinkComponent::is_schedule_block(uint16_t address) const {
+  size_t index;
+  uint8_t block;
+  return this->find_schedule_block_(address, &index, &block);
+}
+
+bool VissLinkComponent::request_block_refresh(uint16_t address) {
+  size_t index;
+  uint8_t block;
+  if (!this->find_schedule_block_(address, &index, &block)) {
+    ESP_LOGW(TAG, "0x%04X: block refresh refused: not a declared schedule block", address);
+    return false;
+  }
+  const bool ok = this->scheduler_.expedite_block(index, block, millis());
+  ESP_LOGD(TAG, "0x%04X: block refresh %s", address, ok ? "requested" : "deferred (busy)");
+  return ok;
+}
+
+bool VissLinkComponent::cancel_block_refresh(uint16_t address) {
+  size_t index;
+  uint8_t block;
+  if (!this->find_schedule_block_(address, &index, &block) || !this->scheduler_.cancel_refresh(index, block))
+    return false;
+  ESP_LOGD(TAG, "0x%04X: pending block refresh cancelled", address);
+  return true;
+}
+
+bool VissLinkComponent::block_refresh_pending(uint16_t address) const {
+  size_t index;
+  uint8_t block;
+  return this->find_schedule_block_(address, &index, &block) && this->scheduler_.refresh_pending(index, block);
 }
 
 void VissLinkComponent::loop() {
@@ -596,11 +697,11 @@ void VissLinkComponent::preempt_unsent_read_(uint32_t now) {
   // acquise mais encore en attente du 0x05 : aucun octet n'a été émis, rien
   // n'est interrompu sur la ligne. La lecture garde son échéance et repasse
   // après. Une transaction dont la trame est partie n'est jamais touchée,
-  // ni une relecture de vérification.
+  // ni une relecture de vérification (un rafraîchissement de bloc, si).
   const int current = this->scheduler_.current();
   const bool direct_ready = this->direct_.pending && !this->direct_.in_flight && time_reached(now, this->direct_.due_ms);
   if (this->write_in_flight_ || this->direct_.in_flight || current == RegisterScheduler::NONE ||
-      this->scheduler_.entry(current).urgent || !this->kw_.is_waiting_sync() ||
+      this->scheduler_.entry(current).urgent == RegisterScheduler::URGENT_VERIFY || !this->kw_.is_waiting_sync() ||
       !((this->enable_writes_ && this->writes_.ready(now, this->link_ok_)) || direct_ready))
     return;
   if (this->kw_.cancel_before_send()) {
