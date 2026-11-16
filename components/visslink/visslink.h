@@ -25,7 +25,11 @@
 #ifdef USE_TIME
 #include "esphome/components/time/real_time_clock.h"
 #endif
+#ifdef USE_CLIMATE
+#include "esphome/components/climate/climate.h"
+#endif
 
+#include "circuit_climate.h"
 #include "circulation_boost.h"
 #include "decode.h"
 #include "dhw_setpoint.h"
@@ -79,6 +83,8 @@ class VissLinkRegister {
   /// Programme de fonctionnement (v0.3) : valeur brute lue (00, 03, 05), ou
   /// -1 si inconnue ou si ce registre n'est pas un programme.
   virtual int mode_raw() const { return -1; }
+  /// v0.7 : consigne lue (°C entiers), ou -1 si inconnue (number seulement).
+  virtual int setpoint_value() const { return -1; }
   /// Écriture (v0.3) : demande refusée ou abandonnée ; republier la dernière
   /// valeur lue pour que Home Assistant ne garde pas la valeur demandée.
   virtual void restore_read_state() {}
@@ -213,6 +219,7 @@ class VissLinkNumber : public number::Number, public VissLinkRegister {
   void dump_register_config() override;
   /// Une valeur lue est disponible.
   bool has_read_value() const { return this->has_state() && !std::isnan(this->state); }
+  int setpoint_value() const override { return this->has_read_value() ? static_cast<int>(this->state) : -1; }
 
  protected:
   void control(float value) override;
@@ -324,14 +331,24 @@ class VissLinkComponent : public Component, public uart::UARTDevice {
   /// défaut, exige aussi enable_writes. Aucune autre autorisation ne la permet.
   void set_enable_dhw_setpoint_write(bool enable) { this->enable_dhw_setpoint_write_ = enable; }
   bool dhw_setpoint_writes_enabled() const { return this->enable_writes_ && this->enable_dhw_setpoint_write_; }
+  /// Écriture des consignes de chauffage A1/M2 (0x2306, 0x2307, 0x3306,
+  /// 0x3307, v0.7, expérimental) : false par défaut, exige aussi
+  /// enable_writes. Aucune autre autorisation ne la permet.
+  void set_enable_heating_setpoint_writes(bool enable) { this->enable_heating_setpoint_writes_ = enable; }
+  bool heating_setpoint_writes_enabled() const {
+    return this->enable_writes_ && this->enable_heating_setpoint_writes_;
+  }
 #ifdef USE_NUMBER
-  /// Le number de la consigne ECS (0x6300), s'il est déclaré.
-  void set_dhw_setpoint_number(VissLinkNumber *number) { this->dhw_number_ = number; }
-#endif
+  /// Consigne (ECS ou chauffage) gérée par sa transaction dédiée (v0.6/v0.7).
+  void add_setpoint_number(VissLinkNumber *number);
 #ifdef USE_TEXT_SENSOR
-  /// Texte facultatif « ECS - État modification consigne » (v0.6).
-  void set_dhw_status_sensor(text_sensor::TextSensor *sensor) { this->dhw_status_ = sensor; }
+  /// Texte facultatif d'état des modifications de cette consigne.
+  void set_setpoint_status_sensor(VissLinkNumber *number, text_sensor::TextSensor *sensor);
 #endif
+#endif
+  /// v0.7 : une modification de cette consigne est en cours (relecture ou
+  /// écriture) ; `target` = valeur demandée.
+  bool setpoint_pending(const VissLinkRegister *reg, uint8_t *target) const;
 
   // --- Blocs horaires (v0.5) ---
   void set_block_client(VissLinkBlockClient *client) { this->block_client_ = client; }
@@ -363,8 +380,7 @@ class VissLinkComponent : public Component, public uart::UARTDevice {
   /// Demande d'écriture venant de Home Assistant (VissLinkNumber::control).
   void submit_write(VissLinkNumber *number, float value);
 #endif
-  /// v0.6 : transaction de consigne ECS (état, pour les journaux et tests).
-  const DhwSetpointWriter &dhw_setpoint() const { return this->dhw_; }
+
   /// Registre de programme (select A1 ou text_sensor), au plus deux.
   void add_mode_register(VissLinkRegister *reg);
 #ifdef USE_SELECT
@@ -395,15 +411,26 @@ class VissLinkComponent : public Component, public uart::UARTDevice {
   int mode_peer_of_(int index) const;
   void read_back_done_(int index, uint32_t now);
   void log_mode_divergence_after_write_();
-  // v0.6 : consigne ECS.
-#ifdef USE_NUMBER
-  void submit_dhw_write_(VissLinkNumber *number, float value);
+  // v0.6/v0.7 : consignes ECS et chauffage, une transaction par registre.
+  struct SetpointChannel {
+    SetpointChannel(VissLinkRegister *r, uint16_t address) : reg(r), writer(address) {}
+    VissLinkRegister *reg;
+    int owner{WriteArbiter::NONE};
+    SetpointWriter writer;
+    uint32_t published{0};  ///< version du texte publiée
+#ifdef USE_TEXT_SENSOR
+    text_sensor::TextSensor *status{nullptr};
 #endif
-  void dhw_on_read_(bool ok, uint8_t value, bool verify, uint32_t now);
-  void dhw_publish_();
-  /// Propriétaire dont la demande attend (consigne ECS pendant une
-  /// restauration du bouclage), ou WriteArbiter::NONE.
-  int dhw_deferred_owner_() const;
+  };
+#ifdef USE_NUMBER
+  void submit_setpoint_(SetpointChannel &ch, VissLinkNumber *number, float value);
+#endif
+  void setpoint_on_read_(SetpointChannel &ch, bool ok, uint8_t value, bool verify, uint32_t now);
+  void setpoint_publish_(SetpointChannel &ch);
+  SetpointChannel *setpoint_channel_(int index);
+  bool setpoint_permitted_(uint16_t address) const;
+  /// Consignes dont l'écriture attend (restauration du bouclage en cours).
+  OwnerSet deferred_setpoints_() const;
 
   KwProtocol kw_;
   RegisterScheduler scheduler_;
@@ -414,15 +441,8 @@ class VissLinkComponent : public Component, public uart::UARTDevice {
   bool enable_m2_mode_write_{false};
   bool enable_schedule_writes_{false};
   bool enable_dhw_setpoint_write_{false};
-  DhwSetpointWriter dhw_;
-  int dhw_owner_{WriteArbiter::NONE};  ///< index du number 0x6300
-  uint32_t dhw_published_{0};          ///< version du texte publiée
-#ifdef USE_NUMBER
-  VissLinkNumber *dhw_number_{nullptr};
-#endif
-#ifdef USE_TEXT_SENSOR
-  text_sensor::TextSensor *dhw_status_{nullptr};
-#endif
+  bool enable_heating_setpoint_writes_{false};
+  std::vector<SetpointChannel> setpoints_;  ///< consignes déclarées (au plus 5)
   VissLinkBlockClient *block_client_{nullptr};
   /// Lecture ponctuelle (v0.5) : une à la fois, nouvelles tentatives comme
   /// une lecture ordinaire.
@@ -447,6 +467,48 @@ class VissLinkComponent : public Component, public uart::UARTDevice {
   WriteArbiter writes_;
   HighFrequencyLoopRequester high_freq_;
 };
+
+#if defined(USE_CLIMATE) && defined(USE_NUMBER) && defined(USE_SELECT)
+/// Climate du circuit plancher M2 (v0.7, expérimental). Ne lit aucun
+/// registre et n'écrit rien lui-même : il agrège des entités VissLink
+/// existantes (circuit_climate.h) et passe ses commandes à leurs chemins
+/// sécurisés (VissLinkComponent::submit_write, submit_mode_write). Ce n'est
+/// PAS un thermostat de pièce : la cible est la consigne confort du circuit.
+class VissLinkCircuitClimate : public climate::Climate, public Component {
+ public:
+  void set_parent(VissLinkComponent *parent) { this->parent_ = parent; }
+  void set_comfort_number(VissLinkNumber *number) { this->comfort_ = number; }
+  void set_mode_select(VissLinkModeSelect *select) { this->mode_select_ = select; }
+#ifdef USE_SENSOR
+  void set_room_sensor(sensor::Sensor *sensor) { this->room_ = sensor; }
+#endif
+#ifdef USE_BINARY_SENSOR
+  void set_pump_sensor(binary_sensor::BinarySensor *sensor) { this->pump_ = sensor; }
+#endif
+
+  void setup() override;
+  void dump_config() override;
+  float get_setup_priority() const override { return setup_priority::DATA - 1.0f; }
+
+ protected:
+  climate::ClimateTraits traits() override;
+  void control(const climate::ClimateCall &call) override;
+  /// Recalcule l'état depuis les entités ; publie s'il a changé (ou `force`).
+  void refresh_(bool force);
+  int mode_raw_() const;
+
+  VissLinkComponent *parent_{nullptr};
+  VissLinkNumber *comfort_{nullptr};
+  VissLinkModeSelect *mode_select_{nullptr};
+#ifdef USE_SENSOR
+  sensor::Sensor *room_{nullptr};
+#endif
+#ifdef USE_BINARY_SENSOR
+  binary_sensor::BinarySensor *pump_{nullptr};
+#endif
+  CircuitClimateState state_;
+};
+#endif
 
 }  // namespace visslink
 }  // namespace esphome

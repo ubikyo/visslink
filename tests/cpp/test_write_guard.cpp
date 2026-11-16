@@ -29,7 +29,9 @@ TEST(write_value_checks) {
   CHECK_EQ(check_write_value(0x2306, 1, 21, 16, 24, &out), WriteCheck::OK);
   CHECK_EQ(out, 21);
   CHECK_EQ(check_write_value(0x2306, 1, 16, 16, 24, &out), WriteCheck::OK);  // bornes incluses
-  CHECK_EQ(check_write_value(0x2306, 1, 24, 16, 24, &out), WriteCheck::OK);
+  CHECK_EQ(check_write_value(0x2306, 1, 23, 16, 24, &out), WriteCheck::OK);
+  // v0.7 : limite interne provisoire A1 confort 23 °C, quelle que soit la config.
+  CHECK_EQ(check_write_value(0x2306, 1, 24, 16, 24, &out), WriteCheck::OUT_OF_HEATING_LIMITS);
   CHECK_EQ(check_write_value(0x6300, 1, 60, 40, 60, &out), WriteCheck::OK);
 
   out = 0xAA;

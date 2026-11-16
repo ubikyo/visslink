@@ -103,6 +103,11 @@ visslink:
   # enable_writes seul ne permet pas d'écrire 0x6300. Écriture limitée en
   # interne à 50..60 °C. Laisser à false avant docs/consigne-ecs-v0.6.md.
   enable_dhw_setpoint_write: false
+  # Consignes de chauffage A1/M2 (0x2306, 0x2307, 0x3306, 0x3307, v0.7,
+  # expérimental) : exige enable_writes ; sans elle, enable_writes seul ne
+  # permet pas de les écrire. Limites internes provisoires par registre.
+  # Laisser à false avant docs/consignes-chauffage-v0.7.md.
+  enable_heating_setpoint_writes: false
 
 sensor:
   # --- Températures (int16, dixièmes de degré) ------------------------------

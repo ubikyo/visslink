@@ -29,6 +29,7 @@ CONF_ENABLE_MODE_WRITES = "enable_mode_writes"
 CONF_ENABLE_M2_MODE_WRITE = "enable_m2_mode_write"
 CONF_ENABLE_SCHEDULE_WRITES = "enable_schedule_writes"
 CONF_ENABLE_DHW_SETPOINT_WRITE = "enable_dhw_setpoint_write"
+CONF_ENABLE_HEATING_SETPOINT_WRITES = "enable_heating_setpoint_writes"
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -195,6 +196,17 @@ def _warn_if_writes_enabled(config):
             "enable_dhw_setpoint_write requires enable_writes: true",
             path=[CONF_ENABLE_DHW_SETPOINT_WRITE],
         )
+    if config[CONF_ENABLE_HEATING_SETPOINT_WRITES] and not config[CONF_ENABLE_WRITES]:
+        raise cv.Invalid(
+            "enable_heating_setpoint_writes requires enable_writes: true",
+            path=[CONF_ENABLE_HEATING_SETPOINT_WRITES],
+        )
+    if config[CONF_ENABLE_HEATING_SETPOINT_WRITES]:
+        _LOGGER.warning(
+            "VissLink: HEATING SETPOINT WRITES ENABLED (enable_heating_setpoint_"
+            "writes: true), A1 0x2306/0x2307, M2 0x3306/0x3307, provisional "
+            "limits, experimental: see docs/consignes-chauffage-v0.7.md"
+        )
     if config[CONF_ENABLE_DHW_SETPOINT_WRITE]:
         _LOGGER.warning(
             "VissLink: DHW SETPOINT WRITE ENABLED (enable_dhw_setpoint_write: "
@@ -263,6 +275,11 @@ CONFIG_SCHEMA = cv.All(
             # les limites internes 50..60 °C. Exige enable_writes. Sans elle,
             # enable_writes seul ne permet plus d'écrire 0x6300.
             cv.Optional(CONF_ENABLE_DHW_SETPOINT_WRITE, default=False): cv.boolean,
+            # v0.7, expérimental : écriture des consignes de chauffage A1/M2
+            # (0x2306, 0x2307, 0x3306, 0x3307), limites internes provisoires
+            # par registre. Exige enable_writes. Sans elle, enable_writes seul
+            # ne permet plus d'écrire ces consignes.
+            cv.Optional(CONF_ENABLE_HEATING_SETPOINT_WRITES, default=False): cv.boolean,
         }
     )
     .extend(cv.COMPONENT_SCHEMA)
@@ -293,3 +310,8 @@ async def to_code(config):
     cg.add(var.set_enable_m2_mode_write(config[CONF_ENABLE_M2_MODE_WRITE]))
     cg.add(var.set_enable_schedule_writes(config[CONF_ENABLE_SCHEDULE_WRITES]))
     cg.add(var.set_enable_dhw_setpoint_write(config[CONF_ENABLE_DHW_SETPOINT_WRITE]))
+    cg.add(
+        var.set_enable_heating_setpoint_writes(
+            config[CONF_ENABLE_HEATING_SETPOINT_WRITES]
+        )
+    )

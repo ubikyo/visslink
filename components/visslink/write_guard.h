@@ -103,6 +103,92 @@ inline const char *dhw_permission_to_string(DhwPermission permission) {
   return "unknown";
 }
 
+// --- Consignes de chauffage A1/M2 (v0.7, expérimental) ----------------------
+//
+// Liste blanche DISTINCTE, autorisation propre : enable_heating_setpoint_writes
+// (avec enable_writes). Ni enable_dhw_setpoint_write, ni les autorisations des
+// programmes ou des blocs horaires ne la permettent.
+//
+// Limites INTERNES d'écriture par registre (°C), PROVISOIRES tant que
+// l'écriture n'est pas validée sur la chaudière, plus étroites que la plage
+// documentée (3..37) et différentes selon le circuit :
+//  - A1 radiateurs : réponse rapide ; réduite jusqu'à 10 °C ;
+//  - M2 plancher : forte inertie, la consigne d'ambiance déplace la courbe de
+//    chauffe et donc la température de départ ; confort plafonné à 22 °C,
+//    réduite au moins 14 °C (un abaissement profond se rattrape mal).
+// Les bornes min_value/max_value du number restreignent encore la plage.
+// En plus : confort >= réduite du même circuit (dernières valeurs lues).
+struct HeatingSetpoint {
+  uint16_t address;
+  uint8_t min;
+  uint8_t max;
+  uint16_t peer;  ///< l'autre consigne du même circuit
+  bool comfort;   ///< consigne normale (confort) ; sinon réduite
+};
+static constexpr HeatingSetpoint HEATING_SETPOINTS[] = {
+    {0x2306, 16, 23, 0x2307, true},   // A1 radiateurs, confort
+    {0x2307, 10, 20, 0x2306, false},  // A1 radiateurs, réduite
+    {0x3306, 16, 22, 0x3307, true},   // M2 plancher, confort
+    {0x3307, 14, 20, 0x3306, false},  // M2 plancher, réduite
+};
+
+inline const HeatingSetpoint *find_heating_setpoint(uint16_t address) {
+  for (const auto &h : HEATING_SETPOINTS) {
+    if (h.address == address)
+      return &h;
+  }
+  return nullptr;
+}
+inline bool is_heating_setpoint_write_whitelisted(uint16_t address) { return find_heating_setpoint(address) != nullptr; }
+
+enum class HeatingPermission : uint8_t {
+  OK,
+  WRITES_DISABLED,          ///< enable_writes: false
+  HEATING_WRITE_DISABLED,   ///< enable_heating_setpoint_writes: false
+  NOT_WHITELISTED,          ///< pas une consigne de chauffage
+};
+
+inline const char *heating_permission_to_string(HeatingPermission permission) {
+  switch (permission) {
+    case HeatingPermission::OK:
+      return "ok";
+    case HeatingPermission::WRITES_DISABLED:
+      return "writes are disabled (enable_writes: false)";
+    case HeatingPermission::HEATING_WRITE_DISABLED:
+      return "heating setpoint writes are disabled (enable_heating_setpoint_writes: false)";
+    case HeatingPermission::NOT_WHITELISTED:
+      return "not a heating setpoint register";
+  }
+  return "unknown";
+}
+
+inline HeatingPermission heating_write_permitted(uint16_t address, bool enable_writes,
+                                                 bool enable_heating_setpoint_writes) {
+  if (!enable_writes)
+    return HeatingPermission::WRITES_DISABLED;
+  if (!enable_heating_setpoint_writes)
+    return HeatingPermission::HEATING_WRITE_DISABLED;
+  if (!is_heating_setpoint_write_whitelisted(address))
+    return HeatingPermission::NOT_WHITELISTED;
+  return HeatingPermission::OK;
+}
+
+/// Limites internes d'écriture d'une consigne (ECS ou chauffage). Faux si
+/// l'adresse n'en a pas.
+inline bool setpoint_write_limits(uint16_t address, uint8_t *min, uint8_t *max) {
+  if (is_dhw_setpoint_write_whitelisted(address)) {
+    *min = DHW_WRITE_MIN;
+    *max = DHW_WRITE_MAX;
+    return true;
+  }
+  const HeatingSetpoint *h = find_heating_setpoint(address);
+  if (h == nullptr)
+    return false;
+  *min = h->min;
+  *max = h->max;
+  return true;
+}
+
 inline DhwPermission dhw_write_permitted(uint16_t address, bool enable_writes, bool enable_dhw_setpoint_write) {
   if (!enable_writes)
     return DhwPermission::WRITES_DISABLED;
@@ -238,6 +324,7 @@ enum class WriteCheck : uint8_t {
   OUT_OF_DOCUMENTED, ///< hors des bornes documentées (ne devrait jamais arriver : refusé par la config)
   VALUE_NOT_ALLOWED, ///< programme : valeur hors de {00, 03, 05}
   OUT_OF_SAFE_LIMITS, ///< v0.6 : consigne ECS hors des limites internes (DHW_WRITE_MIN..MAX)
+  OUT_OF_HEATING_LIMITS, ///< v0.7 : consigne de chauffage hors des limites internes du registre
 };
 
 inline const char *write_check_to_string(WriteCheck check) {
@@ -260,6 +347,8 @@ inline const char *write_check_to_string(WriteCheck check) {
       return "operating mode value not allowed (only 00, 03, 05)";
     case WriteCheck::OUT_OF_SAFE_LIMITS:
       return "DHW setpoint outside the internal safety limits (50..60)";
+    case WriteCheck::OUT_OF_HEATING_LIMITS:
+      return "heating setpoint outside the internal limits of this register";
   }
   return "unknown";
 }
@@ -284,6 +373,10 @@ inline WriteCheck check_write_value(uint16_t address, uint8_t length, float valu
   // v0.6 : limites internes de la consigne ECS, quelle que soit la config.
   if (is_dhw_setpoint_write_whitelisted(address) && (value < DHW_WRITE_MIN || value > DHW_WRITE_MAX))
     return WriteCheck::OUT_OF_SAFE_LIMITS;
+  // v0.7 : limites internes des consignes de chauffage, par registre.
+  const HeatingSetpoint *heating = find_heating_setpoint(address);
+  if (heating != nullptr && (value < heating->min || value > heating->max))
+    return WriteCheck::OUT_OF_HEATING_LIMITS;
   out[0] = static_cast<uint8_t>(value);
   return WriteCheck::OK;
 }
@@ -403,6 +496,31 @@ class WriteVerification {
 /// MIN_SPACING_MS. Les lectures périodiques restent servies entre deux
 /// écritures : au plus deux transactions (écriture + relecture) toutes les
 /// MIN_SPACING_MS leur sont prises.
+/// Propriétaires dont les demandes attendent (v0.6/v0.7 : consignes pendant
+/// une restauration du bouclage). Construit implicitement depuis un seul
+/// propriétaire (ou NONE).
+struct OwnerSet {
+  static constexpr size_t MAX = 5;
+  int owners[MAX]{};
+  size_t count{0};
+  OwnerSet() = default;
+  OwnerSet(int owner) {  // NOLINT(google-explicit-constructor)
+    if (owner != -1)  // WriteArbiter::NONE
+      this->add(owner);
+  }
+  void add(int owner) {
+    if (this->count < MAX)
+      this->owners[this->count++] = owner;
+  }
+  bool contains(int owner) const {
+    for (size_t i = 0; i < this->count; i++) {
+      if (this->owners[i] == owner)
+        return true;
+    }
+    return false;
+  }
+};
+
 class WriteArbiter {
  public:
   static constexpr int NONE = -1;
@@ -481,7 +599,7 @@ class WriteArbiter {
   /// retirer de la file).
   /// v0.6 : `deferred` = propriétaire dont la demande attend (consigne ECS
   /// pendant une restauration du bouclage), ou NONE.
-  bool ready(uint32_t now, bool link_ok, int deferred = NONE) const {
+  bool ready(uint32_t now, bool link_ok, const OwnerSet &deferred = OwnerSet()) const {
     if (this->active_ || this->eligible_count_(deferred) == 0 || !link_ok)
       return false;
     return !this->has_completed_ || time_reached(now, this->completed_ms_ + MIN_SPACING_MS);
@@ -494,14 +612,14 @@ class WriteArbiter {
   /// en cours.
   /// v0.6 : la demande de `deferred` (s'il n'est pas NONE) est laissée en
   /// attente ; elle reste soumise à REQUEST_EXPIRY_MS.
-  bool next(uint32_t now, bool link_ok, Request *out, int deferred = NONE) {
+  bool next(uint32_t now, bool link_ok, Request *out, const OwnerSet &deferred = OwnerSet()) {
     if (this->active_ || this->eligible_count_(deferred) == 0 || !link_ok)
       return false;
     if (this->has_completed_ && !time_reached(now, this->completed_ms_ + MIN_SPACING_MS))
       return false;
     size_t oldest = this->count_;
     for (size_t i = 0; i < this->count_; i++) {
-      if (deferred != NONE && this->pending_[i].owner == deferred)
+      if (deferred.contains(this->pending_[i].owner))
         continue;
       if (oldest == this->count_ ||
           static_cast<int32_t>(this->pending_[i].requested_ms - this->pending_[oldest].requested_ms) < 0)
@@ -538,12 +656,12 @@ class WriteArbiter {
   size_t pending_count() const { return this->count_; }
 
  protected:
-  size_t eligible_count_(int deferred) const {
-    if (deferred == NONE)
+  size_t eligible_count_(const OwnerSet &deferred) const {
+    if (deferred.count == 0)
       return this->count_;
     size_t n = 0;
     for (size_t i = 0; i < this->count_; i++)
-      n += this->pending_[i].owner != deferred;
+      n += !deferred.contains(this->pending_[i].owner);
     return n;
   }
 

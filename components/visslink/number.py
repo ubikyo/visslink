@@ -3,8 +3,11 @@
 v0.6 : la consigne ECS (0x6300) exige en plus `enable_dhw_setpoint_write`
 (composant `visslink`), est relue juste avant d'écrire, et ne s'écrit que
 dans les limites internes DHW_WRITE_LIMITS, quelles que soient min_value et
-max_value. Option `status` (0x6300 seulement) : texte « ECS - État
-modification consigne ».
+max_value.
+
+v0.7 : même transaction pour les consignes de chauffage A1/M2, avec
+`enable_heating_setpoint_writes` et les limites HEATING_WRITE_LIMITS. Option
+`status` (toute consigne) : texte d'état des modifications.
 
 Le registre est lu périodiquement (`update_interval`, 5 min par défaut) et
 l'état publié est toujours la valeur LUE. Une modification n'est écrite que si
@@ -60,6 +63,17 @@ WRITABLE_REGISTERS = {
 DHW_SETPOINT_ADDRESS = 0x6300
 DHW_WRITE_LIMITS = (50, 60)
 
+# v0.7 : consignes de chauffage, autorisation enable_heating_setpoint_writes,
+# limites INTERNES d'écriture PROVISOIRES par registre (HEATING_SETPOINTS,
+# write_guard.h ; un test vérifie la concordance). Comme pour l'ECS, les bornes
+# min_value/max_value plus larges restent valides pour l'affichage.
+HEATING_WRITE_LIMITS = {
+    0x2306: (16, 23),  # A1 radiateurs, confort
+    0x2307: (10, 20),  # A1 radiateurs, réduite
+    0x3306: (16, 22),  # M2 plancher, confort
+    0x3307: (14, 20),  # M2 plancher, réduite
+}
+
 
 def _integer(value):
     value = cv.float_(value)
@@ -92,12 +106,6 @@ def _validate(config):
     if lo >= hi:
         raise cv.Invalid(
             "min_value must be lower than max_value", path=[CONF_MAX_VALUE]
-        )
-    if CONF_STATUS in config and address != DHW_SETPOINT_ADDRESS:
-        raise cv.Invalid(
-            f"status is only available for the DHW setpoint "
-            f"(0x{DHW_SETPOINT_ADDRESS:04X})",
-            path=[CONF_STATUS],
         )
     return config
 
@@ -139,8 +147,8 @@ async def to_code(config):
     parent = await cg.get_variable(config[CONF_VISSLINK_ID])
     cg.add(var.set_parent(parent))
     await register_register(var, config)
-    if config[CONF_ADDRESS] == DHW_SETPOINT_ADDRESS:
-        cg.add(parent.set_dhw_setpoint_number(var))
-        if CONF_STATUS in config:
-            status = await text_sensor.new_text_sensor(config[CONF_STATUS])
-            cg.add(parent.set_dhw_status_sensor(status))
+    # v0.6/v0.7 : chaque consigne a sa transaction dédiée.
+    cg.add(parent.add_setpoint_number(var))
+    if CONF_STATUS in config:
+        status = await text_sensor.new_text_sensor(config[CONF_STATUS])
+        cg.add(parent.set_setpoint_status_sensor(var, status))

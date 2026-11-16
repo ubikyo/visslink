@@ -619,9 +619,10 @@ def test_python_and_cpp_whitelists_match(repo_root):
         for a, lo, hi in re.findall(r"\{0x([0-9A-Fa-f]{4}), 1, (\d+), (\d+)\}", cpp)
     }
     py = (repo_root / "components/visslink/number.py").read_text(encoding="utf-8")
+    block = py.partition("WRITABLE_REGISTERS = {")[2].partition("}")[0]
     py_table = {
         int(a, 16): (int(lo), int(hi))
-        for a, lo, hi in re.findall(r"0x([0-9A-Fa-f]{4}): \((\d+), (\d+)\)", py)
+        for a, lo, hi in re.findall(r"0x([0-9A-Fa-f]{4}): \((\d+), (\d+)\)", block)
     }
     assert cpp_table == WRITABLE
     assert py_table == WRITABLE
@@ -1288,6 +1289,7 @@ WRITE_FLAGS = (
     "enable_m2_mode_write",
     "enable_schedule_writes",
     "enable_dhw_setpoint_write",
+    "enable_heating_setpoint_writes",
 )
 
 
@@ -1329,7 +1331,7 @@ def test_dhw_setpoint_write_requires_enable_writes(repo_root, tmp_path):
     assert good.returncode == 0, out
     assert "DHW SETPOINT WRITE ENABLED" in out, out
     # Aucune autre autorisation n'est activée par la sienne.
-    for flag in WRITE_FLAGS[1:4]:
+    for flag in WRITE_FLAGS[1:4] + WRITE_FLAGS[5:]:
         assert f"{flag}: false" in out, flag
 
 
@@ -1354,22 +1356,22 @@ def test_dhw_limits_and_whitelist_match_cpp(repo_root):
     assert WRITABLE[0x6300][0] <= low and high <= WRITABLE[0x6300][1]
 
 
-def test_number_status_only_for_dhw_setpoint(repo_root, tmp_path):
-    def status_on(address):
-        def transform(text):
+def test_number_status_for_every_setpoint(repo_root, tmp_path):
+    """v0.7 : texte d'état facultatif pour chaque consigne (ECS et chauffage)."""
+
+    def status_on(text):
+        for address in ("0x2306", "0x2307", "0x3306", "0x3307", "0x6300"):
             old = f"    address: {address}\n"
             assert old in text
-            return text.replace(old, old + '    status:\n      name: "TEST état"\n', 1)
+            text = text.replace(
+                old, old + f'    status:\n      name: "TEST état {address}"\n', 1
+            )
+        return text
 
-        return transform
-
-    bad = _run_config(repo_root, tmp_path, status_on("0x2306"))
-    assert bad.returncode != 0, bad.stdout
-    assert "status is only available for the DHW setpoint (0x6300)" in (
-        bad.stdout + bad.stderr
-    )
-    good = _run_config(repo_root, tmp_path, status_on("0x6300"))
-    assert good.returncode == 0, good.stdout + good.stderr
+    result = _run_config(repo_root, tmp_path, status_on)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert out.count("name: TEST état 0x") == 5, out
 
 
 def test_dhw_trial_config_valid_and_without_writes(repo_root, tmp_path):
@@ -1413,7 +1415,13 @@ def test_dhw_trial_only_changes_the_dhw_number(repo_root):
 
 @pytest.mark.parametrize(
     "example",
-    [EXAMPLE, ESSAI_V05, ESSAI_BOUCLAGE, ESSAI_CONSIGNE_ECS],
+    [
+        EXAMPLE,
+        ESSAI_V05,
+        ESSAI_BOUCLAGE,
+        ESSAI_CONSIGNE_ECS,
+        "examples/iot-viessmann-essai-chauffage-v0.7.yaml",
+    ],
 )
 def test_examples_keep_all_write_flags_false(repo_root, example):
     text = (repo_root / example).read_text(encoding="utf-8")
@@ -1422,3 +1430,200 @@ def test_examples_keep_all_write_flags_false(repo_root, example):
         assert f"  {flag}: false" in active.splitlines(), (example, flag)
         assert f"{flag}: true" not in active, (example, flag)
     assert "  validated_days: []" in text
+
+
+# --- v0.7 : consignes de chauffage A1/M2 et climate du plancher M2 -----------
+
+ESSAI_CHAUFFAGE = "examples/iot-viessmann-essai-chauffage-v0.7.yaml"
+HEATING = {0x2306: (16, 23), 0x2307: (10, 20), 0x3306: (16, 22), 0x3307: (14, 20)}
+
+
+def test_heating_setpoint_writes_disabled_by_default(repo_root, tmp_path):
+    text = (repo_root / EXAMPLE).read_text(encoding="utf-8")
+    assert "  enable_heating_setpoint_writes: false\n" in text
+    result = _run_config(
+        repo_root,
+        tmp_path,
+        lambda s: _drop_first(s, "  enable_heating_setpoint_writes: false\n"),
+    )
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "enable_heating_setpoint_writes: false" in out, out
+    assert "HEATING SETPOINT WRITES ENABLED" not in out
+
+
+def test_heating_setpoint_writes_require_enable_writes(repo_root, tmp_path):
+    def heating_on(s):
+        return s.replace(
+            "enable_heating_setpoint_writes: false",
+            "enable_heating_setpoint_writes: true",
+        )
+
+    bad = _run_config(repo_root, tmp_path, heating_on)
+    assert bad.returncode != 0, bad.stdout
+    assert "enable_heating_setpoint_writes requires enable_writes: true" in (
+        bad.stdout + bad.stderr
+    )
+    good = _run_config(
+        repo_root,
+        tmp_path,
+        lambda s: heating_on(s).replace("enable_writes: false", "enable_writes: true"),
+    )
+    out = good.stdout + good.stderr
+    assert good.returncode == 0, out
+    assert "HEATING SETPOINT WRITES ENABLED" in out, out
+    for flag in WRITE_FLAGS[1:5]:  # aucune autre autorisation
+        assert f"{flag}: false" in out, flag
+    assert "DHW SETPOINT WRITE ENABLED" not in out
+
+
+def test_heating_limits_match_cpp(repo_root):
+    header = (repo_root / "components/visslink/write_guard.h").read_text(
+        encoding="utf-8"
+    )
+    cpp = {
+        int(a, 16): (int(lo), int(hi))
+        for a, lo, hi in re.findall(
+            r"\{0x([0-9A-Fa-f]{4}), (\d+), (\d+), 0x[0-9A-Fa-f]{4}, (?:true|false)\}",
+            header,
+        )
+    }
+    number_py = (repo_root / "components/visslink/number.py").read_text(
+        encoding="utf-8"
+    )
+    block = number_py.partition("HEATING_WRITE_LIMITS = {")[2].partition("}")[0]
+    py = {
+        int(a, 16): (int(lo), int(hi))
+        for a, lo, hi in re.findall(r"0x([0-9A-Fa-f]{4}): \((\d+), (\d+)\)", block)
+    }
+    assert cpp == py == HEATING
+    # Pas les mêmes limites pour les radiateurs et le plancher.
+    assert HEATING[0x2306] != HEATING[0x3306]
+    assert HEATING[0x2307] != HEATING[0x3307]
+    for address, (lo, hi) in HEATING.items():  # dans la plage documentée
+        assert WRITABLE[address][0] <= lo < hi <= WRITABLE[address][1]
+
+
+def test_heating_trial_config_valid_and_without_writes(repo_root, tmp_path):
+    result = _run_config(repo_root, tmp_path, example=ESSAI_CHAUFFAGE)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    for flag in WRITE_FLAGS:
+        assert f"{flag}: false" in out, flag
+    assert "validated_days: []" in out
+    assert "ENABLED" not in out
+    for address in ("0x2306", "0x2307", "0x3306", "0x3307", "0x898", "0x3906"):
+        assert out.count(f"address: {address}\n") == 1, address  # une seule lecture
+    assert "platform: visslink\n    name: Plancher chauffant\n" in out or (
+        "name: Plancher chauffant\n" in out
+    ), out
+    assert out.count("comfort_setpoint_id: m2_comfort_setpoint") == 1, out
+    for name in (
+        "Radiateurs - Consigne confort",
+        "Radiateurs - Consigne réduite",
+        "Plancher - Consigne confort",
+        "Plancher - Consigne réduite",
+    ):
+        assert f"name: {name}\n" in out, name  # noms de production conservés
+        assert f"name: {name} - État modification\n" in out, name
+
+
+def test_heating_trial_only_adds_reads_climate_and_status(repo_root):
+    example = _active_lines((repo_root / EXAMPLE).read_text(encoding="utf-8"))
+    trial = _active_lines((repo_root / ESSAI_CHAUFFAGE).read_text(encoding="utf-8"))
+    removed = [line for line in example.splitlines() if line not in trial.splitlines()]
+    # Bornes des number ramenées dans les limites internes ; rien d'autre.
+    assert removed == ["    max_value: 24"] * 2, removed  # A1 et M2 confort
+    added = [line for line in trial.splitlines() if line not in example.splitlines()]
+    allowed = re.compile(
+        r"^\s*(- platform: visslink|visslink_id: viessmann|climate:|"
+        r"id: (m2_room_temperature|m2_pump|m2_comfort_setpoint|m2_mode)|"
+        r'name: "(Plancher chauffant - Température ambiante \(Vitotrol\)|'
+        r"Plancher chauffant - Circulateur|Plancher chauffant|"
+        r'(Radiateurs|Plancher) - Consigne (confort|réduite) - État modification)"|'
+        r"address: 0x(0898|3906)|data_type: int16|invalid_values: \[0xFFFF\]|"
+        r"min_value: (14|22|23)|max_value: (22|23)|"
+        r"status:|comfort_setpoint_id: m2_comfort_setpoint|mode_id: m2_mode|"
+        r"current_temperature_id: m2_room_temperature|pump_id: m2_pump)$"
+    )
+    assert all(allowed.match(line) for line in added), [
+        line for line in added if not allowed.match(line)
+    ]
+
+
+def _climate_transform(**changes):
+    def transform(text):
+        for old, new in changes.items():
+            assert old in text, old
+            text = text.replace(old, new, 1)
+        return text
+
+    return transform
+
+
+@pytest.mark.parametrize(
+    "old, new, message",
+    [
+        (
+            "comfort_setpoint_id: m2_comfort_setpoint",
+            "comfort_setpoint_id: a1_comfort",
+            "comfort_setpoint_id must be the visslink number of the M2 comfort",
+        ),
+        (
+            "mode_id: m2_mode",
+            "mode_id: a1_mode",
+            "mode_id must be the visslink select of the M2 operating mode",
+        ),
+        (
+            "current_temperature_id: m2_room_temperature",
+            "current_temperature_id: m2_flow",
+            "current_temperature_id must be a room temperature, not 0x3900",
+        ),
+    ],
+)
+def test_climate_rejects_wrong_sources(repo_root, tmp_path, old, new, message):
+    def transform(text):
+        # Identifiants supplémentaires sur des entités existantes.
+        text = text.replace(
+            '    name: "Radiateurs - Consigne confort"\n',
+            '    id: a1_comfort\n    name: "Radiateurs - Consigne confort"\n',
+            1,
+        )
+        text = text.replace(
+            '    name: "Radiateurs - Mode actuel"\n',
+            '    id: a1_mode\n    name: "Radiateurs - Mode actuel"\n',
+            1,
+        )
+        text = text.replace(
+            '    name: "Température départ M2"\n',
+            '    id: m2_flow\n    name: "Température départ M2"\n',
+            1,
+        )
+        assert old in text
+        return text.replace(old, new, 1)
+
+    result = _run_config(repo_root, tmp_path, transform, example=ESSAI_CHAUFFAGE)
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, out
+    assert message in out, out
+
+
+def test_climate_optional_sources(repo_root, tmp_path):
+    def transform(text):
+        for line in (
+            "    current_temperature_id: m2_room_temperature\n",
+            "    pump_id: m2_pump\n",
+        ):
+            assert line in text
+            text = text.replace(line, "", 1)
+        return text
+
+    result = _run_config(repo_root, tmp_path, transform, example=ESSAI_CHAUFFAGE)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_production_has_no_climate(repo_root):
+    """Le climate M2 n'existe que dans la configuration d'essai."""
+    text = _active_lines((repo_root / EXAMPLE).read_text(encoding="utf-8"))
+    assert "\nclimate:" not in text
+    assert "0x0898" not in text

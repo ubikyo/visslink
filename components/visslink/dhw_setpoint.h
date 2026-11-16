@@ -21,6 +21,12 @@
 //  - rien n'est persistant : après un redémarrage de l'ESP, aucune demande
 //    ne subsiste ;
 //  - la restauration du bouclage ECS passe avant (WriteArbiter, `deferred`).
+//
+// v0.7 : même transaction pour les consignes de chauffage A1/M2 (0x2306,
+// 0x2307, 0x3306, 0x3307) : SetpointWriter(adresse). Autorisation propre
+// (enable_heating_setpoint_writes), limites internes par registre, confort
+// >= réduite du même circuit. Le comportement et les messages de la consigne
+// ECS sont inchangés (DhwSetpointWriter = SetpointWriter(0x6300)).
 
 #include <cmath>
 #include <cstdint>
@@ -41,7 +47,15 @@ struct DhwContext {
   bool has_value{false};  ///< une valeur a été lue (état du number)
   float config_min{0};    ///< bornes du number (min_value / max_value)
   float config_max{0};
+  // v0.7, consignes de chauffage :
+  bool enable_heating_setpoint_writes{false};
+  bool peer_known{false};  ///< l'autre consigne du circuit a été lue
+  uint8_t peer_value{0};
+  // v0.7, garde commune à toutes les consignes (setpoint_gate) :
+  bool other_busy{false};    ///< une autre consigne est en cours de modification
+  bool other_recent{false};  ///< une autre consigne a été écrite il y a moins de GLOBAL_SPACING_MS
 };
+using SetpointContext = DhwContext;
 
 enum class DhwState : uint8_t {
   IDLE,
@@ -77,8 +91,14 @@ inline bool boost_restore_priority(const BoostSequencer &seq) {
          s == BoostState::RECOVERY_VERIFY;
 }
 
-class DhwSetpointWriter {
+class SetpointWriter {
  public:
+  /// v0.7 : `address` = consigne ECS (défaut) ou de chauffage.
+  explicit SetpointWriter(uint16_t address = DHW_SETPOINT_ADDRESS)
+      : address_(address), heating_(find_heating_setpoint(address)) {}
+  uint16_t address() const { return this->address_; }
+  bool heating() const { return this->heating_ != nullptr; }
+
   /// Relecture préalable non obtenue dans ce délai : abandon, rien d'écrit.
   static constexpr uint32_t PRE_READ_TIMEOUT_MS = 60000;
   /// Après une écriture émise : pas de nouvelle demande avant ce délai
@@ -87,15 +107,28 @@ class DhwSetpointWriter {
 
   /// Demande venant de Home Assistant.
   DhwAction request(float value, const DhwContext &ctx, uint32_t now) {
-    const DhwPermission permission =
-        dhw_write_permitted(DHW_SETPOINT_ADDRESS, ctx.enable_writes, ctx.enable_dhw_setpoint_write);
-    if (permission == DhwPermission::WRITES_DISABLED)
-      return this->refuse_(VL_TEXT("écritures désactivées (enable_writes: false)"), dhw_permission_to_string(permission));
-    if (permission != DhwPermission::OK)
-      return this->refuse_(VL_TEXT("écriture de la consigne ECS désactivée (enable_dhw_setpoint_write: false)"),
-                           dhw_permission_to_string(permission));
+    if (this->heating_ != nullptr) {
+      const HeatingPermission permission =
+          heating_write_permitted(this->address_, ctx.enable_writes, ctx.enable_heating_setpoint_writes);
+      if (permission == HeatingPermission::WRITES_DISABLED)
+        return this->refuse_(VL_TEXT("écritures désactivées (enable_writes: false)"),
+                             heating_permission_to_string(permission));
+      if (permission != HeatingPermission::OK)
+        return this->refuse_(
+            VL_TEXT("écriture des consignes de chauffage désactivée (enable_heating_setpoint_writes: false)"),
+            heating_permission_to_string(permission));
+    } else {
+      const DhwPermission permission =
+          dhw_write_permitted(this->address_, ctx.enable_writes, ctx.enable_dhw_setpoint_write);
+      if (permission == DhwPermission::WRITES_DISABLED)
+        return this->refuse_(VL_TEXT("écritures désactivées (enable_writes: false)"),
+                             dhw_permission_to_string(permission));
+      if (permission != DhwPermission::OK)
+        return this->refuse_(VL_TEXT("écriture de la consigne ECS désactivée (enable_dhw_setpoint_write: false)"),
+                             dhw_permission_to_string(permission));
+    }
     uint8_t byte = 0;
-    const WriteCheck check = check_write_value(DHW_SETPOINT_ADDRESS, 1, value, ctx.config_min, ctx.config_max, &byte);
+    const WriteCheck check = check_write_value(this->address_, 1, value, ctx.config_min, ctx.config_max, &byte);
     if (check != WriteCheck::OK) {
       return this->refuse_(VL_TEXT("valeur ") + format_value_(value) + VL_TEXT(" hors limites (") +
                                std::to_string(this->effective_min_(ctx)) + VL_TEXT("-") +
@@ -104,14 +137,37 @@ class DhwSetpointWriter {
     }
     if (this->state_ != DhwState::IDLE) {
       return this->refuse_(VL_TEXT("modification déjà en cours (") + std::to_string(this->target_) + VL_TEXT(" °C)"),
-                           "another DHW setpoint change is in progress");
+                           this->heating_ != nullptr ? "another heating setpoint change is in progress"
+                                                     : "another DHW setpoint change is in progress");
     }
+    if (ctx.other_busy)
+      return this->refuse_(VL_TEXT("une autre consigne est en cours de modification"),
+                           "another setpoint change is in progress");
+    if (ctx.other_recent)
+      return this->refuse_(VL_TEXT("trop tôt après la modification d'une autre consigne (15 s)"),
+                           "too soon after another setpoint write");
     if (!ctx.has_value)
       return this->refuse_(VL_TEXT("consigne actuelle pas encore lue"), "current value not read yet");
     if (!ctx.link_ok)
       return this->refuse_(VL_TEXT("liaison Optolink non synchronisée"), "Optolink link not synchronized");
     if (this->has_written_ && !time_reached(now, this->written_ms_ + MIN_INTERVAL_MS))
       return this->refuse_(VL_TEXT("trop tôt après la modification précédente (30 s)"), "too soon after the previous write");
+    if (this->heating_ != nullptr) {
+      // Confort >= réduite du même circuit (dernière valeur lue de l'autre).
+      if (!ctx.peer_known)
+        return this->refuse_(this->heating_->comfort ? VL_TEXT("consigne réduite du circuit pas encore lue")
+                                                     : VL_TEXT("consigne confort du circuit pas encore lue"),
+                             "the other setpoint of the circuit is not read yet");
+      if (this->heating_->comfort && byte < ctx.peer_value)
+        return this->refuse_(VL_TEXT("confort ") + std::to_string(byte) + VL_TEXT(" °C inférieur à la réduite (") +
+                                 std::to_string(ctx.peer_value) + VL_TEXT(" °C)"),
+                             "comfort setpoint below the reduced setpoint");
+      if (!this->heating_->comfort && byte > ctx.peer_value)
+        return this->refuse_(VL_TEXT("réduite ") + std::to_string(byte) + VL_TEXT(" °C supérieure au confort (") +
+                                 std::to_string(ctx.peer_value) + VL_TEXT(" °C)"),
+                             "reduced setpoint above the comfort setpoint");
+    }
+    this->requested_ms_ = now;
     this->target_ = byte;
     this->state_ = DhwState::PRE_READ;
     this->since_ms_ = now;
@@ -148,6 +204,7 @@ class DhwSetpointWriter {
     if (this->state_ == DhwState::WRITING && verify) {
       this->has_written_ = true;
       this->written_ms_ = now;
+      this->duration_ms_ = now - this->requested_ms_;
       if (!ok) {
         // Issue inconnue : la dernière valeur confirmée reste affichée,
         // aucune nouvelle écriture ; la lecture périodique tranchera.
@@ -173,8 +230,9 @@ class DhwSetpointWriter {
     if (this->state_ == DhwState::IDLE && ok) {
       // Lecture périodique : modification faite ailleurs (panneau) ?
       if (this->has_confirmed_ && value != this->confirmed_) {
-        this->set_status_(VL_TEXT("Modifiée hors de Home Assistant (panneau ?) : ") + std::to_string(this->confirmed_) +
-                          VL_TEXT(" -> ") + std::to_string(value) + VL_TEXT(" °C"));
+        this->set_status_((this->heating_ != nullptr ? VL_TEXT("Modifiée hors de Home Assistant (panneau ou Vitotrol ?) : ")
+                                                     : VL_TEXT("Modifiée hors de Home Assistant (panneau ?) : ")) +
+                          std::to_string(this->confirmed_) + VL_TEXT(" -> ") + std::to_string(value) + VL_TEXT(" °C"));
         this->panel_changes_++;
       }
       this->confirmed_ = value;
@@ -219,6 +277,13 @@ class DhwSetpointWriter {
   /// Incrémenté à chaque changement d'état affiché (publication du texte).
   uint32_t version() const { return this->version_; }
   uint32_t panel_changes() const { return this->panel_changes_; }
+  /// Demande -> fin de la relecture de vérification (dernière écriture).
+  uint32_t last_duration_ms() const { return this->duration_ms_; }
+  /// v0.7 : une écriture a été émise par cette consigne depuis moins de
+  /// `spacing_ms` (garde commune entre consignes).
+  bool wrote_within(uint32_t now, uint32_t spacing_ms) const {
+    return this->has_written_ && !time_reached(now, this->written_ms_ + spacing_ms);
+  }
 
  protected:
   DhwAction refuse_(const std::string &why, const char *reason) {
@@ -269,15 +334,21 @@ class DhwSetpointWriter {
     snprintf(s, sizeof(s), "%.1f °C", static_cast<double>(value));
     return s;
   }
-  static int effective_min_(const DhwContext &ctx) {
-    return std::isfinite(ctx.config_min) && ctx.config_min > DHW_WRITE_MIN ? static_cast<int>(std::ceil(ctx.config_min))
-                                                                          : DHW_WRITE_MIN;
+  int effective_min_(const DhwContext &ctx) const {
+    uint8_t lo = 0, hi = 0;
+    setpoint_write_limits(this->address_, &lo, &hi);
+    return std::isfinite(ctx.config_min) && ctx.config_min > lo ? static_cast<int>(std::ceil(ctx.config_min)) : lo;
   }
-  static int effective_max_(const DhwContext &ctx) {
-    return std::isfinite(ctx.config_max) && ctx.config_max < DHW_WRITE_MAX ? static_cast<int>(std::floor(ctx.config_max))
-                                                                          : DHW_WRITE_MAX;
+  int effective_max_(const DhwContext &ctx) const {
+    uint8_t lo = 0, hi = 0;
+    setpoint_write_limits(this->address_, &lo, &hi);
+    return std::isfinite(ctx.config_max) && ctx.config_max < hi ? static_cast<int>(std::floor(ctx.config_max)) : hi;
   }
 
+  uint16_t address_;
+  const HeatingSetpoint *heating_;
+  uint32_t requested_ms_{0};
+  uint32_t duration_ms_{0};
   DhwState state_{DhwState::IDLE};
   DhwOutcome outcome_{DhwOutcome::NONE};
   uint8_t target_{0};
@@ -295,6 +366,26 @@ class DhwSetpointWriter {
   uint32_t version_{0};
   uint32_t panel_changes_{0};
 };
+
+/// v0.7 : garde commune à toutes les consignes déclarées (ECS et chauffage) :
+/// une seule modification à la fois, et GLOBAL_SPACING_MS entre deux
+/// écritures de consignes différentes. Avec la seule consigne ECS, rien ne
+/// change par rapport à la v0.6. `writers` : toutes les consignes, `self`
+/// celle qui reçoit la demande.
+static constexpr uint32_t SETPOINT_GLOBAL_SPACING_MS = 15000;
+
+template<typename Range>
+inline void setpoint_gate(const Range &writers, const SetpointWriter *self, uint32_t now, DhwContext *ctx) {
+  for (const SetpointWriter *w : writers) {
+    if (w == nullptr || w == self)
+      continue;
+    ctx->other_busy |= w->busy();
+    ctx->other_recent |= w->wrote_within(now, SETPOINT_GLOBAL_SPACING_MS);
+  }
+}
+
+/// v0.6 : nom d'origine, consigne ECS.
+using DhwSetpointWriter = SetpointWriter;
 
 }  // namespace visslink
 }  // namespace esphome
