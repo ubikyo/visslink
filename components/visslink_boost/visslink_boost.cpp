@@ -30,7 +30,7 @@ void VissLinkBoost::setup() {
     this->parent_->set_block_client(this);
   if (this->duration_ != nullptr)
     this->duration_->publish_state(visslink::BOOST_DEFAULT_DURATION_INDEX);  // 10 min après chaque démarrage
-  this->publish_();
+  this->publish_(millis());
 }
 
 void VissLinkBoost::dump_config() {
@@ -45,7 +45,7 @@ void VissLinkBoost::loop() {
   const uint32_t now = millis();
   this->dispatch_(now);
   this->refresh_display_(now);
-  this->publish_();
+  this->publish_(now);
 }
 
 void VissLinkBoost::refresh_display_(uint32_t now) {
@@ -71,10 +71,12 @@ void VissLinkBoost::refresh_display_(uint32_t now) {
   }
 }
 
-void VissLinkBoost::refuse_(const std::string &why) {
+void VissLinkBoost::refuse_(const std::string &why, uint32_t now) {
   ESP_LOGW(TAG, "Request refused: %s", why.c_str());
   this->refusal_ = VL_TEXT("Refusé : ") + why;
-  this->publish_();
+  this->refusal_until_ms_ = now + 30000;
+  this->refusal_base_ = this->sequencer_.status();
+  this->publish_(now);
 }
 
 void VissLinkBoost::press(BoostButton::Kind kind) {
@@ -82,25 +84,25 @@ void VissLinkBoost::press(BoostButton::Kind kind) {
   this->refusal_.clear();
   if (kind == BoostButton::Kind::FORGET) {
     if (!this->sequencer_.forget())
-      this->refuse_(VL_TEXT("aucune sauvegarde à oublier"));
+      this->refuse_(VL_TEXT("aucune sauvegarde à oublier"), now);
     return;
   }
   // Démarrer et restaurer écrivent dans la régulation : mêmes autorisations.
   if (this->parent_ == nullptr || !this->parent_->schedule_writes_enabled()) {
-    this->refuse_(VL_TEXT("écritures de programmation désactivées (enable_writes / enable_schedule_writes)"));
+    this->refuse_(VL_TEXT("écritures de programmation désactivées (enable_writes / enable_schedule_writes)"), now);
     return;
   }
   if (kind == BoostButton::Kind::RESTORE) {
     if (!this->sequencer_.request_restore(now))
-      this->refuse_(VL_TEXT("aucune plage temporaire ni récupération en cours"));
+      this->refuse_(VL_TEXT("aucune plage temporaire ni récupération en cours"), now);
     return;
   }
   if (!this->parent_->link_ok()) {
-    this->refuse_(VL_TEXT("liaison Optolink non synchronisée"));
+    this->refuse_(VL_TEXT("liaison Optolink non synchronisée"), now);
     return;
   }
   if (!this->parent_->writes_idle() && this->sequencer_.idle()) {
-    this->refuse_(VL_TEXT("une autre commande est en cours"));
+    this->refuse_(VL_TEXT("une autre commande est en cours"), now);
     return;
   }
   visslink::HaTime ha;
@@ -122,16 +124,16 @@ void VissLinkBoost::press(BoostButton::Kind kind) {
       ESP_LOGI(TAG, "Circulation boost requested (%u min)", duration);
       break;
     case visslink::BoostStart::BUSY:
-      this->refuse_(VL_TEXT("opération déjà en cours"));
+      this->refuse_(VL_TEXT("opération déjà en cours (minuterie non prolongée)"), now);
       break;
     case visslink::BoostStart::RECOVERY_PENDING:
-      this->refuse_(VL_TEXT("récupération nécessaire d'abord"));
+      this->refuse_(VL_TEXT("récupération nécessaire d'abord"), now);
       break;
     case visslink::BoostStart::BAD_DURATION:
-      this->refuse_(VL_TEXT("durée invalide"));
+      this->refuse_(VL_TEXT("durée invalide"), now);
       break;
     case visslink::BoostStart::RATE_LIMITED:
-      this->refuse_(VL_TEXT("trop tôt après le déclenchement précédent"));
+      this->refuse_(VL_TEXT("trop tôt après le déclenchement précédent"), now);
       break;
   }
   this->dispatch_(now);
@@ -200,7 +202,10 @@ void VissLinkBoost::on_block_write(uint16_t /*address*/, bool sent, bool acked, 
   this->dispatch_(now);  // relecture demandée aussitôt : l'arbitre reste occupé jusque-là
 }
 
-void VissLinkBoost::publish_() {
+void VissLinkBoost::publish_(uint32_t now) {
+  if (!this->refusal_.empty() &&
+      (visslink::time_reached(now, this->refusal_until_ms_) || this->sequencer_.status() != this->refusal_base_))
+    this->refusal_.clear();
   const std::string status = this->refusal_.empty() ? this->sequencer_.status() : this->refusal_;
   if (status != this->last_status_) {
     this->last_status_ = status;
@@ -219,6 +224,24 @@ void VissLinkBoost::publish_() {
   if (this->restoring_sensor_ != nullptr &&
       (!this->restoring_sensor_->has_state() || this->restoring_sensor_->state != this->sequencer_.restoring()))
     this->restoring_sensor_->publish_state(this->sequencer_.restoring());
+  // v0.7.1 : plage inscrite et temps restant, distincts de la pompe, lue à
+  // part (0x0846 : entité visslink séparée, jamais commandée ici).
+  if (this->range_sensor_ != nullptr) {
+    const std::string range = this->sequencer_.range_text();
+    if (range != this->last_range_ || !this->range_sensor_->has_state()) {
+      this->last_range_ = range;
+      this->range_sensor_->publish_state(range);
+    }
+  }
+  if (this->remaining_sensor_ != nullptr) {
+    // Minutes entières arrondies au-dessus : 10 juste après la confirmation,
+    // 1 pendant la dernière minute, 0 à la restauration.
+    const int32_t minutes = static_cast<int32_t>((this->sequencer_.remaining_s(now) + 59u) / 60u);
+    if (minutes != this->last_remaining_min_) {
+      this->last_remaining_min_ = minutes;
+      this->remaining_sensor_->publish_state(minutes);
+    }
+  }
   const bool alert = this->sequencer_.restore_alert();
   if (this->restore_sensor_ != nullptr && (!this->restore_sensor_->has_state() || this->restore_sensor_->state != alert))
     this->restore_sensor_->publish_state(alert);

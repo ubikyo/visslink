@@ -725,6 +725,30 @@ class BoostSequencer {
     this->refresh_address_ = 0;
     return address;
   }
+  /// v0.7.1 : temps restant avant la restauration automatique, en secondes :
+  /// minuterie monotone lancée à la confirmation de la plage (durée demandée
+  /// exactement). 0 hors de cette attente : aucune plage, durée écoulée,
+  /// restauration en cours ou demandée, récupération. Lecture seule.
+  uint32_t remaining_s(uint32_t now) const {
+    if (this->state_ != BoostState::ACTIVE || this->expired_ || this->retrying_ || this->restore_requested_ ||
+        time_reached(now, this->restore_at_ms_))
+      return 0;
+    return (this->restore_at_ms_ - now + 999u) / 1000u;
+  }
+  /// v0.7.1 : plage temporaire inscrite dans la programmation de la Vitotronic
+  /// (texte pour Home Assistant). Ce n'est PAS l'état de la pompe (0x0846, jamais lu ici) :
+  /// la régulation décide seule de la faire tourner pendant la plage.
+  std::string range_text() const {
+    const std::string range = hhmm_(this->record_.start_min) + VL_TEXT("-") + hhmm_(this->record_.end_min) +
+                              VL_TEXT(" (") + this->day_name_() + VL_TEXT(")");
+    if (this->active())
+      return range;  // confirmée par relecture, pas encore retirée
+    if (this->state_ == BoostState::WRITE_PENDING || this->state_ == BoostState::VERIFY_PENDING)
+      return VL_TEXT("Écriture en cours : ") + range;
+    if (this->recovery_required())
+      return range + VL_TEXT(" peut-être encore inscrite (récupération)");
+    return VL_TEXT("Aucune");
+  }
   const std::string &status() const { return this->status_; }
   const BoostRecord &record() const { return this->record_; }
   const BoostPlan &plan() const { return this->plan_; }
@@ -814,13 +838,16 @@ class BoostSequencer {
                      std::to_string(this->restore_writes_) + VL_TEXT(" écritures") + this->panel_hint_());
   }
 
-  /// Intervention à faire sur le panneau si la récupération échoue.
-  std::string panel_hint_() const {
+  const char *day_name_() const {
     static const char *const DAYS[SCHEDULE_DAYS] = {"lundi", "mardi", "mercredi", "jeudi",
                                                     "vendredi", "samedi", "dimanche"};
-    const char *day = this->record_.weekday < SCHEDULE_DAYS ? DAYS[this->record_.weekday] : "?";
+    return this->record_.weekday < SCHEDULE_DAYS ? DAYS[this->record_.weekday] : "?";
+  }
+
+  /// Intervention à faire sur le panneau si la récupération échoue.
+  std::string panel_hint_() const {
     return VL_TEXT(" ; sinon, supprimer sur le panneau la plage ") + hhmm_(this->record_.start_min) + VL_TEXT("-") +
-           hhmm_(this->record_.end_min) + VL_TEXT(" du ") + day;
+           hhmm_(this->record_.end_min) + VL_TEXT(" du ") + this->day_name_();
   }
 
   /// « , après 10 min 02 s » : durée mesurée depuis la confirmation de la

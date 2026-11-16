@@ -13,13 +13,13 @@ Procédure : docs/bouclage-ecs-v0.5.md.
 
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.components import binary_sensor, button, select, text_sensor, time
-from esphome.const import CONF_ID, CONF_TIME_ID
+from esphome.components import binary_sensor, button, select, sensor, text_sensor, time
+from esphome.const import CONF_ID, CONF_TIME_ID, UNIT_MINUTE
 
 from ..visslink import CONF_VISSLINK_ID, VissLinkComponent
 
 DEPENDENCIES = ["visslink", "time"]
-AUTO_LOAD = ["button", "select", "binary_sensor", "text_sensor"]
+AUTO_LOAD = ["button", "select", "binary_sensor", "sensor", "text_sensor"]
 
 CONF_VALIDATED_DAYS = "validated_days"
 CONF_START = "start"
@@ -30,6 +30,8 @@ CONF_ACTIVE = "active"
 CONF_RESTORE_REQUIRED = "restore_required"
 CONF_RESTORING = "restoring"
 CONF_STATUS = "status"
+CONF_RANGE = "range"
+CONF_REMAINING = "remaining"
 
 DAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 # Durées proposées, dans l'ordre de BOOST_DURATIONS (circulation_boost.h).
@@ -81,6 +83,19 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Required(CONF_STATUS): text_sensor.text_sensor_schema(
             icon="mdi:information-outline", entity_category="diagnostic"
         ),
+        # v0.7.1 (facultatifs) : plage temporaire inscrite dans la Vitotronic
+        # ("14:00-14:30 (dimanche)" ou "Aucune"), et temps restant avant la
+        # restauration (minutes, minuterie lancée à la confirmation). Ni l'un
+        # ni l'autre n'est l'état de la pompe (0x0846, lu à part, jamais écrit).
+        cv.Optional(CONF_RANGE): text_sensor.text_sensor_schema(
+            icon="mdi:calendar-range"
+        ),
+        cv.Optional(CONF_REMAINING): sensor.sensor_schema(
+            unit_of_measurement=UNIT_MINUTE,
+            icon="mdi:timer-sand",
+            accuracy_decimals=0,
+            device_class="duration",
+        ),
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -115,3 +130,9 @@ async def to_code(config):
         cg.add(var.set_restoring_sensor(restoring))
     status = await text_sensor.new_text_sensor(config[CONF_STATUS])
     cg.add(var.set_status_sensor(status))
+    if CONF_RANGE in config:
+        rng = await text_sensor.new_text_sensor(config[CONF_RANGE])
+        cg.add(var.set_range_sensor(rng))
+    if CONF_REMAINING in config:
+        remaining = await sensor.new_sensor(config[CONF_REMAINING])
+        cg.add(var.set_remaining_sensor(remaining))

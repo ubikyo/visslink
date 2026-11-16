@@ -9,6 +9,7 @@
 #include "esphome/components/binary_sensor/binary_sensor.h"
 #include "esphome/components/button/button.h"
 #include "esphome/components/select/select.h"
+#include "esphome/components/sensor/sensor.h"
 #include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/components/time/real_time_clock.h"
 #include "esphome/components/visslink/visslink.h"
@@ -72,6 +73,10 @@ class VissLinkBoost : public Component, public visslink::VissLinkBlockClient {
   void set_restore_required_sensor(binary_sensor::BinarySensor *s) { this->restore_sensor_ = s; }
   void set_restoring_sensor(binary_sensor::BinarySensor *s) { this->restoring_sensor_ = s; }
   void set_status_sensor(text_sensor::TextSensor *s) { this->status_sensor_ = s; }
+  /// v0.7.1 (facultatifs) : plage inscrite dans la Vitotronic, temps restant
+  /// avant la restauration. Affichage seulement.
+  void set_range_sensor(text_sensor::TextSensor *s) { this->range_sensor_ = s; }
+  void set_remaining_sensor(sensor::Sensor *s) { this->remaining_sensor_ = s; }
 
   void setup() override;
   void loop() override;
@@ -94,8 +99,8 @@ class VissLinkBoost : public Component, public visslink::VissLinkBlockClient {
   void dispatch_(uint32_t now);
   void refresh_display_(uint32_t now);
   bool persist_(const visslink::BoostRecord &record);
-  void publish_();
-  void refuse_(const std::string &why);
+  void publish_(uint32_t now);
+  void refuse_(const std::string &why, uint32_t now);
 
   visslink::VissLinkComponent *parent_{nullptr};
   time::RealTimeClock *clock_{nullptr};
@@ -111,7 +116,15 @@ class VissLinkBoost : public Component, public visslink::VissLinkBlockClient {
   binary_sensor::BinarySensor *restore_sensor_{nullptr};
   binary_sensor::BinarySensor *restoring_sensor_{nullptr};  ///< v0.5.2, facultatif
   text_sensor::TextSensor *status_sensor_{nullptr};
+  text_sensor::TextSensor *range_sensor_{nullptr};  ///< v0.7.1, facultatif
+  sensor::Sensor *remaining_sensor_{nullptr};       ///< v0.7.1, facultatif (min)
+  std::string last_range_;
+  int32_t last_remaining_min_{-1};
   std::string refusal_;          ///< refus avant le séquenceur (autorisations, liaison)
+  /// v0.7.1 : un refus (appui répété...) n'est affiché que 30 s, ou jusqu'au
+  /// prochain changement d'état du séquenceur : l'état réel reprend ensuite.
+  uint32_t refusal_until_ms_{0};
+  std::string refusal_base_;
   std::string last_status_;
 };
 

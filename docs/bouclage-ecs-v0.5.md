@@ -338,6 +338,67 @@ les 30 s par le séquenceur, **pendant la plage seulement**, avec les délais
 mesurés dans l'état. Elle ne déciderait de rien. À envisager seulement si
 l'historique ne suffit pas.
 
+## 5 quater. Sept jours, affichage et appuis répétés (v0.7.1)
+
+### Autorisation explicite
+
+[`iot-viessmann-ecritures-autorisees.yaml`](../examples/iot-viessmann-ecritures-autorisees.yaml)
+autorise les **six catégories d'écriture**, et le bouclage **les sept jours**
+(`validated_days` : les 7 jours).
+
+Les autres exemples ne changent pas : toutes les écritures y restent
+désactivées et `validated_days: []`.
+
+Rien n'est retiré dans le composant :
+
+- les listes blanches restent en place ;
+- les limites de température restent en place ;
+- une seule écriture et une seule modification de consigne à la fois ;
+- l'horloge est toujours recoupée avec Home Assistant ;
+- la sauvegarde en flash est faite avant l'écriture ;
+- l'écriture est vérifiée par relecture des 8 octets ;
+- la restauration n'a lieu que si le bloc relu est exactement le bloc
+  temporaire ;
+- 15 min minimum entre deux déclenchements, 8 déclenchements par jour au
+  plus.
+
+**Risque accepté :** la correspondance bloc ↔ jour n'a été observée qu'un
+dimanche (§ 3 et § 4). Sur un autre jour, si le bloc ne correspondait pas, la plage
+serait inscrite sur un autre jour, et la pompe ne tournerait pas. Le bloc
+serait quand même sauvegardé, relu et restauré à l'identique.
+
+### Trois informations distinctes dans Home Assistant
+
+| Entité | Source | Ce qu'elle dit |
+|---|---|---|
+| « Bouclage ECS — Plage inscrite » (`range`, facultative) | séquenceur | plage temporaire écrite dans la Vitotronic, par exemple `14:00-14:30 (dimanche)`, ou `Aucune`. Arrondie à la dizaine avec la marge : souvent plus longue que la durée demandée |
+| « Bouclage ECS — Temps restant » (`remaining`, facultative, en min) | minuterie monotone | minutes avant la restauration automatique, comptées depuis la confirmation de l'écriture. Vaut 10 juste après la confirmation, 1 pendant la dernière minute, puis 0 |
+| « Bouclage ECS — Pompe (état réel, 0x0846) » | `binary_sensor` visslink, 15 s | ce que fait réellement le circulateur. La régulation décide seule. Jamais écrit |
+
+Les entités existantes ne changent pas : « Plage temporaire en cours »,
+« Restauration en cours », « Restauration nécessaire » et « État de
+l'opération ».
+
+En cas de récupération, « Plage inscrite » indique « … peut-être encore
+inscrite (récupération) » : sans relecture, l'état n'est pas connu.
+
+### Durée et appuis répétés
+
+- **Restauration :** 10 min demandées donnent une restauration 10 min après
+  la confirmation de l'écriture par relecture, même si la plage inscrite
+  dure 30 min.
+- **Exemple :** une demande à 14:09:10 inscrit la plage 14:00-14:30, et la
+  restauration a lieu vers 14:19 (tests
+  `sim_v071_boost_10_min_in_a_30_min_range_restored_after_10_min` et
+  `boost_range_and_remaining_are_distinct_displays`).
+- **Appuis répétés :** un appui sur « Démarrer » pendant la plage est refusé
+  (« opération déjà en cours (minuterie non prolongée) »), quelle que soit la
+  durée choisie. La minuterie, la plage et la sauvegarde ne changent pas.
+- **Après la restauration :** un nouvel appui est refusé pendant 15 min (test
+  `boost_repeated_presses_never_extend_the_timer`).
+- **Affichage d'un refus :** il reste 30 s dans « État de l'opération », ou
+  jusqu'au changement d'état suivant. Ensuite, l'état réel réapparaît.
+
 ## 6. Coupures d'alimentation
 
 Test `boost_power_cut_after_every_action` : coupure après **chacune** des

@@ -1627,3 +1627,87 @@ def test_production_has_no_climate(repo_root):
     text = _active_lines((repo_root / EXAMPLE).read_text(encoding="utf-8"))
     assert "\nclimate:" not in text
     assert "0x0898" not in text
+
+
+# --- v0.7.1 : configuration explicite « toutes écritures autorisées » --------
+
+ECRITURES = "examples/iot-viessmann-ecritures-autorisees.yaml"
+SEVEN_DAYS = (
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+)
+
+
+def test_all_writes_example_valid_with_six_flags_and_seven_days(repo_root, tmp_path):
+    text = _active_lines((repo_root / ECRITURES).read_text(encoding="utf-8"))
+    for flag in WRITE_FLAGS:
+        assert f"  {flag}: true" in text.splitlines(), flag
+        assert f"{flag}: false" not in text, flag
+    assert f"  validated_days: [{', '.join(SEVEN_DAYS)}]" in text.splitlines()
+    result = _run_config(repo_root, tmp_path, example=ECRITURES)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    for flag in WRITE_FLAGS:
+        assert f"{flag}: true" in out, flag
+    assert "SCHEDULE BLOCK WRITES ENABLED" in out, out
+    assert "HEATING SETPOINT WRITES ENABLED" in out, out
+    for day in SEVEN_DAYS:
+        assert f"  - {day}\n" in out, day
+    # Trois affichages distincts du bouclage, et la pompe lue toutes les 15 s.
+    for name in (
+        "Bouclage ECS — Plage inscrite",
+        "Bouclage ECS — Temps restant",
+        "Bouclage ECS — Restauration en cours",
+        "Bouclage ECS — Pompe (état réel, 0x0846)",
+    ):
+        assert f"name: {name}\n" in out, name
+    assert out.count("address: 0x846\n") == 1, out
+    assert re.search(
+        r"address: 0x846\n(?:    [^\n]*\n)*?    update_interval: 15s\n", out
+    ), out
+
+
+def test_all_writes_example_only_changes_permissions_and_loop_display(repo_root):
+    """Mêmes entités, bornes et limites que l'essai v0.7 : seules les
+    autorisations, les jours et les affichages du bouclage changent."""
+    trial = _active_lines((repo_root / ESSAI_CHAUFFAGE).read_text(encoding="utf-8"))
+    full = _active_lines((repo_root / ECRITURES).read_text(encoding="utf-8"))
+    removed = [
+        re.sub(r"\s+#.*$", "", line)  # commentaire de fin de ligne
+        for line in trial.splitlines()
+        if line not in full.splitlines()
+    ]
+    assert sorted(removed) == sorted(
+        [f"  {flag}: false" for flag in WRITE_FLAGS] + ["  validated_days: []"]
+    ), removed
+    added = [line for line in full.splitlines() if line not in trial.splitlines()]
+    allowed = re.compile(
+        r"^\s+(enable_[a-z0-9_]+: true|validated_days: \[[a-z, ]+\]|"
+        r"- platform: visslink|"
+        r"name: \"Bouclage ECS — (Pompe \(état réel, 0x0846\)|Plage inscrite|"
+        r"Temps restant|Restauration en cours)\"|"
+        r"address: 0x0846|update_interval: 15s|device_class: running|"
+        r"range:|remaining:|restoring:)$"
+    )
+    assert all(allowed.match(line) for line in added), added
+
+
+def test_boost_range_and_remaining_are_optional_display(repo_root, tmp_path):
+    # Production : sans ces entités, valide (test_example_config_is_valid).
+    # Le temps restant est en minutes, la plage un texte.
+    result = _run_config(repo_root, tmp_path, example=ECRITURES)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert re.search(
+        r"remaining:\n(?:    [^\n]*\n)*?    unit_of_measurement: min\n", out
+    ), out
+    init = (repo_root / "components/visslink_boost/__init__.py").read_text(
+        encoding="utf-8"
+    )
+    assert "cv.Optional(CONF_RANGE)" in init
+    assert "cv.Optional(CONF_REMAINING)" in init

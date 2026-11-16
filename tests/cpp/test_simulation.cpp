@@ -2824,6 +2824,90 @@ TEST(sim_v05_boost_and_a1_command_serialized) {
   CHECK(b.failures.empty());
 }
 
+TEST(sim_v071_boost_10_min_in_a_30_min_range_restored_after_10_min) {
+  // 10 min demandées à 14:09:10 (heure Vitotronic) : la plage inscrite,
+  // arrondie à la dizaine avec la marge, est 14:00-14:30 (30 min). La
+  // restauration a lieu 10 min après la confirmation par relecture, vers
+  // 14:19, pas à 14:30. Appuis répétés pendant la plage : refusés, minuterie
+  // non prolongée. Pompe 0x0846 : régulation simulée (marche si l'heure est
+  // dans une plage du bloc du jour), lue toutes les 15 s, jamais écrite.
+  Bench b;
+  BoostBench x(b);
+  const size_t pump = b.add_binary(0x0846, 15 * S, 0);
+  b.boiler.registers[0x0846] = {0x00};
+  auto regulation = [&](uint32_t t) {  // la Vitotronic commande la pompe
+    ScheduleSlots slots;
+    bool on = false;
+    if (decode_schedule_slots(b.boiler.registers[0x2230].data(), SCHEDULE_BLOCK_LENGTH, &slots) == ScheduleError::NONE) {
+      const uint32_t minute = (CLOCK_BASE_S + t / 1000) / 60 % 1440;
+      for (uint8_t i = 0; i < SCHEDULE_SLOTS; i++)
+        on |= slots.used[i] && minute >= slots.start[i] && minute < slots.end[i];
+    }
+    b.boiler.registers[0x0846] = {static_cast<uint8_t>(on ? 0x01 : 0x00)};
+  };
+  auto run = [&](uint32_t from, uint32_t duration) {  // pas exacts : jamais de retour en arrière
+    for (uint32_t done = 0; done < duration;) {
+      const uint32_t chunk = std::min<uint32_t>(S, duration - done);
+      regulation(from + done);
+      run_boost(b, x.glue, from + done, chunk);
+      done += chunk;
+    }
+  };
+  const uint32_t press = 9 * MIN + 10 * S;  // 14:09:10
+  run(0, press);
+  CHECK(b.last_binary[pump] == BinaryValue::OFF);
+  CHECK(x.glue.start(10, ha_now(press), press) == "accepted");
+  uint32_t t = press, confirmed = 0;
+  while (confirmed == 0 && t < press + MIN) {
+    run_boost(b, x.glue, t, 5);
+    t += 5;
+    if (x.glue.seq.state() == BoostState::ACTIVE)
+      confirmed = t;
+  }
+  CHECK(confirmed != 0);
+  CHECK_EQ(x.glue.seq.plan().start_min, 14 * 60);
+  CHECK_EQ(x.glue.seq.plan().end_min, 14 * 60 + 30);  // plage de 30 min
+  CHECK(b.boiler.registers[0x2230] == (std::vector<uint8_t>{0x31, 0x43, 0x70, 0x73, 0xAC, 0xAD, 0xFF, 0xFF}));
+  CHECK(x.glue.seq.range_text() == "14:00-14:30 (dimanche)");
+  CHECK_EQ(x.glue.seq.remaining_s(confirmed), 600u);
+  // Appuis répétés à +1 min, +5 min, +9 min 50 s : refusés.
+  uint32_t expired = 0;
+  for (uint32_t at : {1 * MIN, 5 * MIN, 9 * MIN + 50 * S}) {
+    run(t, confirmed + at - t);
+    t = confirmed + at;
+    CHECK(x.glue.start(10, ha_now(t), t) == "refused");
+    CHECK(x.glue.start(30, ha_now(t), t) == "refused");
+    CHECK_EQ(x.glue.seq.remaining_s(t), (10 * MIN - at) / 1000);
+    CHECK(x.glue.seq.range_text() == "14:00-14:30 (dimanche)");
+    if (at == 5 * MIN)
+      CHECK(b.last_binary[pump] == BinaryValue::ON);  // la régulation fait tourner la pompe
+  }
+  CHECK_EQ(writes_to(b.boiler, 0x2230), 1);
+  // Expiration : à 10 min de la confirmation, au pas de 5 ms près.
+  while (expired == 0 && t < confirmed + 11 * MIN) {
+    regulation(t);
+    run_boost(b, x.glue, t, 5);
+    t += 5;
+    if (x.glue.seq.state() != BoostState::ACTIVE)
+      expired = t;
+  }
+  CHECK(expired >= confirmed + 10 * MIN && expired <= confirmed + 10 * MIN + 10);
+  run(t, MIN);
+  t += MIN;
+  CHECK(x.glue.seq.idle());
+  CHECK(b.boiler.registers[0x2230] == LOOP_SUNDAY);
+  CHECK(x.glue.seq.status().rfind("Programmation restaurée (vérifiée par relecture), après 10 min 0", 0) == 0);
+  CHECK(x.glue.seq.range_text() == "Aucune");
+  CHECK_EQ(x.glue.seq.remaining_s(t), 0u);
+  CHECK((CLOCK_BASE_S + t / 1000) / 60 % 1440 < 14 * 60 + 30);  // avant la fin de la plage
+  CHECK(b.last_binary[pump] == BinaryValue::OFF);                 // pompe arrêtée par la régulation
+  CHECK_EQ(writes_to(b.boiler, 0x2230), 2);
+  CHECK_EQ(writes_to(b.boiler, 0x0846), 0);
+  CHECK_EQ(b.boiler.write_frames, 2);
+  CHECK(x.glue.start(10, ha_now(t), t) == "refused");  // 15 min entre deux déclenchements
+  CHECK(b.failures.empty());
+}
+
 TEST(sim_v05_boost_refused_on_unvalidated_day_or_bad_clock) {
   {  // Jour non validé : aucune sauvegarde, aucune écriture.
     Bench b;

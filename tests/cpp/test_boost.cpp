@@ -285,6 +285,9 @@ struct Rig {
   uint32_t t0 = 1000;
   /// Instants (millis) des écritures émises.
   std::vector<uint32_t> write_times;
+  /// Date de la régulation : 2026-11-<day>, jour KW 1 = lundi ... 7 = dimanche
+  /// (v0.7.1 : les 7 jours ; dimanche 15 par défaut).
+  uint8_t day = 15, weekday_kw = 7;
 
   Rig() {
     regs[0x2230] = REAL;
@@ -301,7 +304,7 @@ struct Rig {
   }
   void set_clock(uint8_t h, uint8_t m, uint8_t s) {
     auto bcd = [](uint8_t v) { return static_cast<uint8_t>((v / 10) << 4 | (v % 10)); };
-    regs[VITO_CLOCK_ADDRESS] = {0x20, 0x26, 0x11, 0x15, 0x07, bcd(h), bcd(m), bcd(s)};
+    regs[VITO_CLOCK_ADDRESS] = {0x20, 0x26, 0x11, bcd(day), bcd(weekday_kw), bcd(h), bcd(m), bcd(s)};
   }
   /// Exécute une action ; renvoie false si aucune.
   bool step(BoostSequencer &q) {
@@ -1231,4 +1234,122 @@ TEST(boost_reboot_never_restarts_a_full_duration) {
   CHECK_EQ(write_at(r, 1), pressed);  // restauration immédiate
   CHECK(r.regs[0x2230] == REAL);
   CHECK(after.status() == "Récupération terminée : programmation restaurée (vérifiée)");
+}
+
+// --- v0.7.1 : sept jours, plage inscrite, temps restant, appuis répétés -------
+
+TEST(boost_all_seven_days_when_validated) {
+  // validated_days: les 7 jours. Pour chaque jour (2026-11-09 lundi ...
+  // 2026-11-15 dimanche), seul le bloc du jour est écrit, sauvegardé avant,
+  // relu, puis restauré à l'identique ; les autres blocs ne bougent pas.
+  for (uint8_t d = 0; d < SCHEDULE_DAYS; d++) {
+    Rig r;
+    r.day = static_cast<uint8_t>(9 + d);
+    r.weekday_kw = static_cast<uint8_t>(d + 1);
+    for (uint8_t o = 0; o < SCHEDULE_DAYS; o++)
+      r.regs[loop_block_address(o)] = REAL;
+    r.tick_clock();
+    BoostSequencer q;
+    BoostConfig cfg;
+    cfg.validated_days_mask = 0x7F;
+    q.configure(cfg);
+    q.boot(nullptr);
+    CHECK(q.start(10, ha_at(843, d), r.now) == BoostStart::ACCEPTED);
+    CHECK(r.run_until(q, [&] { return q.state() == BoostState::ACTIVE; }, 60000));
+    const uint16_t block = loop_block_address(d);
+    CHECK_EQ(q.record().address, block);
+    CHECK(r.flash_has && bytes(r.flash.original) == REAL);  // sauvegarde avant l'écriture
+    CHECK(r.trace[2] == "S" && r.trace[3] == "W" + std::to_string(block) && r.trace[4] == "R" + std::to_string(block));
+    CHECK(r.regs[block] != REAL);
+    CHECK(r.run_until(q, [&] { return q.idle(); }, 11 * 60 * 1000));
+    for (uint8_t o = 0; o < SCHEDULE_DAYS; o++)
+      CHECK(r.regs[loop_block_address(o)] == REAL);
+    CHECK_EQ(r.writes, 2);
+    CHECK(!r.flash_has);
+  }
+  // Masque sans le jour : toujours refusé, rien d'écrit.
+  Rig r;
+  r.day = 11, r.weekday_kw = 3;  // mercredi
+  r.regs[loop_block_address(2)] = REAL;
+  r.tick_clock();
+  BoostSequencer q;
+  BoostConfig cfg;
+  cfg.validated_days_mask = 0x7F & ~(1u << 2);
+  q.configure(cfg);
+  q.boot(nullptr);
+  CHECK(q.start(10, ha_at(843, 2), r.now) == BoostStart::ACCEPTED);
+  while (r.step(q)) {
+  }
+  CHECK(q.idle());
+  CHECK(q.status().rfind("Refusé : correspondance du bloc non validée pour ce jour", 0) == 0);
+  CHECK_EQ(r.writes, 0);
+}
+
+TEST(boost_range_and_remaining_are_distinct_displays) {
+  // 10 min demandées vers 21:28:30 : plage inscrite 21:20-21:50 (30 min),
+  // temps restant 10 min à la confirmation, restauration au bout de 10 min.
+  Rig r(21u * 3600 + 28 * 60 + 30, 5000);
+  r.regs[0x2230] = MORNING_ONLY;
+  BoostSequencer q;
+  q.configure(sunday_validated());
+  q.boot(nullptr);
+  CHECK(q.range_text() == "Aucune");
+  CHECK_EQ(q.remaining_s(r.now), 0u);
+  CHECK(q.start(10, ha_at(21 * 60 + 28), r.now) == BoostStart::ACCEPTED);
+  const uint32_t confirmed = r.now;  // synchrone : confirmée dans la même seconde
+  CHECK(r.run_until(q, [&] { return q.state() == BoostState::ACTIVE; }, 60000));
+  CHECK_EQ(r.now, confirmed);
+  CHECK(q.range_text() == "21:20-21:50 (dimanche)");
+  CHECK_EQ(q.remaining_s(r.now), 600u);
+  r.run(q, 5 * 60 * 1000);
+  CHECK_EQ(q.remaining_s(r.now), 300u);
+  CHECK(q.range_text() == "21:20-21:50 (dimanche)");  // la plage, elle, ne change pas
+  r.run(q, 299 * 1000);
+  CHECK_EQ(q.remaining_s(r.now), 1u);
+  CHECK(r.run_until(q, [&] { return q.idle(); }, 5000));
+  CHECK_EQ(write_at(r, 1) - confirmed, 10u * 60 * 1000);
+  CHECK(q.range_text() == "Aucune");
+  CHECK_EQ(q.remaining_s(r.now), 0u);
+  // Fin anticipée (bouton) : temps restant à 0 immédiatement.
+  Rig s;
+  BoostSequencer p;
+  confirm(s, p, 10, 843);
+  CHECK_EQ(p.remaining_s(s.now), 600u);
+  CHECK(p.request_restore(s.now));
+  CHECK_EQ(p.remaining_s(s.now), 0u);
+  p.poll(s.now);  // prise en compte au passage suivant : restauration en cours
+  CHECK(p.restoring());
+  CHECK(p.range_text() == "14:00-14:20 (dimanche)");  // encore inscrite jusqu'à la relecture
+  // Récupération (redémarrage pendant la plage) : plage signalée « peut-être
+  // encore inscrite », aucun temps restant.
+  Rig t;
+  BoostSequencer before;
+  confirm(t, before, 10, 843);
+  BoostSequencer after;
+  after.configure(sunday_validated());
+  after.boot(&t.flash);
+  CHECK(after.range_text() == "14:00-14:20 (dimanche) peut-être encore inscrite (récupération)");
+  CHECK_EQ(after.remaining_s(t.now), 0u);
+}
+
+TEST(boost_repeated_presses_never_extend_the_timer) {
+  // Appuis répétés pendant la plage (et juste avant l'expiration) : refusés,
+  // la minuterie n'est ni relancée ni prolongée, aucune écriture de plus.
+  Rig r;
+  BoostSequencer q;
+  const uint32_t confirmed = confirm(r, q, 10, 843);
+  const BoostRecord record = q.record();
+  for (uint32_t at : {1u, 60u, 5u * 60, 9u * 60 + 59}) {
+    r.run(q, (confirmed + at * 1000) - r.now);
+    for (uint16_t d : BOOST_DURATIONS)  // même avec une durée plus longue
+      CHECK(q.start(d, ha_at(843 + at / 60), r.now) == BoostStart::BUSY);
+    CHECK_EQ(q.remaining_s(r.now), 600u - at);
+    CHECK(std::memcmp(&q.record(), &record, sizeof(record)) == 0);  // même plage, même sauvegarde
+  }
+  CHECK(r.run_until(q, [&] { return q.idle(); }, 5000));
+  CHECK_EQ(r.writes, 2);
+  CHECK_EQ(write_at(r, 1) - confirmed, 10u * 60 * 1000);
+  // Juste après : 15 min minimum entre deux déclenchements.
+  CHECK(q.start(10, ha_at(853), r.now) == BoostStart::RATE_LIMITED);
+  CHECK_EQ(r.writes, 2);
 }
