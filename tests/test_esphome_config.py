@@ -4,6 +4,7 @@ L'exemple est copié dans un dossier temporaire avec des secrets fictifs génér
 à la volée : aucun identifiant n'est écrit dans le dépôt.
 """
 
+import ast
 import base64
 import os
 import re
@@ -1176,3 +1177,103 @@ def test_no_write_path_for_loop_pump_0x0846(repo_root):
         for line in path.read_text(encoding="utf-8").splitlines():
             if "0846" in line:
                 assert "jamais" in line, f"{path}: {line}"
+
+
+# --- v0.5.2 : configuration d'essai matériel du bouclage --------------------
+
+ESSAI_BOUCLAGE = "examples/iot-viessmann-essai-bouclage-v0.5.2.yaml"
+
+
+def test_loop_hardware_trial_valid_and_without_writes(repo_root, tmp_path):
+    result = _run_config(repo_root, tmp_path, example=ESSAI_BOUCLAGE)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    for flag in (
+        "enable_writes",
+        "enable_mode_writes",
+        "enable_m2_mode_write",
+        "enable_schedule_writes",
+    ):
+        assert f"{flag}: false" in out, flag
+    assert "validated_days: []" in out
+    assert "ENABLED" not in out
+    # 0x0846 déclaré une seule fois, en octet brut lu toutes les 15 s.
+    assert out.count("address: 0x846\n") == 1, out
+    assert re.search(
+        r"address: 0x846\n(?:    [^\n]*\n)*?    update_interval: 15s\n", out
+    ), out
+    assert "name: Bouclage ECS — Restauration en cours" in out, out
+
+
+def test_loop_hardware_trial_only_adds_read_entities(repo_root):
+    example = _active_lines((repo_root / EXAMPLE).read_text(encoding="utf-8"))
+    trial = _active_lines((repo_root / ESSAI_BOUCLAGE).read_text(encoding="utf-8"))
+    removed = [line for line in example.splitlines() if line not in trial.splitlines()]
+    assert removed == [], removed
+    added = [line for line in trial.splitlines() if line not in example.splitlines()]
+    allowed = re.compile(
+        r"^\s+(- platform: visslink|visslink_id: viessmann|"
+        r"name: \"TEST — Bouclage ECS brut\"|address: 0x0846|"
+        r"data_type: uint8|update_interval: 15s|accuracy_decimals: 0|"
+        r"entity_category: diagnostic|restoring:|"
+        r"name: \"Bouclage ECS — Restauration en cours\")$"
+    )
+    assert all(allowed.match(line) for line in added), added
+
+
+def test_production_keeps_loop_pump_at_60s(repo_root):
+    """Production : 0x0846 seulement en commentaire, à 60 s ; 15 s est
+    réservé à l'essai matériel."""
+    text = (repo_root / EXAMPLE).read_text(encoding="utf-8")
+    assert "0x0846" not in _active_lines(text)
+    intervals = re.findall(
+        r"address: 0x0846\n(?:  #   (?!- platform)[^\n]*\n)*?  #   update_interval: (\S+)",
+        text,
+    )
+    assert intervals and set(intervals) == {"60s"}, intervals
+
+
+def test_loop_pump_0x0846_never_writable_in_examples(repo_root):
+    """Aucune entité inscriptible (number, select) sur 0x0846 dans les
+    exemples : seulement sensor / binary_sensor."""
+    for path in sorted((repo_root / "examples").glob("*.yaml")):
+        if path.name == "secrets.yaml":
+            continue
+        text = _active_lines(path.read_text(encoding="utf-8"))
+        section = None
+        for line in text.splitlines():
+            if not line.startswith(" "):
+                section = line.rstrip(":")
+            if "address: 0x0846" in line:
+                assert section in ("sensor", "binary_sensor"), (path, section)
+
+
+def test_boost_default_duration_is_10_min(repo_root):
+    """Durée proposée après chaque redémarrage de l'ESP : 10 min."""
+    init = (repo_root / "components/visslink_boost/__init__.py").read_text(
+        encoding="utf-8"
+    )
+    options = re.search(r"DURATION_OPTIONS = (\[[^\]]*\])", init).group(1)
+    default = re.search(r'DEFAULT_DURATION = "([^"]*)"', init).group(1)
+    assert default == "10 min"
+    header = (repo_root / "components/visslink/circulation_boost.h").read_text(
+        encoding="utf-8"
+    )
+    index = int(re.search(r"BOOST_DEFAULT_DURATION_INDEX = (\d+);", header).group(1))
+    assert ast.literal_eval(options)[index] == default
+    cpp = (repo_root / "components/visslink_boost/visslink_boost.cpp").read_text(
+        encoding="utf-8"
+    )
+    assert "publish_state(visslink::BOOST_DEFAULT_DURATION_INDEX)" in cpp
+
+
+def test_boost_restoring_entity_is_optional(repo_root, tmp_path):
+    # La production n'a pas l'entité et reste valide (test_example_*) ; la
+    # retirer de l'essai matériel le laisse valide aussi.
+    def drop(text):
+        old = '  restoring:\n    name: "Bouclage ECS — Restauration en cours"\n'
+        assert old in text
+        return text.replace(old, "")
+
+    result = _run_config(repo_root, tmp_path, drop, example=ESSAI_BOUCLAGE)
+    assert result.returncode == 0, result.stdout + result.stderr

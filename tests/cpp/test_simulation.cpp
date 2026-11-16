@@ -2437,12 +2437,13 @@ TEST(sim_v05_boost_end_to_end) {
     block_before |= log[i] == std::pair<uint8_t, uint16_t>{0xF7, 0x2230} && clock_before;
   }
   CHECK(clock_before && block_before);
-  // Fin de plage 14:20, restauration vers 14:22.
+  // v0.5.2 : restauration 10 min après la confirmation (vers 14:12), et non
+  // plus à la fin de la plage 14:20 + 2 min.
   run_boost(b, x.glue, BOOT + MIN, 25 * MIN);
   CHECK(x.glue.seq.idle());
   CHECK(b.boiler.registers[0x2230] == LOOP_SUNDAY);
   CHECK(!x.glue.flash_has);
-  CHECK(x.glue.seq.status() == "Programmation restaurée (vérifiée par relecture)");
+  CHECK(x.glue.seq.status().rfind("Programmation restaurée (vérifiée par relecture), après 10 min 0", 0) == 0);
   CHECK_EQ(writes_to(b.boiler, 0x2230), 2);
   CHECK_EQ(b.boiler.write_frames, 2);  // rien d'autre : ni 0x0846, ni les autres programmes
   CHECK_EQ(writes_to(b.boiler, 0x0846), 0);
@@ -3058,9 +3059,9 @@ TEST(sim_v051_boost_display_follows_write_and_restore) {
       run_boost(b, x.glue, t, 5), t += 5;
     CHECK(format_day(b.weeks[loop].days[6]) == temporary);
     CHECK(t - active_at <= 2 * (post + 1000));
-    // Restauration automatique en fin de plage.
+    // Restauration automatique à la fin de la durée demandée.
     run_until(b, x.glue, t, BoostState::IDLE, 40 * MIN);
-    CHECK(x.glue.seq.status() == "Programmation restaurée (vérifiée par relecture)");
+    CHECK(x.glue.seq.status().rfind("Programmation restaurée (vérifiée par relecture)", 0) == 0);
     run_boost(b, x.glue, t, 30 * S);
     t += 30 * S;
     CHECK(format_day(b.weeks[loop].days[6]) == day_text(LOOP_SUNDAY));
@@ -3229,4 +3230,184 @@ TEST(sim_v051_trial_config_eco_party_60s_load) {
                   b60.max_gap_ms[c60.burner] / 1000.0, b30.max_gap_ms[c30.burner] / 1000.0,
                   b60.boiler.requests / 390.0, b30.boiler.requests / 390.0);
   }
+}
+
+// --- v0.5.2 : 10 min demandées = 10 min de plage, au niveau des trames KW ------
+
+namespace {
+
+/// Avance par pas de 100 ms jusqu'à `done` (au plus `limit`) ; renvoie l'instant.
+template<typename F> uint32_t run_boost_until(Bench &b, BoostGlue &g, uint32_t t, uint32_t limit, F done) {
+  const uint32_t end = t + limit;
+  while (t < end && !done()) {
+    run_boost(b, g, t, 100);
+    t += 100;
+  }
+  return t;
+}
+
+}  // namespace
+
+TEST(sim_v052_boost_restored_after_requested_duration) {
+  // Durée mesurée sur la régulation simulée : de la plage temporaire
+  // confirmée par relecture au bloc d'origine réécrit. v0.5 : fin de plage
+  // 14:20 + 2 min ; v0.5.2 : 10 min après la confirmation (~14:12).
+  for (uint32_t post : {2000u, 3000u, 4000u}) {
+    for (uint16_t d : BOOST_DURATIONS) {
+      Bench b;
+      b.boiler.post_response_delay_ms = post;
+      BoostBench x(b);
+      run_boost(b, x.glue, 0, BOOT);
+      CHECK(x.glue.start(d, ha_now(BOOT), BOOT) == "accepted");
+      const uint32_t confirmed =
+          run_boost_until(b, x.glue, BOOT, MIN, [&] { return x.glue.seq.state() == BoostState::ACTIVE; });
+      CHECK(x.glue.seq.state() == BoostState::ACTIVE);
+      const std::vector<uint8_t> temporary = b.boiler.registers[0x2230];
+      CHECK(temporary != LOOP_SUNDAY);
+      // Jamais avant la durée demandée.
+      run_boost(b, x.glue, confirmed, d * MIN - S);
+      CHECK(b.boiler.registers[0x2230] == temporary);
+      CHECK_EQ(writes_to(b.boiler, 0x2230), 1);
+      // Bloc d'origine réécrit peu après l'expiration (relecture + écriture).
+      const uint32_t restored = run_boost_until(b, x.glue, confirmed + d * MIN - S, MIN,
+                                                [&] { return b.boiler.registers[0x2230] == LOOP_SUNDAY; });
+      CHECK(b.boiler.registers[0x2230] == LOOP_SUNDAY);
+      const uint32_t lasted = restored - confirmed;
+      CHECK(lasted >= d * MIN);
+      CHECK(lasted <= d * MIN + 3 * post + 2 * S);  // à la précision des échanges KW près
+      // Toujours avant la fin de la plage programmée (horloge Vitotronic).
+      CHECK(CLOCK_BASE_S + restored / 1000 < x.glue.seq.record().end_min * 60u);
+      run_boost(b, x.glue, restored, MIN);
+      CHECK(x.glue.seq.idle());
+      CHECK(!x.glue.flash_has);
+      CHECK_EQ(writes_to(b.boiler, 0x2230), 2);
+      CHECK_EQ(writes_to(b.boiler, 0x0846), 0);
+      CHECK(b.failures.empty());
+      if (report_enabled())
+        std::printf("  resynchro %u s, %2u min : plage %.1f s (confirmée %.1f s, restaurée %.1f s)\n",
+                    static_cast<unsigned>(post / 1000), static_cast<unsigned>(d), lasted / 1000.0,
+                    confirmed / 1000.0, restored / 1000.0);
+      if (vltest::failures() > 0)
+        std::printf("    post=%u durée=%u lasted=%u\n", static_cast<unsigned>(post), static_cast<unsigned>(d),
+                    static_cast<unsigned>(lasted));
+    }
+  }
+}
+
+TEST(sim_v052_boost_link_lost_at_expiry_then_restored) {
+  // Interface débranchée de 9 à 14 min (4 min après l'expiration, dans la
+  // fenêtre automatique de 15 min) : restauration en cours, pas d'alerte,
+  // aucune écriture à l'aveugle ; restauration après le rebranchement,
+  // précédée d'une relecture.
+  Bench b;
+  BoostBench x(b);
+  run_boost(b, x.glue, 0, BOOT);
+  x.glue.start(10, ha_now(BOOT), BOOT);
+  const uint32_t confirmed =
+      run_boost_until(b, x.glue, BOOT, MIN, [&] { return x.glue.seq.state() == BoostState::ACTIVE; });
+  run_boost(b, x.glue, confirmed, 9 * MIN);
+  b.boiler.connected = false;
+  run_boost(b, x.glue, confirmed + 9 * MIN, 5 * MIN);
+  CHECK(x.glue.seq.restoring());
+  CHECK(!x.glue.seq.restore_alert());
+  CHECK(!x.glue.seq.recovery_required());
+  CHECK_EQ(writes_to(b.boiler, 0x2230), 1);
+  CHECK(x.glue.flash_has);
+  b.boiler.connected = true;
+  const uint32_t back = confirmed + 14 * MIN;
+  const uint32_t restored =
+      run_boost_until(b, x.glue, back, 2 * MIN, [&] { return b.boiler.registers[0x2230] == LOOP_SUNDAY; });
+  CHECK(b.boiler.registers[0x2230] == LOOP_SUNDAY);
+  CHECK(restored - back <= 45 * S);
+  run_boost(b, x.glue, restored, MIN);
+  CHECK(x.glue.seq.idle());
+  CHECK(!x.glue.seq.restore_alert());
+  CHECK(!x.glue.seq.restoring());
+  CHECK(!x.glue.flash_has);
+  CHECK_EQ(writes_to(b.boiler, 0x2230), 2);
+  CHECK_EQ(writes_to(b.boiler, 0x0846), 0);
+}
+
+TEST(sim_v052_boost_link_lost_beyond_window_requires_manual_recovery) {
+  // Interface débranchée de 9 à 30 min : relectures pendant 15 min après
+  // l'expiration, puis récupération manuelle. Rebranchée ensuite : aucune
+  // écriture automatique ; le bouton « Restaurer » rétablit le bloc.
+  Bench b;
+  BoostBench x(b);
+  run_boost(b, x.glue, 0, BOOT);
+  x.glue.start(10, ha_now(BOOT), BOOT);
+  const uint32_t confirmed =
+      run_boost_until(b, x.glue, BOOT, MIN, [&] { return x.glue.seq.state() == BoostState::ACTIVE; });
+  run_boost(b, x.glue, confirmed, 9 * MIN);
+  b.boiler.connected = false;
+  const uint32_t recovery = run_boost_until(b, x.glue, confirmed + 9 * MIN, 30 * MIN,
+                                            [&] { return x.glue.seq.recovery_required(); });
+  CHECK(x.glue.seq.recovery_required());
+  // Fin de la durée + 15 min, à la durée d'une relecture KW près.
+  CHECK(recovery >= confirmed + 25 * MIN);
+  CHECK(recovery <= confirmed + 25 * MIN + 30 * S);
+  CHECK(x.glue.flash_has);
+  b.boiler.connected = true;
+  run_boost(b, x.glue, recovery, H);
+  CHECK_EQ(writes_to(b.boiler, 0x2230), 1);
+  CHECK(b.boiler.registers[0x2230] == LOOP_SUNDAY_BOOST);
+  CHECK(x.glue.seq.restore_alert());
+  CHECK(x.glue.restore(recovery + H));
+  run_boost(b, x.glue, recovery + H, 2 * MIN);
+  CHECK(x.glue.seq.idle());
+  CHECK(!x.glue.seq.restore_alert());
+  CHECK(b.boiler.registers[0x2230] == LOOP_SUNDAY);
+  CHECK(!x.glue.flash_has);
+  CHECK_EQ(writes_to(b.boiler, 0x0846), 0);
+}
+
+TEST(sim_v052_boost_no_alert_during_normal_restore) {
+  // Resynchro lente (4 s) et commande A1 au moment de l'expiration : la
+  // restauration attend le bus, sans jamais lever l'alerte.
+  Bench b;
+  b.boiler.post_response_delay_ms = 4000;
+  BoostBench x(b);
+  run_boost(b, x.glue, 0, BOOT);
+  x.glue.start(10, ha_now(BOOT), BOOT);
+  const uint32_t confirmed =
+      run_boost_until(b, x.glue, BOOT, MIN, [&] { return x.glue.seq.state() == BoostState::ACTIVE; });
+  run_boost(b, x.glue, confirmed, 10 * MIN - 2 * S);
+  CHECK(b.request_mode(x.modes.a1, ECS_ONLY, confirmed + 10 * MIN - 2 * S) == "queued");
+  bool alert = false, restoring = false;
+  uint32_t t = confirmed + 10 * MIN - 2 * S;
+  while (t < confirmed + 12 * MIN) {
+    run_boost(b, x.glue, t, 100);
+    t += 100;
+    alert |= x.glue.seq.restore_alert();
+    restoring |= x.glue.seq.restoring();
+  }
+  CHECK(restoring);
+  CHECK(!alert);
+  CHECK(x.glue.seq.idle());
+  CHECK(b.boiler.registers[0x2230] == LOOP_SUNDAY);
+  CHECK_EQ(writes_to(b.boiler, 0x2301), 1);
+  CHECK(b.failures.empty());
+}
+
+TEST(sim_v052_boost_reboot_during_restore_window_writes_nothing) {
+  Bench b;
+  BoostBench x(b);
+  run_boost(b, x.glue, 0, BOOT);
+  x.glue.start(10, ha_now(BOOT), BOOT);
+  const uint32_t confirmed =
+      run_boost_until(b, x.glue, BOOT, MIN, [&] { return x.glue.seq.state() == BoostState::ACTIVE; });
+  run_boost(b, x.glue, confirmed, 9 * MIN);
+  b.boiler.connected = false;
+  run_boost(b, x.glue, confirmed + 9 * MIN, 4 * MIN);
+  CHECK(x.glue.seq.restoring());
+  const uint32_t t = confirmed + 13 * MIN;
+  b.reboot(t);
+  x.glue.boot();
+  b.boiler.connected = true;
+  b.boiler_only(t, 5 * S);
+  run_boost(b, x.glue, t + 5 * S, H);
+  CHECK(x.glue.seq.recovery_required());
+  CHECK(x.glue.seq.restore_alert());
+  CHECK_EQ(writes_to(b.boiler, 0x2230), 1);  // aucune écriture automatique
+  CHECK(x.glue.flash_has);
 }

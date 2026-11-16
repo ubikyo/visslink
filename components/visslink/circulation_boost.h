@@ -19,6 +19,9 @@
 //  - jour accepté seulement si sa correspondance avec le bloc a été validée ;
 //  - sauvegarde persistante et vérifiée AVANT la première écriture ;
 //  - relecture et comparaison exacte des 8 octets après chaque écriture ;
+//  - v0.5.2 : durée mesurée par une minuterie monotone (millis()), lancée à
+//    la confirmation de la plage par relecture ; la restauration a lieu à son
+//    expiration, sans attendre la fin de la plage (arrondie à la dizaine) ;
 //  - restauration seulement si le bloc relu est exactement le bloc temporaire
 //    (une modification faite depuis le panneau n'est jamais écrasée) ;
 //  - aucune écriture réémise à l'aveugle ; état indéterminé -> récupération
@@ -57,12 +60,17 @@ inline std::string progmem_string(PGM_P text) {
 static constexpr uint16_t LOOP_SCHEDULE_MONDAY = 0x2200;
 static constexpr uint16_t BOOST_DURATIONS[] = {10, 20, 30};  ///< minutes
 static constexpr size_t BOOST_DURATION_COUNT = sizeof(BOOST_DURATIONS) / sizeof(BOOST_DURATIONS[0]);
+/// v0.5.2 : durée proposée au démarrage de l'ESP (10 min), jamais restaurée.
+static constexpr size_t BOOST_DEFAULT_DURATION_INDEX = 0;
 /// Marge ajoutée à la durée demandée : délai entre la lecture de l'horloge et
 /// la prise en compte de l'écriture (attente du 0x05, relecture...). Avec
 /// elle, la plage restante est d'au moins la durée demandée.
+///
+/// v0.5.2 : la plage n'est qu'une fenêtre qui contient l'heure courante et
+/// couvre la durée. Sa fin (arrondie à la dizaine) ne décide plus de rien :
+/// la restauration a lieu quand la durée demandée est écoulée depuis la
+/// confirmation de la plage (minuterie monotone, BoostSequencer).
 static constexpr uint32_t BOOST_MARGIN_S = 120;
-/// Délai après la fin de plage avant de tenter la restauration.
-static constexpr uint32_t BOOST_RESTORE_DELAY_S = 120;
 /// Dernière fin de plage acceptée : pas de 24:00 (0xC0 jamais observé sur
 /// cette chaudière) ni de plage traversant minuit.
 static constexpr uint16_t BOOST_LAST_END_MIN = 23 * 60 + 50;
@@ -133,7 +141,6 @@ struct BoostPlan {
   uint16_t start_min{0};     ///< début de la plage ajoutée
   uint16_t end_min{0};       ///< fin de la plage ajoutée
   uint8_t slot{0};           ///< emplacement de la plage ajoutée dans le bloc trié
-  uint32_t restore_at_s{0};  ///< seconde du jour (Vitotronic) où restaurer
   uint16_t remaining_min{0}; ///< ALREADY_ACTIVE : minutes restantes dans la plage
 };
 
@@ -215,7 +222,6 @@ inline PlanResult plan_boost(const VitoClock &clock, const uint8_t *block, uint1
     return PlanResult::INVALID_BLOCK;
   plan.start_min = start;
   plan.end_min = end;
-  plan.restore_at_s = end * 60u + BOOST_RESTORE_DELAY_S;
   *out = plan;
   return PlanResult::OK;
 }
@@ -285,8 +291,7 @@ enum class BoostState : uint8_t {
   BACKUP_PENDING,    ///< sauvegarde persistante en cours (aucune écriture avant)
   WRITE_PENDING,     ///< écriture du bloc temporaire
   VERIFY_PENDING,    ///< relecture après écriture
-  ACTIVE,            ///< plage temporaire confirmée, attente de la fin
-  RESTORE_CLOCK,     ///< fin de plage : lecture de l'horloge
+  ACTIVE,            ///< plage temporaire confirmée, minuterie en cours
   RESTORE_READ,      ///< relecture avant restauration
   RESTORE_WRITE,     ///< écriture du bloc d'origine
   RESTORE_VERIFY,    ///< relecture après restauration
@@ -313,8 +318,6 @@ inline const char *boost_state_to_string(BoostState s) {
       return "VERIFY_PENDING";
     case BoostState::ACTIVE:
       return "ACTIVE";
-    case BoostState::RESTORE_CLOCK:
-      return "RESTORE_CLOCK";
     case BoostState::RESTORE_READ:
       return "RESTORE_READ";
     case BoostState::RESTORE_WRITE:
@@ -349,8 +352,17 @@ struct BoostConfig {
   uint8_t validated_days_mask{0};       ///< bit n : bloc du jour n validé (0 = lundi)
   uint32_t min_interval_ms{15 * 60000};  ///< entre deux déclenchements
   uint8_t max_per_day{8};               ///< déclenchements par jour (date Vitotronic)
-  uint8_t restore_attempts{3};          ///< tentatives de restauration (relues à chaque fois)
+  /// Écritures de restauration émises au plus (chacune précédée d'une
+  /// relecture) avant de conclure « récupération nécessaire ».
+  uint8_t restore_attempts{3};
+  /// Après une écriture de restauration émise mais non appliquée.
   uint32_t restore_retry_ms{2 * 60000};
+  /// v0.5.2 : après un échec de communication (relecture impossible, trame
+  /// non émise) : nouvelle relecture 30 s plus tard...
+  uint32_t link_retry_ms{30000};
+  /// ... pendant au plus 15 min après la fin de la durée. Au-delà :
+  /// récupération manuelle (RECOVERY_REQUIRED), sauvegarde conservée.
+  uint32_t link_retry_window_ms{15 * 60000};
 };
 
 /// Heure de Home Assistant au moment de la demande (recoupement).
@@ -368,7 +380,8 @@ class BoostSequencer {
 
   /// Au démarrage de l'ESP : sauvegarde lue en flash (ou nullptr). Une
   /// sauvegarde valide = opération incomplète : récupération manuelle, aucune
-  /// écriture automatique.
+  /// écriture automatique. Le temps déjà écoulé est inconnu (millis() repart
+  /// de zéro) : aucune durée n'est jamais relancée.
   void boot(const BoostRecord *record) {
     if (record != nullptr && boost_record_valid(*record)) {
       this->record_ = *record;
@@ -376,7 +389,7 @@ class BoostSequencer {
       this->enter_(BoostState::RECOVERY_REQUIRED,
                    VL_TEXT("Récupération nécessaire : opération interrompue sur ") + this->block_name_() +
                        VL_TEXT(" (origine ") + hex_block(record->original) + VL_TEXT(", temporaire ") +
-                       hex_block(record->temporary) + VL_TEXT(")"));
+                       hex_block(record->temporary) + VL_TEXT(")") + this->panel_hint_());
     } else {
       this->enter_(BoostState::IDLE, VL_TEXT("Inactif"));
     }
@@ -394,6 +407,9 @@ class BoostSequencer {
     this->duration_ = duration_min;
     this->ha_ = ha;
     this->restore_requested_ = false;
+    this->retrying_ = false;
+    this->expired_ = false;
+    this->restore_writes_ = 0;
     this->refresh_address_ = 0;  // la nouvelle opération en demandera une à sa fin
     this->enter_(BoostState::READ_CLOCK, VL_TEXT("Lecture de l'horloge de la Vitotronic"));
     return BoostStart::ACCEPTED;
@@ -431,7 +447,6 @@ class BoostSequencer {
       return a;
     switch (this->state_) {
       case BoostState::READ_CLOCK:
-      case BoostState::RESTORE_CLOCK:
         return this->emit_read_(VITO_CLOCK_ADDRESS, VITO_CLOCK_LENGTH);
       case BoostState::READ_BLOCK:
         return this->emit_read_(loop_block_address(this->clock_.weekday), SCHEDULE_BLOCK_LENGTH);
@@ -463,11 +478,20 @@ class BoostSequencer {
       case BoostState::RECOVERY_WRITE:
         return this->emit_write_(this->record_.original);
       case BoostState::ACTIVE:
+        // Minuterie monotone : différence signée, correcte au débordement de
+        // millis() (durées de quelques minutes).
         if (time_reached(now, this->restore_at_ms_)) {
-          if (this->restore_requested_) {
+          if (!this->expired_) {
+            // Fin de la durée (ou bouton) : début de la fenêtre automatique.
+            this->expired_ = true;
+            this->expired_ms_ = now;
+          }
+          if (this->retrying_) {
+            this->enter_(BoostState::RESTORE_READ, VL_TEXT("Restauration en cours : nouvelle relecture de ") + this->block_name_());
+          } else if (this->restore_requested_) {
             this->enter_(BoostState::RESTORE_READ, VL_TEXT("Restauration demandée : relecture de ") + this->block_name_());
           } else {
-            this->enter_(BoostState::RESTORE_CLOCK, VL_TEXT("Fin de plage : lecture de l'horloge"));
+            this->enter_(BoostState::RESTORE_READ, VL_TEXT("Durée écoulée : relecture de ") + this->block_name_());
           }
           return this->poll(now);
         }
@@ -491,14 +515,24 @@ class BoostSequencer {
       case BoostState::VERIFY_PENDING:
         if (!ok || length != SCHEDULE_BLOCK_LENGTH) {
           this->enter_(BoostState::RECOVERY_REQUIRED,
-                       VL_TEXT("Récupération nécessaire : relecture après écriture impossible (état indéterminé)"));
+                       VL_TEXT("Récupération nécessaire : relecture après écriture impossible (état indéterminé)") +
+                           this->panel_hint_());
         } else if (std::memcmp(data, this->record_.temporary, SCHEDULE_BLOCK_LENGTH) == 0) {
-          this->restore_at_ms_ = this->clock_ms_ + (this->plan_.restore_at_s - this->clock_.second_of_day()) * 1000u;
-          this->attempts_ = 0;
+          // Plage confirmée : la minuterie part maintenant, pour la durée
+          // demandée exactement (la fin de plage ne compte plus).
+          this->timer_start_ms_ = now;
+          this->restore_at_ms_ = now + static_cast<uint32_t>(this->duration_) * 60000u;
+          this->restore_writes_ = 0;
+          this->retrying_ = false;
+          this->expired_ = false;
           this->refresh_address_ = this->record_.address;  // plage temporaire confirmée
-          this->enter_(BoostState::ACTIVE, VL_TEXT("Bouclage programmé ") + hhmm_(this->plan_.start_min) + VL_TEXT("-") +
-                                               hhmm_(this->plan_.end_min) + VL_TEXT(" (restauration vers ") +
-                                               hhmm_(this->plan_.restore_at_s / 60u) + VL_TEXT(")"));
+          // Heure d'arrêt estimée (horloge Vitotronic), pour l'affichage seulement.
+          const uint32_t stop_s =
+              this->clock_.second_of_day() + (now - this->clock_ms_) / 1000u + this->duration_ * 60u;
+          this->enter_(BoostState::ACTIVE, VL_TEXT("Bouclage en cours : ") + std::to_string(this->duration_) +
+                                               VL_TEXT(" min, arrêt vers ") + hhmm_((stop_s + 30u) / 60u % 1440u) +
+                                               VL_TEXT(" (plage ") + hhmm_(this->plan_.start_min) + VL_TEXT("-") +
+                                               hhmm_(this->plan_.end_min) + VL_TEXT(" programmée)"));
         } else if (std::memcmp(data, this->record_.original, SCHEDULE_BLOCK_LENGTH) == 0) {
           this->final_message_ = VL_TEXT("Refusé par la régulation : bloc inchangé après écriture");
           this->enter_(BoostState::CLEAR_PENDING, VL_TEXT("Effacement de la sauvegarde"));
@@ -507,29 +541,17 @@ class BoostSequencer {
                                                            hex_block(data) + VL_TEXT(")"));
         }
         break;
-      case BoostState::RESTORE_CLOCK: {
-        VitoClock c;
-        if (!ok || decode_vito_clock(data, length, &c) != ClockError::NONE) {
-          this->restore_retry_(VL_TEXT("horloge illisible"), now);
-          break;
-        }
-        const uint32_t due = this->plan_.restore_at_s;
-        if (c.date_key() == this->clock_.date_key() && c.second_of_day() < due) {
-          // Horloge de la régulation en retard sur l'estimation : attendre.
-          this->restore_at_ms_ = now + (due - c.second_of_day()) * 1000u;
-          this->enter_(BoostState::ACTIVE, this->status_);
-        } else {
-          this->enter_(BoostState::RESTORE_READ, VL_TEXT("Restauration : relecture de ") + this->block_name_());
-        }
-        break;
-      }
       case BoostState::RESTORE_READ:
         if (!ok || length != SCHEDULE_BLOCK_LENGTH) {
-          this->restore_retry_(VL_TEXT("relecture impossible"), now);
+          this->link_retry_(VL_TEXT("relecture impossible"), now);
         } else if (std::memcmp(data, this->record_.temporary, SCHEDULE_BLOCK_LENGTH) == 0) {
-          this->enter_(BoostState::RESTORE_WRITE, VL_TEXT("Restauration : écriture du bloc d'origine"));
+          if (this->restore_writes_ >= this->config_.restore_attempts) {
+            this->restore_refused_();
+          } else {
+            this->enter_(BoostState::RESTORE_WRITE, VL_TEXT("Restauration : écriture du bloc d'origine"));
+          }
         } else if (std::memcmp(data, this->record_.original, SCHEDULE_BLOCK_LENGTH) == 0) {
-          this->final_message_ = VL_TEXT("Programmation déjà conforme à l'origine (vérifié)");
+          this->final_message_ = VL_TEXT("Programmation déjà conforme à l'origine (vérifié)") + this->elapsed_(now);
           this->refresh_address_ = this->record_.address;
           this->enter_(BoostState::CLEAR_PENDING, VL_TEXT("Effacement de la sauvegarde"));
         } else {
@@ -541,17 +563,21 @@ class BoostSequencer {
       case BoostState::RESTORE_VERIFY:
         if (ok && length == SCHEDULE_BLOCK_LENGTH &&
             std::memcmp(data, this->record_.original, SCHEDULE_BLOCK_LENGTH) == 0) {
-          this->final_message_ = VL_TEXT("Programmation restaurée (vérifiée par relecture)");
+          this->final_message_ = VL_TEXT("Programmation restaurée (vérifiée par relecture)") + this->elapsed_(now);
           this->refresh_address_ = this->record_.address;
           this->enter_(BoostState::CLEAR_PENDING, VL_TEXT("Effacement de la sauvegarde"));
-        } else if (ok && length == SCHEDULE_BLOCK_LENGTH &&
-                   std::memcmp(data, this->record_.temporary, SCHEDULE_BLOCK_LENGTH) != 0) {
+        } else if (!ok || length != SCHEDULE_BLOCK_LENGTH) {
+          // Illisible : nouvelle relecture plus tard, qui décidera (jamais
+          // d'écriture sans relecture préalable).
+          this->link_retry_(VL_TEXT("relecture impossible"), now);
+        } else if (std::memcmp(data, this->record_.temporary, SCHEDULE_BLOCK_LENGTH) != 0) {
           this->enter_(BoostState::RECOVERY_REQUIRED,
                        VL_TEXT("Récupération nécessaire : bloc inattendu après restauration (") + hex_block(data) + VL_TEXT(")"));
+        } else if (this->restore_writes_ >= this->config_.restore_attempts) {
+          this->restore_refused_();
         } else {
-          // Toujours temporaire ou illisible : nouvelle comparaison plus tard
-          // (jamais d'écriture sans relecture préalable).
-          this->restore_retry_(ok ? VL_TEXT("restauration non appliquée") : VL_TEXT("relecture impossible"), now);
+          // Toujours temporaire : nouvelle relecture, puis écriture, plus tard.
+          this->retry_later_(VL_TEXT("restauration non appliquée"), now + this->config_.restore_retry_ms);
         }
         break;
       case BoostState::RECOVERY_READ:
@@ -607,8 +633,9 @@ class BoostSequencer {
         break;
       case BoostState::RESTORE_WRITE:
         if (!sent) {
-          this->restore_retry_(VL_TEXT("écriture non envoyée"), now);
+          this->link_retry_(VL_TEXT("écriture non envoyée"), now);
         } else {
+          this->restore_writes_++;
           this->retry_at_ms_ = now;
           this->enter_(BoostState::RESTORE_VERIFY, VL_TEXT("Restauration : relecture"));
         }
@@ -652,10 +679,19 @@ class BoostSequencer {
   bool idle() const { return this->state_ == BoostState::IDLE; }
   /// Plage temporaire en place (de la confirmation à la fin de la restauration).
   bool active() const {
-    return this->state_ == BoostState::ACTIVE || this->state_ == BoostState::RESTORE_CLOCK ||
-           this->state_ == BoostState::RESTORE_READ || this->state_ == BoostState::RESTORE_WRITE ||
-           this->state_ == BoostState::RESTORE_VERIFY;
+    return this->state_ == BoostState::ACTIVE || this->state_ == BoostState::RESTORE_READ ||
+           this->state_ == BoostState::RESTORE_WRITE || this->state_ == BoostState::RESTORE_VERIFY;
   }
+  /// v0.5.2 : « restauration en cours » : durée écoulée (ou bouton), plage
+  /// pas encore retirée ; inclut les nouvelles tentatives de la fenêtre
+  /// automatique (attente du bus, liaison brièvement perdue). Pas une alerte.
+  bool restoring() const {
+    return this->state_ == BoostState::RESTORE_READ || this->state_ == BoostState::RESTORE_WRITE ||
+           this->state_ == BoostState::RESTORE_VERIFY || (this->state_ == BoostState::ACTIVE && this->expired_);
+  }
+  /// Alerte « restauration nécessaire » : seulement quand une action manuelle
+  /// est requise (récupération), jamais pendant une attente normale.
+  bool restore_alert() const { return this->recovery_required(); }
   bool recovery_required() const {
     return this->state_ == BoostState::RECOVERY_REQUIRED || this->state_ == BoostState::RECOVERY_READ ||
            this->state_ == BoostState::RECOVERY_WRITE || this->state_ == BoostState::RECOVERY_VERIFY;
@@ -672,7 +708,7 @@ class BoostSequencer {
     return false;
   }
   /// Aucune transaction ni étape en cours : IDLE, ou ACTIVE en attente de la
-  /// fin de plage.
+  /// fin de la durée (ou d'une nouvelle tentative de restauration).
   bool quiescent() const {
     return !this->waiting_ && (this->state_ == BoostState::IDLE || this->state_ == BoostState::ACTIVE);
   }
@@ -742,17 +778,61 @@ class BoostSequencer {
     this->enter_(BoostState::CLEAR_PENDING, VL_TEXT("Effacement de la sauvegarde"));
   }
 
-  void restore_retry_(const std::string &why, uint32_t now) {
-    this->attempts_++;
-    if (this->attempts_ >= this->config_.restore_attempts) {
-      this->enter_(BoostState::RECOVERY_REQUIRED,
-                   std::string(VL_TEXT("Récupération nécessaire : restauration impossible (")) + why + VL_TEXT(")"));
+  /// Nouvelle tentative à `at`, toujours précédée d'une relecture ; la plage
+  /// reste programmée en attendant (état « restauration en cours »).
+  void retry_later_(const std::string &why, uint32_t at) {
+    this->retrying_ = true;
+    this->restore_at_ms_ = at;
+    this->enter_(BoostState::ACTIVE, std::string(VL_TEXT("Restauration en cours (")) + why +
+                                         VL_TEXT(") : nouvel essai ; plage ") + hhmm_(this->record_.start_min) +
+                                         VL_TEXT("-") + hhmm_(this->record_.end_min) + VL_TEXT(" toujours programmée"));
+  }
+
+  /// Échec de communication pendant la restauration : nouvelle relecture
+  /// toutes les link_retry_ms, seulement dans la fenêtre automatique qui suit
+  /// la fin de la durée. Au-delà : récupération manuelle ; la sauvegarde
+  /// n'est jamais effacée sans restauration confirmée.
+  void link_retry_(const std::string &why, uint32_t now) {
+    const uint32_t window_end = this->expired_ms_ + this->config_.link_retry_window_ms;
+    if (time_reached(now, window_end)) {
+      this->enter_(BoostState::RECOVERY_REQUIRED, std::string(VL_TEXT("Récupération nécessaire : liaison indisponible (")) +
+                                                      why + VL_TEXT(") ") +
+                                                      std::to_string(this->config_.link_retry_window_ms / 60000u) +
+                                                      VL_TEXT(" min après la fin de la durée") + this->panel_hint_());
       return;
     }
-    // Nouvelle tentative plus tard, toujours précédée d'une relecture.
-    this->restore_at_ms_ = now + this->config_.restore_retry_ms;
-    this->restore_requested_ = true;  // l'horloge a déjà été vérifiée
-    this->enter_(BoostState::ACTIVE, std::string(VL_TEXT("Restauration différée (")) + why + VL_TEXT(")"));
+    // Dernière relecture exactement à la fin de la fenêtre.
+    const uint32_t next = now + this->config_.link_retry_ms;
+    this->retry_later_(why, time_reached(next, window_end) ? window_end : next);
+  }
+
+  /// Écritures de restauration épuisées, bloc toujours temporaire : plus
+  /// aucune écriture automatique ; la plage resterait chaque semaine.
+  void restore_refused_() {
+    this->enter_(BoostState::RECOVERY_REQUIRED,
+                 VL_TEXT("Récupération nécessaire : restauration non appliquée après ") +
+                     std::to_string(this->restore_writes_) + VL_TEXT(" écritures") + this->panel_hint_());
+  }
+
+  /// Intervention à faire sur le panneau si la récupération échoue.
+  std::string panel_hint_() const {
+    static const char *const DAYS[SCHEDULE_DAYS] = {"lundi", "mardi", "mercredi", "jeudi",
+                                                    "vendredi", "samedi", "dimanche"};
+    const char *day = this->record_.weekday < SCHEDULE_DAYS ? DAYS[this->record_.weekday] : "?";
+    return VL_TEXT(" ; sinon, supprimer sur le panneau la plage ") + hhmm_(this->record_.start_min) + VL_TEXT("-") +
+           hhmm_(this->record_.end_min) + VL_TEXT(" du ") + day;
+  }
+
+  /// « , après 10 min 02 s » : durée mesurée depuis la confirmation de la
+  /// plage, si elle a été confirmée dans cette session de l'ESP.
+  std::string elapsed_(uint32_t now) const {
+    if (!this->active())
+      return std::string();
+    const uint32_t s = (now - this->timer_start_ms_) / 1000u;
+    char text[40];
+    snprintf(text, sizeof(text), ", après %u min %02u s", static_cast<unsigned>(s / 60u),
+             static_cast<unsigned>(s % 60u));
+    return text;
   }
 
   void on_start_clock_(bool ok, const uint8_t *data, uint8_t length, uint32_t now) {
@@ -855,10 +935,14 @@ class BoostSequencer {
   uint32_t clock_ms_{0};
   HaTime ha_;
   uint16_t duration_{0};
-  uint32_t restore_at_ms_{0};
+  uint32_t timer_start_ms_{0};  ///< v0.5.2 : confirmation de la plage par relecture
+  uint32_t restore_at_ms_{0};   ///< fin de la durée, ou prochaine tentative
   uint32_t retry_at_ms_{0};
   bool restore_requested_{false};
-  uint8_t attempts_{0};
+  bool retrying_{false};        ///< v0.5.2 : nouvelle tentative de restauration programmée
+  bool expired_{false};         ///< v0.5.2 : durée écoulée (ou bouton) : restauration en cours
+  uint32_t expired_ms_{0};      ///< début de la fenêtre automatique
+  uint8_t restore_writes_{0};   ///< écritures de restauration émises
   uint32_t sequence_{0};
   bool has_started_{false};
   uint32_t last_start_ms_{0};

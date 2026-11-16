@@ -70,6 +70,7 @@ class VissLinkBoost : public Component, public visslink::VissLinkBlockClient {
   void set_duration_select(BoostDurationSelect *s) { this->duration_ = s; }
   void set_active_sensor(binary_sensor::BinarySensor *s) { this->active_sensor_ = s; }
   void set_restore_required_sensor(binary_sensor::BinarySensor *s) { this->restore_sensor_ = s; }
+  void set_restoring_sensor(binary_sensor::BinarySensor *s) { this->restoring_sensor_ = s; }
   void set_status_sensor(text_sensor::TextSensor *s) { this->status_sensor_ = s; }
 
   void setup() override;
@@ -105,6 +106,7 @@ class VissLinkBoost : public Component, public visslink::VissLinkBlockClient {
   BoostDurationSelect *duration_{nullptr};
   binary_sensor::BinarySensor *active_sensor_{nullptr};
   binary_sensor::BinarySensor *restore_sensor_{nullptr};
+  binary_sensor::BinarySensor *restoring_sensor_{nullptr};  ///< v0.5.2, facultatif
   text_sensor::TextSensor *status_sensor_{nullptr};
   std::string refusal_;          ///< refus avant le séquenceur (autorisations, liaison)
   std::string last_status_;

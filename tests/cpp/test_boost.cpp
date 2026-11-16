@@ -181,7 +181,6 @@ TEST(boost_plan_inserts_sorted_and_preserves_ranges) {
   CHECK(bytes(p.temporary) == (Block{0x31, 0x43, 0x70, 0x72, 0xAC, 0xAD, 0xFF, 0xFF}));
   CHECK(bytes(p.original) == REAL);
   CHECK_EQ(p.slot, 1);
-  CHECK_EQ(p.restore_at_s, (14u * 60 + 20) * 60 + BOOST_RESTORE_DELAY_S);
   // Avant la première plage, puis après la dernière.
   CHECK(plan(REAL, at(5, 0), 20, &p) == PlanResult::OK);
   CHECK(bytes(p.temporary) == (Block{0x28, 0x2B, 0x31, 0x43, 0xAC, 0xAD, 0xFF, 0xFF}));  // 05:00-05:30
@@ -278,14 +277,27 @@ struct Rig {
   bool flash_has = false;
   BoostRecord flash;
   bool save_fails = false, read_fails = false, write_lost = false, write_ignored = false, write_unsent = false;
-  bool panel_edit_before_restore = false;
   int writes = 0, saves = 0;
   std::vector<std::string> trace;
   uint32_t now = 1000;
+  /// Horloge de la régulation : clock_base_s (seconde du jour) à now = t0.
+  uint32_t clock_base_s = 14u * 3600 + 3 * 60;
+  uint32_t t0 = 1000;
+  /// Instants (millis) des écritures émises.
+  std::vector<uint32_t> write_times;
 
   Rig() {
     regs[0x2230] = REAL;
     set_clock(14, 3, 0);
+  }
+  /// v0.5.2 : démarre à une autre heure et/ou à une autre valeur de millis().
+  Rig(uint32_t clock_s, uint32_t start_ms) : now(start_ms), clock_base_s(clock_s), t0(start_ms) {
+    regs[0x2230] = REAL;
+    tick_clock();
+  }
+  void tick_clock() {
+    const uint32_t t = clock_base_s + (now - t0) / 1000;  // différence modulo 2^32
+    set_clock(t / 3600 % 24, t / 60 % 60, t % 60);
   }
   void set_clock(uint8_t h, uint8_t m, uint8_t s) {
     auto bcd = [](uint8_t v) { return static_cast<uint8_t>((v / 10) << 4 | (v % 10)); };
@@ -311,6 +323,7 @@ struct Rig {
           return true;
         }
         writes++;
+        write_times.push_back(now);
         if (!write_ignored)
           regs[a.address] = Block(a.data, a.data + a.length);
         q.on_write(true, !write_lost, now);
@@ -333,19 +346,26 @@ struct Rig {
     }
     return false;
   }
+  /// Pas de 1 s ; correct au débordement de millis().
   void run(BoostSequencer &q, uint32_t ms) {
-    const uint32_t end = now + ms;
-    while (now < end) {
-      if (panel_edit_before_restore && q.state() == BoostState::ACTIVE && time_reached(now, now)) {
-        // rien ici : géré par le test
-      }
+    for (uint32_t elapsed = 0; elapsed < ms; elapsed += 1000) {
       while (step(q)) {
       }
       now += 1000;
-      // L'horloge de la régulation avance avec le temps simulé.
-      const uint32_t t = 14u * 3600 + 3 * 60 + (now - 1000) / 1000;
-      set_clock(t / 3600 % 24, t / 60 % 60, t % 60);
+      tick_clock();  // l'horloge de la régulation avance avec le temps simulé
     }
+  }
+  /// Pas de 1 s jusqu'à ce que `done` soit vrai (au plus `limit_ms`).
+  template<typename F> bool run_until(BoostSequencer &q, F done, uint32_t limit_ms) {
+    for (uint32_t elapsed = 0; elapsed <= limit_ms; elapsed += 1000) {
+      while (!done() && step(q)) {
+      }
+      if (done())
+        return true;
+      now += 1000;
+      tick_clock();
+    }
+    return false;
   }
 };
 
@@ -383,7 +403,7 @@ TEST(boost_sequence_nominal) {
   CHECK(q.idle());
   CHECK(r.regs[0x2230] == REAL);
   CHECK(!r.flash_has);
-  CHECK(q.status() == "Programmation restaurée (vérifiée par relecture)");
+  CHECK(q.status() == "Programmation restaurée (vérifiée par relecture), après 10 min 00 s");
   CHECK_EQ(r.writes, 2);
   CHECK_EQ(r.saves, 2);  // une sauvegarde, un effacement : usure minimale
 }
@@ -576,7 +596,7 @@ TEST(boost_power_cut_after_every_action) {
     int done = 0;
     while (done < k) {
       if (!r.step(q)) {
-        r.now += 60000;  // attendre la fin de plage si besoin
+        r.now += 60000;  // attendre la fin de la durée si besoin
         const uint32_t t = 14u * 3600 + 3 * 60 + (r.now - 1000) / 1000;
         r.set_clock(t / 3600 % 24, t / 60 % 60, t % 60);
         if (q.idle())
@@ -610,7 +630,8 @@ TEST(boost_power_cut_after_every_action) {
     if (vltest::failures() > 0)
       std::printf("    coupure après l'action %d\n", k);
   }
-  CHECK(cuts >= 10);
+  // 9 actions (v0.5.2 : plus de lecture de l'horloge avant la restauration).
+  CHECK(cuts >= 9);
 }
 
 TEST(boost_record_integrity) {
@@ -689,7 +710,7 @@ TEST(boost_take_refresh_only_after_confirmed_change) {
       CHECK_EQ(q.take_refresh(), 0);
   }
   CHECK(q.idle());
-  CHECK(q.status() == "Programmation restaurée (vérifiée par relecture)");
+  CHECK(q.status().rfind("Programmation restaurée (vérifiée par relecture)", 0) == 0);
   CHECK_EQ(q.take_refresh(), 0x2230);
   CHECK_EQ(q.take_refresh(), 0);
 }
@@ -908,4 +929,306 @@ TEST(boost_relay_cancelled_when_a_new_operation_starts) {
   q2.poll(r2.now);
   CHECK(relay2.poll(q2, port2, r2.now + 2000) == BoostRefreshRelay::Event::NONE);
   CHECK_EQ(port2.cancels, 0);
+}
+
+// --- v0.5.2 : durée demandée = durée de la plage temporaire --------------------
+
+namespace {
+
+/// Bloc du dimanche sans la plage 21:40-21:50 (cas du constat du 15/11 au soir).
+const Block MORNING_ONLY = {0x31, 0x43, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+/// Instant de la n-ième écriture émise (0 si absente : le test échoue sans
+/// lecture hors limites).
+uint32_t write_at(const Rig &r, size_t n) {
+  CHECK(r.write_times.size() > n);
+  return r.write_times.size() > n ? r.write_times[n] : 0;
+}
+
+/// Amène le séquenceur en ACTIVE ; renvoie l'instant de la confirmation.
+uint32_t confirm(Rig &r, BoostSequencer &q, uint16_t duration, uint16_t ha_minute) {
+  q.configure(sunday_validated());
+  q.boot(nullptr);
+  CHECK(q.start(duration, ha_at(ha_minute), r.now) == BoostStart::ACCEPTED);
+  CHECK(r.run_until(q, [&] { return q.state() == BoostState::ACTIVE; }, 60000));
+  return r.now;
+}
+
+}  // namespace
+
+TEST(boost_ten_minutes_restore_after_ten_minutes_not_at_range_end) {
+  // Constat matériel : 10 min demandées vers 21:28 (heure Vitotronic) ->
+  // plage 21:20-21:50, restauration prévue à 21:52 (v0.5). v0.5.2 :
+  // restauration 10 min après la confirmation, vers 21:38:30.
+  Rig r(21u * 3600 + 28 * 60 + 30, 5000);
+  r.regs[0x2230] = MORNING_ONLY;
+  BoostSequencer q;
+  const uint32_t confirmed = confirm(r, q, 10, 21 * 60 + 28);
+  CHECK_EQ(q.plan().start_min, 21 * 60 + 20);
+  CHECK_EQ(q.plan().end_min, 21 * 60 + 50);  // fenêtre inchangée (arrondie)
+  CHECK(r.regs[0x2230] == (Block{0x31, 0x43, 0xAA, 0xAD, 0xFF, 0xFF, 0xFF, 0xFF}));
+  CHECK(q.status() == "Bouclage en cours : 10 min, arrêt vers 21:39 (plage 21:20-21:50 programmée)");
+  // Une seconde avant l'expiration : rien.
+  r.run(q, 599 * 1000);
+  CHECK(q.state() == BoostState::ACTIVE);
+  CHECK_EQ(r.writes, 1);
+  CHECK(r.regs[0x2230] != MORNING_ONLY);
+  // Expiration : relecture, restauration, vérification, sans attendre 21:52.
+  CHECK(r.run_until(q, [&] { return q.idle(); }, 5000));
+  CHECK_EQ(r.writes, 2);
+  CHECK_EQ(write_at(r, 1) - confirmed, 10u * 60 * 1000);
+  CHECK(r.regs[0x2230] == MORNING_ONLY);
+  CHECK(!r.flash_has);
+  CHECK(q.status() == "Programmation restaurée (vérifiée par relecture), après 10 min 00 s");
+  // Heure de la régulation à la restauration : 21:38:30, avant la fin de plage.
+  CHECK(r.regs[VITO_CLOCK_ADDRESS] == (Block{0x20, 0x26, 0x11, 0x15, 0x07, 0x21, 0x38, 0x30}));
+}
+
+TEST(boost_every_duration_and_start_time_restores_on_time) {
+  // Toute durée, plusieurs heures de départ (début, milieu, fin de dizaine) :
+  // restauration à durée exacte après la confirmation, toujours avant la fin
+  // de la plage programmée.
+  int cases = 0;
+  for (uint16_t d : BOOST_DURATIONS) {
+    for (uint32_t m : {14u * 60 + 0, 14u * 60 + 3, 14u * 60 + 9}) {
+      for (uint32_t s : {0u, 59u}) {
+        Rig r(m * 60 + s, 1000);
+        r.regs[0x2230] = MORNING_ONLY;
+        BoostSequencer q;
+        const uint32_t confirmed = confirm(r, q, d, static_cast<uint16_t>(m));
+        const uint16_t end_min = q.plan().end_min;
+        CHECK(r.run_until(q, [&] { return q.idle(); }, 60u * 60 * 1000));
+        CHECK_EQ(r.writes, 2);
+        CHECK_EQ(write_at(r, 1) - confirmed, d * 60000u);
+        CHECK(m * 60 + s + d * 60u < end_min * 60u);  // avant la fin de plage
+        CHECK(r.regs[0x2230] == MORNING_ONLY);
+        cases++;
+      }
+    }
+  }
+  CHECK_EQ(cases, 18);
+}
+
+TEST(boost_timer_correct_across_millis_overflow) {
+  // millis() déborde pendant la plage, ou exactement à l'expiration.
+  for (uint32_t before_wrap : {4u * 60 * 1000, 10u * 60 * 1000, 10u * 60 * 1000 - 1000, 1000u}) {
+    Rig r(14u * 3600 + 3 * 60, 0u - before_wrap);
+    BoostSequencer q;
+    const uint32_t confirmed = confirm(r, q, 10, 14 * 60 + 3);
+    r.run(q, 599 * 1000);
+    CHECK(q.state() == BoostState::ACTIVE);  // pas de restauration prématurée
+    CHECK(r.run_until(q, [&] { return q.idle(); }, 5000));
+    CHECK_EQ(r.write_times.size(), 2u);
+    CHECK_EQ(write_at(r, 1) - confirmed, 10u * 60 * 1000);
+    CHECK(r.regs[0x2230] == REAL);
+    if (vltest::failures() > 0)
+      std::printf("    débordement %u ms après le départ\n", before_wrap);
+  }
+}
+
+TEST(boost_link_lost_retries_15_min_then_manual_recovery) {
+  // Liaison perdue avant l'expiration et jamais rétablie dans la fenêtre :
+  // relectures toutes les 30 s pendant 15 min, aucune écriture, puis
+  // récupération manuelle ; la sauvegarde est conservée.
+  Rig r;
+  BoostSequencer q;
+  const uint32_t confirmed = confirm(r, q, 10, 843);
+  r.run(q, 9 * 60 * 1000);
+  r.read_fails = true;
+  r.run(q, 60 * 1000 + 1000);  // expiration à +10 min, première relecture échouée
+  const uint32_t expired = confirmed + 10u * 60 * 1000;
+  CHECK(q.state() == BoostState::ACTIVE);
+  CHECK(q.restoring());       // restauration en cours...
+  CHECK(!q.restore_alert());  // ... sans fausse alerte
+  CHECK(q.status().rfind("Restauration en cours (relecture impossible) : nouvel essai", 0) == 0);
+  CHECK(r.run_until(q, [&] { return q.recovery_required(); }, 20 * 60 * 1000));
+  CHECK_EQ(r.now - expired, 15u * 60 * 1000);  // fin de la fenêtre automatique
+  size_t reads = 0;
+  for (const std::string &t : r.trace)
+    reads += t == "R8752";
+  CHECK_EQ(reads, 2u + 31u);  // bloc + vérification, puis 31 relectures (0 à 15 min)
+  CHECK_EQ(r.writes, 1);
+  CHECK(r.flash_has);  // jamais effacée sans restauration confirmée
+  CHECK(q.restore_alert());
+  CHECK(!q.restoring());
+  CHECK(q.status() ==
+        "Récupération nécessaire : liaison indisponible (relecture impossible) 15 min après la fin de la durée ; "
+        "sinon, supprimer sur le panneau la plage 14:00-14:20 du dimanche");
+  // Retour de la liaison APRÈS la fenêtre : aucune écriture automatique.
+  r.read_fails = false;
+  r.run(q, 60 * 60 * 1000);
+  CHECK_EQ(r.writes, 1);
+  CHECK(q.recovery_required());
+  CHECK(r.regs[0x2230] != REAL);
+  // Récupération manuelle : restaurée, alerte retombée, sauvegarde effacée.
+  CHECK(q.request_restore(r.now));
+  while (r.step(q)) {
+  }
+  CHECK(q.idle());
+  CHECK(!q.restore_alert());
+  CHECK(r.regs[0x2230] == REAL);
+  CHECK(!r.flash_has);
+}
+
+TEST(boost_link_back_within_window_restores_without_alert) {
+  // Retour de la liaison 7 min, puis 14 min 50 s après l'expiration (dernière
+  // relecture à 15 min) : restauration automatique, après relecture exacte,
+  // sans que l'alerte ne soit jamais levée.
+  for (uint32_t back_s : {7u * 60, 14u * 60 + 50}) {
+    Rig r;
+    BoostSequencer q;
+    const uint32_t confirmed = confirm(r, q, 10, 843);
+    const uint32_t expired = confirmed + 10u * 60 * 1000;
+    r.run(q, 9 * 60 * 1000);
+    r.read_fails = true;
+    bool alert = false, restoring = false;
+    while (r.now - expired < back_s * 1000u || r.now < expired) {
+      r.run(q, 1000);
+      alert |= q.restore_alert();
+      restoring |= q.restoring();
+    }
+    CHECK(restoring);
+    CHECK_EQ(r.writes, 1);
+    r.read_fails = false;
+    CHECK(r.run_until(
+        q,
+        [&] {
+          alert |= q.restore_alert();
+          return q.idle();
+        },
+        31 * 1000));
+    CHECK(!alert);
+    CHECK_EQ(r.writes, 2);
+    CHECK(r.regs[0x2230] == REAL);
+    CHECK(!r.flash_has);
+    CHECK(!q.restoring());
+    CHECK(!q.restore_alert());
+    CHECK(q.status().rfind("Programmation restaurée (vérifiée par relecture), après ", 0) == 0);
+    if (vltest::failures() > 0)
+      std::printf("    retour après %u s\n", back_s);
+  }
+}
+
+TEST(boost_link_back_just_after_window_needs_manual_recovery) {
+  Rig r;
+  BoostSequencer q;
+  const uint32_t confirmed = confirm(r, q, 10, 843);
+  const uint32_t expired = confirmed + 10u * 60 * 1000;
+  r.run(q, 9 * 60 * 1000);
+  r.read_fails = true;
+  while (r.now - expired < 15u * 60 * 1000 + 10 * 1000 || r.now < expired)
+    r.run(q, 1000);
+  CHECK(q.recovery_required());
+  r.read_fails = false;
+  r.run(q, 30 * 60 * 1000);
+  CHECK_EQ(r.writes, 1);
+  CHECK(r.flash_has);
+}
+
+TEST(boost_restore_frame_not_sent_is_retried_without_counting) {
+  Rig r;
+  BoostSequencer q;
+  confirm(r, q, 10, 843);
+  r.write_unsent = true;  // arbitre ou liaison indisponible à l'émission
+  r.run(q, 13 * 60 * 1000);
+  CHECK(q.restoring());
+  CHECK(!q.restore_alert());  // attente normale : pas d'alerte
+  CHECK_EQ(r.writes, 1);
+  r.write_unsent = false;
+  CHECK(r.run_until(q, [&] { return q.idle(); }, 31 * 1000));
+  CHECK(r.regs[0x2230] == REAL);
+  CHECK(!q.restore_alert());
+}
+
+TEST(boost_restore_refused_alerts_with_panel_instructions) {
+  Rig r;
+  BoostSequencer q;
+  confirm(r, q, 10, 843);
+  r.write_ignored = true;
+  CHECK(r.run_until(q, [&] { return q.restoring() && q.state() == BoostState::ACTIVE; }, 11 * 60 * 1000));
+  CHECK(!q.restore_alert());  // tentatives en cours : pas encore d'alerte
+  r.run(q, 30 * 60 * 1000);
+  CHECK(q.recovery_required());
+  CHECK(q.restore_alert());
+  CHECK_EQ(r.writes, 1 + 3);  // écritures bornées, chacune après relecture
+  CHECK(r.flash_has);
+  CHECK(q.status() ==
+        "Récupération nécessaire : restauration non appliquée après 3 écritures ; sinon, supprimer sur le panneau "
+        "la plage 14:00-14:20 du dimanche");
+  // Plus rien d'automatique ensuite.
+  r.run(q, 2 * 60 * 60 * 1000);
+  CHECK_EQ(r.writes, 4);
+}
+
+TEST(boost_reboot_during_restore_window_writes_nothing) {
+  // Coupure de l'ESP pendant la fenêtre automatique (liaison perdue) : au
+  // redémarrage, ni minuterie ni nouvelle tentative ; récupération manuelle.
+  Rig r;
+  BoostSequencer q;
+  confirm(r, q, 10, 843);
+  r.run(q, 9 * 60 * 1000);
+  r.read_fails = true;
+  r.run(q, 4 * 60 * 1000);
+  CHECK(q.restoring());
+  BoostSequencer after;
+  after.configure(sunday_validated());
+  after.boot(r.flash_has ? &r.flash : nullptr);
+  r.read_fails = false;
+  r.run(after, 60 * 60 * 1000);
+  CHECK(after.recovery_required());
+  CHECK(after.restore_alert());
+  CHECK(!after.restoring());
+  CHECK_EQ(r.writes, 1);
+  CHECK(r.flash_has);
+}
+
+TEST(boost_default_duration_is_ten_minutes) {
+  CHECK(BOOST_DEFAULT_DURATION_INDEX < BOOST_DURATION_COUNT);
+  CHECK_EQ(BOOST_DURATIONS[BOOST_DEFAULT_DURATION_INDEX], 10);
+}
+
+TEST(boost_panel_change_during_timer_detected_at_expiry) {
+  Rig r;
+  BoostSequencer q;
+  const uint32_t confirmed = confirm(r, q, 10, 843);
+  const Block edited = {0x31, 0x43, 0x70, 0x72, 0xA8, 0xAD, 0xFF, 0xFF};
+  r.run(q, 3 * 60 * 1000);
+  r.regs[0x2230] = edited;  // modifié sur le panneau pendant la minuterie
+  CHECK(r.run_until(q, [&] { return q.recovery_required(); }, 20 * 60 * 1000));
+  CHECK_EQ(r.now - confirmed, 10u * 60 * 1000);  // constaté à l'expiration
+  CHECK(r.regs[0x2230] == edited);              // jamais écrasé
+  CHECK_EQ(r.writes, 1);
+}
+
+TEST(boost_reboot_never_restarts_a_full_duration) {
+  // Redémarrage de l'ESP 4 min après la confirmation : le temps écoulé est
+  // inconnu. Aucune minuterie relancée, aucune écriture automatique ; la
+  // récupération manuelle restaure immédiatement, sans attendre 10 min.
+  Rig r;
+  BoostSequencer q;
+  confirm(r, q, 10, 843);
+  r.run(q, 4 * 60 * 1000);
+  BoostSequencer after;
+  after.configure(sunday_validated());
+  after.boot(r.flash_has ? &r.flash : nullptr);
+  CHECK(after.recovery_required());
+  CHECK(after.restore_alert());
+  CHECK(after.status().find("supprimer sur le panneau la plage 14:00-14:20 du dimanche") != std::string::npos);
+  bool active_again = false;
+  for (int i = 0; i < 60; i++) {
+    r.run(after, 60 * 1000);
+    active_again |= after.state() == BoostState::ACTIVE;
+  }
+  CHECK(!active_again);
+  CHECK_EQ(r.writes, 1);
+  CHECK(after.start(10, ha_at(843 + 64), r.now) == BoostStart::RECOVERY_PENDING);
+  const uint32_t pressed = r.now;
+  CHECK(after.request_restore(pressed));
+  while (r.step(after)) {
+  }
+  CHECK(after.idle());
+  CHECK_EQ(r.writes, 2);
+  CHECK_EQ(write_at(r, 1), pressed);  // restauration immédiate
+  CHECK(r.regs[0x2230] == REAL);
+  CHECK(after.status() == "Récupération terminée : programmation restaurée (vérifiée)");
 }

@@ -29,7 +29,7 @@ void VissLinkBoost::setup() {
   if (this->parent_ != nullptr)
     this->parent_->set_block_client(this);
   if (this->duration_ != nullptr)
-    this->duration_->publish_state(1);  // 20 min par défaut
+    this->duration_->publish_state(visslink::BOOST_DEFAULT_DURATION_INDEX);  // 10 min après chaque démarrage
   this->publish_();
 }
 
@@ -214,9 +214,14 @@ void VissLinkBoost::publish_() {
   if (this->active_sensor_ != nullptr &&
       (!this->active_sensor_->has_state() || this->active_sensor_->state != this->sequencer_.active()))
     this->active_sensor_->publish_state(this->sequencer_.active());
-  if (this->restore_sensor_ != nullptr &&
-      (!this->restore_sensor_->has_state() || this->restore_sensor_->state != this->sequencer_.recovery_required()))
-    this->restore_sensor_->publish_state(this->sequencer_.recovery_required());
+  // v0.5.2 : « restauration en cours » (attente normale du bus, fenêtre
+  // automatique) distincte de l'alerte, levée seulement en récupération.
+  if (this->restoring_sensor_ != nullptr &&
+      (!this->restoring_sensor_->has_state() || this->restoring_sensor_->state != this->sequencer_.restoring()))
+    this->restoring_sensor_->publish_state(this->sequencer_.restoring());
+  const bool alert = this->sequencer_.restore_alert();
+  if (this->restore_sensor_ != nullptr && (!this->restore_sensor_->has_state() || this->restore_sensor_->state != alert))
+    this->restore_sensor_->publish_state(alert);
 }
 
 }  // namespace visslink_boost

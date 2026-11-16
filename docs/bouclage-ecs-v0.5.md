@@ -39,14 +39,16 @@ IDLE ─start─► READ_CLOCK ─► READ_BLOCK ─► BACKUP_PENDING ─► WR
   │              ▼              ▼ déjà actif    ▼ (rien écrit)    ▼ (rien écrit)   │
   └──────────── IDLE ◄───────── IDLE ◄──────── IDLE ◄── CLEAR ◄──┘                │
                                                                                   ▼
-   = temporaire ─► ACTIVE ─(fin + 2 min ou bouton)─► RESTORE_CLOCK ─► RESTORE_READ
-   = origine ────► CLEAR_PENDING ─► IDLE (« refusé par la régulation »)        │
-   autre / illisible ─► RECOVERY_REQUIRED                                       │
-                                                                                ▼
+   = temporaire ─► ACTIVE ─(durée écoulée depuis la confirmation, ou bouton)─► RESTORE_READ
+   = origine ────► CLEAR_PENDING ─► IDLE (« refusé par la régulation »)               │
+   autre / illisible ─► RECOVERY_REQUIRED                                              │
+                                                                                       ▼
    RESTORE_READ : = temporaire ─► RESTORE_WRITE ─► RESTORE_VERIFY ─(= origine)─► CLEAR ─► IDLE
                   = origine ────► CLEAR ─► IDLE
                   autre ────────► RECOVERY_REQUIRED (modifié depuis le panneau : jamais écrasé)
-   échecs bornés (3 tentatives espacées de 2 min, chacune précédée d'une relecture) ─► RECOVERY_REQUIRED
+   liaison (relecture impossible, trame non émise) ─► ACTIVE, nouvelle relecture dans 30 s,
+                  pendant 15 min après la fin de la durée ; au-delà ─► RECOVERY_REQUIRED
+   restauration non appliquée ─► nouvelle relecture dans 2 min ; au plus 3 écritures ─► RECOVERY_REQUIRED
 
    RECOVERY_REQUIRED ─bouton « restaurer »─► RECOVERY_READ ─(= temporaire)─► RECOVERY_WRITE ─► RECOVERY_VERIFY
                      ─bouton « oublier »──► CLEAR (aucune écriture)
@@ -158,10 +160,10 @@ celui-là qui a changé, la correspondance est confirmée pour le dimanche.
    - origine → « refusé par la régulation », sauvegarde effacée ;
    - autre ou illisible → **récupération requise**, toute nouvelle
      opération bloquée, aucune écriture.
-6. Fin de plage + 2 min : nouvelle lecture de l'horloge, puis du bloc.
-   Restauration **seulement si** le bloc est exactement le temporaire, puis
-   relecture : l'effacement de la sauvegarde n'a lieu qu'**après** la
-   preuve de l'égalité avec l'origine.
+6. **Durée demandée écoulée depuis la confirmation** (v0.5.2, § 5 bis) :
+   relecture du bloc. Restauration **seulement si** le bloc est exactement
+   le temporaire, puis relecture : l'effacement de la sauvegarde n'a lieu
+   qu'**après** la preuve de l'égalité avec l'origine.
 
 Un accusé `00` n'est jamais considéré comme une preuve : le journal l'indique
 explicitement et seule la relecture décide.
@@ -229,10 +231,117 @@ Séquence simulée sur `0x2230` :
 L'affichage est à jour 0,3 à 7,5 s après la confirmation (resynchro de 2 à
 4 s).
 
+## 5 bis. Durée du bouclage (v0.5.2)
+
+**Règle : 10 minutes demandées = 10 minutes de plage, à la précision des
+échanges Optolink près.**
+
+### Constat (v0.5)
+
+Une demande de 10 min vers 21:27 a créé la plage 21:20–21:50, avec une
+restauration prévue à 21:52. En v0.5, la restauration attendait la **fin de
+la plage + 2 min**. Or la plage est arrondie à la dizaine : début vers le
+bas, fin vers le haut après une marge de 2 min. Le bouclage durait donc
+entre 12 et 24 min pour 10 demandées.
+
+La plage 21:20–21:50 correspond à 10 min demandées si l'horloge de la
+Vitotronic indiquait plus de 21:28:00 (21:28:01 + 12 min = 21:40:01,
+arrondi à 21:50), ou à 20 min demandées. Le journal tranche
+(`Circulation boost requested (10 min)`). En v0.5, l'entité « Durée »
+revenait à 20 min à chaque redémarrage de l'ESP ; depuis la v0.5.2, elle
+revient à **10 min**.
+
+### Correction
+
+- La plage calculée est inchangée : elle contient l'heure courante et couvre
+  la durée demandée + 2 min, arrondie à la dizaine (§ 4). Ce n'est plus
+  qu'une **fenêtre**.
+- Une **minuterie monotone** (`millis()`) démarre quand la relecture
+  confirme la plage temporaire. À l'expiration de la durée sélectionnée (10,
+  20 ou 30 min), la restauration commence : relecture, puis écriture du bloc
+  d'origine, puis relecture. La fin de la plage n'est plus attendue ;
+  l'horloge `0x088E` n'est plus relue avant la restauration (une lecture de
+  moins).
+- La minuterie compare par différence signée (`time_reached`) : elle reste
+  juste au débordement de `millis()` (tous les 49,7 jours).
+- L'état affiche `Bouclage en cours : 10 min, arrêt vers 21:39 (plage
+  21:20-21:50 programmée)`, puis `Programmation restaurée (vérifiée par
+  relecture), après 10 min 00 s`.
+
+Mesuré en simulation au niveau des trames KW, de la relecture qui confirme
+la plage à l'écriture du bloc d'origine :
+
+| Resynchro | 10 min | 20 min | 30 min |
+|---|---|---|---|
+| 2 s | 602,2 s | 1 203,6 s | 1 802,9 s |
+| 3 s | 604,3 s | 1 203,6 s | 1 806,0 s |
+| 4 s | 604,4 s | 1 207,8 s | 1 807,1 s |
+
+L'écart (2 à 8 s) est l'attente de la synchronisation pour la relecture et
+l'écriture de restauration. Il ne s'agit que de simulation : la durée réelle
+du circulateur dépend aussi du temps de réaction de la régulation, à mesurer
+(§ 5 ter).
+
+### Liaison perdue, restauration refusée, redémarrage
+
+| Situation | Comportement |
+|---|---|
+| Panneau modifié pendant la minuterie | constaté à l'expiration (bloc ≠ temporaire) : **jamais écrasé**, récupération nécessaire |
+| Bus occupé à l'expiration (commande A1/M2, resynchro lente) | « restauration en cours », **pas d'alerte** |
+| Liaison perdue à l'expiration (relecture impossible, trame non émise) | **fenêtre automatique de 15 min** après la fin de la durée : nouvelle relecture toutes les 30 s (la dernière à +15 min) ; restauration automatique seulement si la relecture donne **exactement** le bloc temporaire ; « restauration en cours », pas d'alerte |
+| Liaison toujours absente à +15 min | **récupération nécessaire** : alerte, plus aucune tentative automatique, même si la liaison revient ; sauvegarde conservée ; bouton « Restaurer » ou correction sur le panneau |
+| Écriture de restauration non appliquée | nouvelle relecture dans 2 min ; **au plus 3 écritures**, puis récupération nécessaire |
+| Redémarrage de l'ESP pendant la plage ou la fenêtre | le temps écoulé est inconnu : **aucune minuterie relancée**, aucune écriture automatique ; récupération nécessaire, alerte ; le bouton « Restaurer » restaure **immédiatement** |
+
+La sauvegarde n'est **jamais** effacée sans restauration confirmée par
+relecture (ou constat que le bloc est déjà celui d'origine).
+
+Entités :
+
+- « Plage temporaire en cours » : de la confirmation à la fin de la
+  restauration ;
+- « Restauration en cours » (facultative, `restoring:`, v0.5.2) : durée
+  écoulée, plage pas encore retirée, y compris les nouvelles tentatives de
+  la fenêtre automatique. **Ce n'est pas une alerte** ;
+- « Restauration nécessaire » : **seulement** quand une action manuelle est
+  requise (récupération).
+
+Quand la restauration ne peut pas se faire (récupération nécessaire), la
+plage temporaire **reste dans la programmation hebdomadaire** : elle se
+répétera chaque semaine ce jour-là. L'alerte reste levée et l'état indique
+l'intervention, par exemple : `… ; sinon, supprimer sur le panneau la plage
+21:20-21:50 du dimanche`. Après la correction sur le panneau, « Oublier la
+sauvegarde » (aucune écriture).
+
+## 5 ter. Mesure du circulateur par `0x0846` (étude)
+
+`0x0846` est l'état de **sortie** du circulateur calculé par la régulation :
+c'est la seule mesure du fonctionnement effectif. VissLink ne l'écrit
+jamais, et cette étude ne change rien à cette règle.
+
+| Usage | Intérêt | Risque | Décision |
+|---|---|---|---|
+| Démarrer la minuterie au passage de `0x0846` à `01` | durée de pompe exacte | si la régulation ne démarre pas la pompe (priorité ECS, blocage, autre logique), la minuterie ne démarre jamais : la plage n'est pas retirée et devient permanente | **écarté** |
+| Prolonger la plage tant que la pompe n'a pas tourné 10 min | idem | durée non bornée, même risque | **écarté** |
+| **Mesurer** seulement : délai confirmation → `01`, délai restauration → `00` | vérifie sur la chaudière que 10 min demandées = 10 min de pompe | aucun (lecture seule) | **retenu pour l'essai** |
+
+En production, `0x0846` reste à 60 s (en commentaire), soit ±60 s : trop
+grossier pour juger une durée de 10 min. Pour la phase 2 (§ 8), la
+configuration
+[`iot-viessmann-essai-bouclage-v0.5.2.yaml`](../examples/iot-viessmann-essai-bouclage-v0.5.2.yaml)
+lit `0x0846` toutes les **15 s** (lecture seule, +3 lectures/min) et ajoute
+l'entité « Restauration en cours ». Comparer dans l'historique Home
+Assistant « Plage temporaire en cours » et « TEST — Bouclage ECS brut ».
+
+Évolution possible, non implémentée : lecture ponctuelle de `0x0846` toutes
+les 30 s par le séquenceur, **pendant la plage seulement**, avec les délais
+mesurés dans l'état. Elle ne déciderait de rien. À envisager seulement si
+l'historique ne suffit pas.
+
 ## 6. Coupures d'alimentation
 
 Test `boost_power_cut_after_every_action` : coupure après **chacune** des
-10 actions d'une opération complète, puis redémarrage.
+9 actions d'une opération complète, puis redémarrage.
 `sim_v05_boost_power_cut_while_active_then_manual_restore` refait les
 coupures au niveau KW (moteur, arbitre, ordonnanceur réinitialisés).
 
@@ -276,9 +385,11 @@ Limites :
    et correspondance bloc ↔ jour à valider jour par jour.
 5. **Écriture interrompue** (trame tronquée) : comportement de la KW3 non
    documenté. Le cas est couvert par la relecture et la récupération.
-6. **Restauration impossible** (liaison perdue durablement) : la plage
-   ajoutée se répétera chaque semaine ce jour-là, à cette heure, jusqu'à la
-   correction. Elle est courte (≤ 40 min) et se termine d'elle-même.
+6. **Restauration impossible** (liaison perdue durablement, ESP redémarré,
+   restauration refusée) : la plage ajoutée se répétera chaque semaine ce
+   jour-là, à cette heure, jusqu'à la correction. Elle est courte (≤ 40 min)
+   et se termine d'elle-même. L'alerte « Restauration nécessaire » reste
+   levée et l'état indique la plage à supprimer sur le panneau (§ 5 bis).
 7. Usure (§ 5) et perte de la sauvegarde lors d'un changement de firmware
    (§ 6).
 
@@ -321,9 +432,12 @@ validé en phase 1.
 
 Déroulement :
 
-1. Configuration d'essai : `enable_writes: true`,
-   `enable_schedule_writes: true`, `validated_days: [<jour validé>]`, les
-   autres options d'écriture à `false`, aucune consigne modifiable. Compiler
+1. Configuration d'essai : partir de
+   `examples/iot-viessmann-essai-bouclage-v0.5.2.yaml` (`0x0846` à 15 s,
+   écritures désactivées dans le fichier) et mettre à la main
+   `enable_writes: true`, `enable_schedule_writes: true`,
+   `validated_days: [<jour validé>]`, les autres options d'écriture à
+   `false`, aucune consigne modifiable. Compiler
    et vérifier l'avertissement `SCHEDULE BLOCK WRITES ENABLED`, puis flasher.
 2. Hors de toute plage programmée, au moins 30 min avant 23:50 : choisir
    **10 min** puis appuyer **une seule fois** sur « Bouclage ECS — Démarrer
@@ -333,12 +447,16 @@ Déroulement :
    - `0x22xx -> ... (schedule block write, experimental)` ;
    - l'accusé, ou une issue « indéterminée » ;
    - la relecture ;
-   - l'état « Bouclage programmé hh:mm-hh:mm ».
+   - l'état « Bouclage en cours : 10 min, arrêt vers hh:mm (plage
+     hh:mm-hh:mm programmée) ».
 4. Vérifier **sur le panneau** que la plage apparaît, puis **physiquement**
-   que le circulateur démarre, et que `0x0846` passe à `1`.
-5. Attendre la restauration automatique (fin + 2 min) : « Programmation
-   restaurée (vérifiée par relecture) ». Vérifier sur le panneau que le
-   programme est **identique au relevé papier**.
+   que le circulateur démarre, et que `0x0846` passe à `1`. Noter l'heure
+   de la confirmation et celle du démarrage (§ 5 ter).
+5. Attendre la restauration automatique, **10 min après la confirmation**
+   (et non à la fin de la plage) : « Programmation restaurée (vérifiée par
+   relecture), après 10 min 0x s ». Noter l'heure de l'arrêt du
+   circulateur. Vérifier sur le panneau que le programme est **identique
+   au relevé papier**.
 6. **Au moindre écart** (refus, relecture différente, état « Récupération
    nécessaire », panneau incohérent) : ne plus rien déclencher,
    `enable_schedule_writes: false`, **ressaisir le programme sur le

@@ -28,11 +28,14 @@ CONF_FORGET = "forget"
 CONF_DURATION = "duration"
 CONF_ACTIVE = "active"
 CONF_RESTORE_REQUIRED = "restore_required"
+CONF_RESTORING = "restoring"
 CONF_STATUS = "status"
 
 DAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 # Durées proposées, dans l'ordre de BOOST_DURATIONS (circulation_boost.h).
 DURATION_OPTIONS = ["10 min", "20 min", "30 min"]
+# v0.5.2 : option publiée au démarrage de l'ESP (BOOST_DEFAULT_DURATION_INDEX).
+DEFAULT_DURATION = "10 min"
 
 boost_ns = cg.esphome_ns.namespace("visslink_boost")
 VissLinkBoost = boost_ns.class_("VissLinkBoost", cg.Component)
@@ -70,6 +73,11 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Required(CONF_RESTORE_REQUIRED): binary_sensor.binary_sensor_schema(
             device_class="problem"
         ),
+        # v0.5.2 (facultatif) : restauration en cours, y compris les nouvelles
+        # tentatives de la fenêtre automatique. Pas une alerte.
+        cv.Optional(CONF_RESTORING): binary_sensor.binary_sensor_schema(
+            icon="mdi:backup-restore"
+        ),
         cv.Required(CONF_STATUS): text_sensor.text_sensor_schema(
             icon="mdi:information-outline", entity_category="diagnostic"
         ),
@@ -102,5 +110,8 @@ async def to_code(config):
     cg.add(var.set_active_sensor(active))
     restore = await binary_sensor.new_binary_sensor(config[CONF_RESTORE_REQUIRED])
     cg.add(var.set_restore_required_sensor(restore))
+    if CONF_RESTORING in config:
+        restoring = await binary_sensor.new_binary_sensor(config[CONF_RESTORING])
+        cg.add(var.set_restoring_sensor(restoring))
     status = await text_sensor.new_text_sensor(config[CONF_STATUS])
     cg.add(var.set_status_sensor(status))
