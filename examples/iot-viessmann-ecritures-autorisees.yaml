@@ -1,9 +1,7 @@
-# VissLink — TOUTES LES ÉCRITURES AUTORISÉES (configuration explicite)
-# Base : examples/iot-viessmann-essai-chauffage-v0.7.yaml. Différences :
-#   - les six autorisations d'écriture à true : enable_writes,
-#     enable_mode_writes, enable_m2_mode_write, enable_schedule_writes,
-#     enable_dhw_setpoint_write, enable_heating_setpoint_writes ;
-#   - bouclage ECS autorisé les sept jours (validated_days) ;
+# VissLink — TOUTES LES ÉCRITURES AUTORISÉES, SUIVI DU BOUCLAGE
+# Base : examples/iot-viessmann-essai-chauffage-v0.7.yaml. Les six
+# autorisations d'écriture et les sept jours du bouclage sont actifs par
+# défaut, sans déclaration. Différences :
 #   - Home Assistant distingue trois choses pour le bouclage :
 #       « Plage inscrite » : la plage temporaire écrite dans la Vitotronic ;
 #       « Temps restant » : minutes avant la restauration automatique ;
@@ -97,23 +95,11 @@ visslink:
   sync_timeout: 10s       # attente maximale du caractère de synchro 0x05
   response_timeout: 1s    # attente maximale de la réponse après la requête
   max_retries: 2          # nouvelles tentatives avant d'abandonner le cycle
-  # Les six catégories d'écriture sont autorisées explicitement. Chacune
-  # garde ses listes blanches, ses limites et ses protections internes.
-  # Écritures Optolink : interrupteur général, exigé par les cinq autres.
-  enable_writes: true
-  # Programmes de fonctionnement A1 (0x2301).
-  enable_mode_writes: true
-  # Programme de M2 (0x3301) : écriture NON documentée pour la KW3. Exige
-  # enable_mode_writes. Climate M2 : HEAT = 03, OFF = 00, jamais 05.
-  enable_m2_mode_write: true
-  # Bouclage ECS à la demande : écriture temporaire des blocs horaires du
-  # bouclage (0x2200-0x2237) seulement, jours de validated_days.
-  enable_schedule_writes: true
-  # Consigne ECS (0x6300) : limitée en interne à 50..60 °C.
-  enable_dhw_setpoint_write: true
-  # Consignes de chauffage A1/M2 (0x2306, 0x2307, 0x3306, 0x3307) : limites
-  # internes provisoires par registre, confort >= réduite.
-  enable_heating_setpoint_writes: true
+  # Écritures : autorisées par défaut, sans déclaration, dans les limites des
+  # protections internes (listes blanches, contrôle des valeurs, relecture
+  # après chaque écriture, restauration du bouclage). Pour désactiver :
+  # enable_writes: false (tout), ou l'autorisation concernée à false
+  # (docs/ecriture-kw.md).
 
 sensor:
   # --- Températures (int16, dixièmes de degré) ------------------------------
@@ -454,12 +440,12 @@ climate:
 # puis rétablit exactement le bloc d'origine (sauvegardé en flash avant toute
 # écriture). La pompe reste commandée par la régulation : 0x0846 n'est jamais
 # écrit ; il reste lu pour voir si le circulateur tourne réellement.
-# Autorisé les sept jours. La sauvegarde, la vérification par relecture et la
-# restauration sécurisée restent obligatoires.
+# Autorisé par défaut les sept jours (validated_days, sans déclaration ; une
+# liste réduite ou [] le restreint). Sauvegarde en flash, relecture et
+# restauration vérifiée restent obligatoires.
 visslink_boost:
   visslink_id: viessmann
   time_id: ha_time
-  validated_days: [monday, tuesday, wednesday, thursday, friday, saturday, sunday]
   start:
     name: "Bouclage ECS — Démarrer maintenant"
   duration:

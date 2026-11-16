@@ -342,12 +342,16 @@ l'historique ne suffit pas.
 
 ### Autorisation explicite
 
-[`iot-viessmann-ecritures-autorisees.yaml`](../examples/iot-viessmann-ecritures-autorisees.yaml)
-autorise les **six catégories d'écriture**, et le bouclage **les sept jours**
-(`validated_days` : les 7 jours).
+Depuis la v0.7.2, les **six catégories d'écriture** et les **sept jours** du
+bouclage sont autorisés **par défaut**, sans déclaration. Aucun exemple ne
+déclare plus ces options. Pour restreindre :
 
-Les autres exemples ne changent pas : toutes les écritures y restent
-désactivées et `validated_days: []`.
+- `enable_schedule_writes: false` sous `visslink:` désactive le bouclage ;
+- `validated_days: [sunday]` le limite à certains jours ;
+- `validated_days: []` le désactive.
+
+[`iot-viessmann-ecritures-autorisees.yaml`](../examples/iot-viessmann-ecritures-autorisees.yaml)
+ajoute les entités de suivi décrites ci-dessous.
 
 Rien n'est retiré dans le composant :
 

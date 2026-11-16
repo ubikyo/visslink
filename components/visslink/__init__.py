@@ -1,7 +1,8 @@
 """VissLink : communication Optolink (protocole KW) avec une régulation
-Viessmann Vitotronic. Lecture seule par défaut ; l'écriture des consignes de
-la liste blanche (plateforme `number`) n'est possible qu'avec
-`enable_writes: true`."""
+Viessmann Vitotronic. Écritures autorisées par défaut, limitées par les
+protections internes (listes blanches, limites, relectures, restauration) ;
+`enable_writes: false` (ou une autorisation particulière à `false`) les
+désactive."""
 
 import logging
 from collections import Counter
@@ -172,35 +173,41 @@ async def register_register(var, config):
     cg.add(parent.add_register(var))
 
 
+# Autorisations d'écriture : activées par défaut (sans déclaration YAML).
+# Chacune suit son parent : enable_writes: false désactive tout, et
+# enable_mode_writes: false désactive aussi le programme de M2. Un `false`
+# explicite désactive toujours la fonction. Les protections internes
+# (listes blanches, limites, relectures, restauration) ne dépendent pas de
+# ces options.
+WRITE_FLAG_PARENTS = {
+    CONF_ENABLE_WRITES: (),
+    CONF_ENABLE_MODE_WRITES: (CONF_ENABLE_WRITES,),
+    CONF_ENABLE_M2_MODE_WRITE: (CONF_ENABLE_WRITES, CONF_ENABLE_MODE_WRITES),
+    CONF_ENABLE_SCHEDULE_WRITES: (CONF_ENABLE_WRITES,),
+    CONF_ENABLE_DHW_SETPOINT_WRITE: (CONF_ENABLE_WRITES,),
+    CONF_ENABLE_HEATING_SETPOINT_WRITES: (CONF_ENABLE_WRITES,),
+}
+
+
+def _resolve_write_flags(config):
+    """Valeur effective de chaque autorisation (défaut : true). Erreur
+    seulement pour une autorisation explicitement à true dont un parent est
+    désactivé : la configuration se contredirait."""
+    for flag, parents in WRITE_FLAG_PARENTS.items():
+        explicit = config.get(flag)
+        parents_on = all(config[parent] for parent in parents)
+        if explicit is True and not parents_on:
+            raise cv.Invalid(
+                f"{flag} requires "
+                + " and ".join(f"{parent}: true" for parent in parents),
+                path=[flag],
+            )
+        config[flag] = (explicit is not False) and parents_on
+    return config
+
+
 def _warn_if_writes_enabled(config):
-    if config[CONF_ENABLE_MODE_WRITES] and not config[CONF_ENABLE_WRITES]:
-        raise cv.Invalid(
-            "enable_mode_writes requires enable_writes: true",
-            path=[CONF_ENABLE_MODE_WRITES],
-        )
-    if config[CONF_ENABLE_M2_MODE_WRITE] and not (
-        config[CONF_ENABLE_WRITES] and config[CONF_ENABLE_MODE_WRITES]
-    ):
-        raise cv.Invalid(
-            "enable_m2_mode_write requires enable_writes: true and "
-            "enable_mode_writes: true",
-            path=[CONF_ENABLE_M2_MODE_WRITE],
-        )
-    if config[CONF_ENABLE_SCHEDULE_WRITES] and not config[CONF_ENABLE_WRITES]:
-        raise cv.Invalid(
-            "enable_schedule_writes requires enable_writes: true",
-            path=[CONF_ENABLE_SCHEDULE_WRITES],
-        )
-    if config[CONF_ENABLE_DHW_SETPOINT_WRITE] and not config[CONF_ENABLE_WRITES]:
-        raise cv.Invalid(
-            "enable_dhw_setpoint_write requires enable_writes: true",
-            path=[CONF_ENABLE_DHW_SETPOINT_WRITE],
-        )
-    if config[CONF_ENABLE_HEATING_SETPOINT_WRITES] and not config[CONF_ENABLE_WRITES]:
-        raise cv.Invalid(
-            "enable_heating_setpoint_writes requires enable_writes: true",
-            path=[CONF_ENABLE_HEATING_SETPOINT_WRITES],
-        )
+    config = _resolve_write_flags(config)
     if config[CONF_ENABLE_HEATING_SETPOINT_WRITES]:
         _LOGGER.warning(
             "VissLink: HEATING SETPOINT WRITES ENABLED (enable_heating_setpoint_"
@@ -258,28 +265,27 @@ CONFIG_SCHEMA = cv.All(
                 ),
             ),
             cv.Optional(CONF_MAX_RETRIES, default=2): cv.int_range(min=0, max=5),
-            # v0.3 : écritures Optolink (consignes de la liste blanche). Non
-            # validées sur la chaudière : désactivées par défaut, cf.
-            # docs/ecriture-kw.md avant toute activation.
-            cv.Optional(CONF_ENABLE_WRITES, default=False): cv.boolean,
+            # Autorisations d'écriture : ACTIVÉES par défaut, `false` pour
+            # désactiver (cf. _resolve_write_flags). Interrupteur général.
+            cv.Optional(CONF_ENABLE_WRITES): cv.boolean,
             # v0.3, expérimental : écriture des programmes de fonctionnement
             # (A1 ; M2 exige en plus enable_m2_mode_write). Exige enable_writes.
-            cv.Optional(CONF_ENABLE_MODE_WRITES, default=False): cv.boolean,
+            cv.Optional(CONF_ENABLE_MODE_WRITES): cv.boolean,
             # v0.4, expérimental : écriture du programme de M2 (0x3301), non
             # documentée. Exige enable_writes ET enable_mode_writes.
-            cv.Optional(CONF_ENABLE_M2_MODE_WRITE, default=False): cv.boolean,
+            cv.Optional(CONF_ENABLE_M2_MODE_WRITE): cv.boolean,
             # v0.5, expérimental : écriture des blocs horaires du bouclage ECS
             # (0x2200-0x2237, 8 octets). Exige enable_writes.
-            cv.Optional(CONF_ENABLE_SCHEDULE_WRITES, default=False): cv.boolean,
+            cv.Optional(CONF_ENABLE_SCHEDULE_WRITES): cv.boolean,
             # v0.6, expérimental : écriture de la consigne ECS (0x6300), dans
             # les limites internes 50..60 °C. Exige enable_writes. Sans elle,
             # enable_writes seul ne permet plus d'écrire 0x6300.
-            cv.Optional(CONF_ENABLE_DHW_SETPOINT_WRITE, default=False): cv.boolean,
+            cv.Optional(CONF_ENABLE_DHW_SETPOINT_WRITE): cv.boolean,
             # v0.7, expérimental : écriture des consignes de chauffage A1/M2
             # (0x2306, 0x2307, 0x3306, 0x3307), limites internes provisoires
             # par registre. Exige enable_writes. Sans elle, enable_writes seul
             # ne permet plus d'écrire ces consignes.
-            cv.Optional(CONF_ENABLE_HEATING_SETPOINT_WRITES, default=False): cv.boolean,
+            cv.Optional(CONF_ENABLE_HEATING_SETPOINT_WRITES): cv.boolean,
         }
     )
     .extend(cv.COMPONENT_SCHEMA)

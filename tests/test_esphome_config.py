@@ -9,10 +9,30 @@ import base64
 import os
 import re
 import subprocess
+from pathlib import Path
 
 import pytest
 
 EXAMPLE = "examples/iot-viessmann.yaml"
+# Autorisations d'écriture : actives par défaut, `false` pour désactiver.
+WRITE_FLAGS = (
+    "enable_writes",
+    "enable_mode_writes",
+    "enable_m2_mode_write",
+    "enable_schedule_writes",
+    "enable_dhw_setpoint_write",
+    "enable_heating_setpoint_writes",
+)
+# Jours du bouclage : les sept par défaut.
+SEVEN_DAYS = (
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+)
 # Exemples de la v0.1.0 et de la v0.2, tels que publiés : doivent rester
 # valides sans modification.
 EXAMPLE_V01 = "tests/fixtures/iot-viessmann-v0.1.yaml"
@@ -39,6 +59,21 @@ def _secrets() -> str:
         'fallback_ap_password: "test-fallback"\n'
         f'api_encryption_key: "{key}"\n'
     )
+
+
+def _with_flags(**flags):
+    """Transformation : déclare explicitement des autorisations sous
+    `visslink:` (les exemples n'en déclarent plus : défaut true)."""
+
+    def transform(text):
+        lines = "".join(f"\n  {k}: {v}" for k, v in flags.items())
+        new, n = re.subn(
+            r"(\n  max_retries: [^\n]*)", lambda m: m.group(1) + lines, text, 1
+        )
+        assert n == 1
+        return new
+
+    return transform
 
 
 def _run_config(repo_root, tmp_path, transform=lambda s: s, example=EXAMPLE):
@@ -143,9 +178,7 @@ INVALID_CASES = {
         "address: 0x2000", 'address: 0x2000\n    lundi:\n      name: "Lundi"'
     ),
     # v0.3 : consignes (number) et écritures.
-    "enable_writes_not_boolean": lambda s: s.replace(
-        "enable_writes: false", "enable_writes: maybe"
-    ),
+    "enable_writes_not_boolean": lambda s: _with_flags(enable_writes="maybe")(s),
     "number_address_not_whitelisted": lambda s: s.replace(
         "address: 0x2306", "address: 0x0846"
     ),
@@ -187,25 +220,22 @@ INVALID_CASES = {
         "address: 0x2306", "address: 0x2306\n    initial_value: 20"
     ),
     # v0.3/v0.4 : modes de fonctionnement (deux select).
-    "mode_writes_without_writes": lambda s: s.replace(
-        "enable_mode_writes: false", "enable_mode_writes: true"
-    ),
-    "mode_writes_not_boolean": lambda s: s.replace(
-        "enable_mode_writes: false", "enable_mode_writes: perhaps"
-    ),
+    # Contradiction explicite : true sous un parent explicitement false.
+    "mode_writes_without_writes": lambda s: _with_flags(
+        enable_writes="false", enable_mode_writes="true"
+    )(s),
+    "mode_writes_not_boolean": lambda s: _with_flags(enable_mode_writes="perhaps")(s),
     # v0.4 : M2 exige enable_writes ET enable_mode_writes.
-    "m2_write_alone": lambda s: s.replace(
-        "enable_m2_mode_write: false", "enable_m2_mode_write: true"
-    ),
-    "m2_write_with_writes_only": lambda s: s.replace(
-        "enable_m2_mode_write: false", "enable_m2_mode_write: true"
-    ).replace("enable_writes: false", "enable_writes: true"),
-    "m2_write_with_mode_writes_only": lambda s: s.replace(
-        "enable_m2_mode_write: false", "enable_m2_mode_write: true"
-    ).replace("enable_mode_writes: false", "enable_mode_writes: true"),
-    "m2_write_not_boolean": lambda s: s.replace(
-        "enable_m2_mode_write: false", "enable_m2_mode_write: maybe"
-    ),
+    "m2_write_alone": lambda s: _with_flags(
+        enable_writes="false", enable_mode_writes="false", enable_m2_mode_write="true"
+    )(s),
+    "m2_write_with_writes_only": lambda s: _with_flags(
+        enable_mode_writes="false", enable_m2_mode_write="true"
+    )(s),
+    "m2_write_with_mode_writes_only": lambda s: _with_flags(
+        enable_writes="false", enable_m2_mode_write="true"
+    )(s),
+    "m2_write_not_boolean": lambda s: _with_flags(enable_m2_mode_write="maybe")(s),
     "select_on_party_register": lambda s: s.replace(
         "address: 0x2301", "address: 0x2303"
     ),
@@ -522,29 +552,43 @@ WRITABLE = {
 }
 
 
-def test_example_writes_disabled_by_default(repo_root, tmp_path):
-    text = (repo_root / EXAMPLE).read_text(encoding="utf-8")
-    assert "  enable_writes: false\n" in text
-    assert "enable_writes: true" not in text
-    # Sans l'option : désactivées aussi (défaut).
-    result = _run_config(
-        repo_root, tmp_path, lambda s: _drop_first(s, "  enable_writes: false\n")
-    )
+def test_example_writes_enabled_by_default(repo_root, tmp_path):
+    """Aucune autorisation déclarée : les six sont actives, le bouclage les
+    sept jours ; les avertissements le rappellent à la compilation."""
+    text = _active_lines((repo_root / EXAMPLE).read_text(encoding="utf-8"))
+    assert "enable_" not in text
+    assert "validated_days" not in text
+    result = _run_config(repo_root, tmp_path)
     out = result.stdout + result.stderr
     assert result.returncode == 0, out
-    assert "enable_writes: false" in out, out
-    assert "WRITES ENABLED" not in out
+    for flag in WRITE_FLAGS:
+        assert f"{flag}: true" in out, flag
+    for day in SEVEN_DAYS:
+        assert f"  - {day}\n" in out, day
+    assert "Optolink WRITES ENABLED" in out, out
 
 
-def test_enable_writes_is_explicit_and_warned(repo_root, tmp_path):
-    result = _run_config(
-        repo_root,
-        tmp_path,
-        lambda s: s.replace("enable_writes: false", "enable_writes: true"),
-    )
+def test_enable_writes_false_disables_everything(repo_root, tmp_path):
+    """Compatibilité : enable_writes: false seul désactive les six
+    autorisations, sans erreur ni avertissement."""
+    result = _run_config(repo_root, tmp_path, _with_flags(enable_writes="false"))
     out = result.stdout + result.stderr
     assert result.returncode == 0, out
-    assert "WRITES ENABLED" in out, out
+    for flag in WRITE_FLAGS:
+        assert f"{flag}: false" in out, flag
+    assert "ENABLED" not in out
+
+
+@pytest.mark.parametrize("flag", WRITE_FLAGS[1:])
+def test_each_flag_false_disables_only_its_feature(repo_root, tmp_path, flag):
+    result = _run_config(repo_root, tmp_path, _with_flags(**{flag: "false"}))
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert f"{flag}: false" in out, out
+    # Le programme de M2 suit celui des programmes ; rien d'autre ne change.
+    off = {flag} | ({"enable_m2_mode_write"} if flag == "enable_mode_writes" else set())
+    for other in WRITE_FLAGS:
+        assert f"{other}: {'false' if other in off else 'true'}" in out, other
 
 
 def test_example_setpoints_are_numbers(repo_root, tmp_path):
@@ -636,8 +680,9 @@ def test_v022_configs_still_valid(repo_root, tmp_path, fixture):
     result = _run_config(repo_root, tmp_path, example=fixture)
     out = result.stdout + result.stderr
     assert result.returncode == 0, out
-    # Sans `enable_writes`, la v0.2.2 reste en lecture seule.
-    assert "enable_writes: false" in out, out
+    # Sans `enable_writes` : autorisé par défaut, mais la v0.2.2 n'a aucune
+    # entité inscriptible (ni number ni select).
+    assert "enable_writes: true" in out, out
     assert "\nnumber:" not in (repo_root / fixture).read_text(encoding="utf-8")
 
 
@@ -664,18 +709,16 @@ def test_cpp_writes_disabled_by_default_and_never_restored(repo_root):
 MODES = {0x00: "ECS seule", 0x03: "Chauffage + ECS", 0x05: "Arrêt"}
 
 
-def test_example_mode_writes_disabled_by_default(repo_root, tmp_path):
-    text = (repo_root / EXAMPLE).read_text(encoding="utf-8")
-    assert "  enable_mode_writes: false\n" in text
+def test_explicit_true_flags_still_accepted(repo_root, tmp_path):
+    """Compatibilité : les configurations qui déclarent les six autorisations
+    à true restent valides."""
     result = _run_config(
-        repo_root,
-        tmp_path,
-        lambda s: _drop_first(s, "  enable_mode_writes: false\n"),
+        repo_root, tmp_path, _with_flags(**{flag: "true" for flag in WRITE_FLAGS})
     )
     out = result.stdout + result.stderr
     assert result.returncode == 0, out
-    assert "enable_mode_writes: false" in out, out
-    assert "OPERATING MODE WRITES ENABLED" not in out
+    for flag in WRITE_FLAGS:
+        assert f"{flag}: true" in out, flag
 
 
 def test_mode_writes_need_both_flags_and_warn(repo_root, tmp_path):
@@ -708,21 +751,15 @@ def test_example_mode_entities(repo_root, tmp_path):
         assert out.count(f"address: {address}\n") == 1, address  # aucun doublon
 
 
-def test_example_three_write_flags_false_by_default(repo_root, tmp_path):
-    text = (repo_root / EXAMPLE).read_text(encoding="utf-8")
-    for flag in ("enable_writes", "enable_mode_writes", "enable_m2_mode_write"):
-        assert f"  {flag}: false\n" in text, flag
-        assert f"{flag}: true" not in text, flag
-
-    def transform(s):
-        for flag in ("enable_writes", "enable_mode_writes", "enable_m2_mode_write"):
-            s = _drop_first(s, f"  {flag}: false\n")
-        return s
-
-    result = _run_config(repo_root, tmp_path, transform)
+def test_explicit_false_flags_still_accepted(repo_root, tmp_path):
+    """Compatibilité : une configuration qui déclare les six autorisations à
+    false (exemples v0.3 à v0.7.1) reste valide et en lecture seule."""
+    result = _run_config(
+        repo_root, tmp_path, _with_flags(**{flag: "false" for flag in WRITE_FLAGS})
+    )
     out = result.stdout + result.stderr
     assert result.returncode == 0, out
-    for flag in ("enable_writes", "enable_mode_writes", "enable_m2_mode_write"):
+    for flag in WRITE_FLAGS:
         assert f"{flag}: false" in out, flag
     assert "ENABLED" not in out
 
@@ -820,13 +857,12 @@ def test_v04_config_still_valid(repo_root, tmp_path):
 DIAGNOSTIC_LOOP = "examples/iot-viessmann-diagnostic-bouclage.yaml"
 
 
-def test_loop_diagnostic_is_read_only_and_valid(repo_root, tmp_path):
+def test_loop_diagnostic_valid(repo_root, tmp_path):
     result = _run_config(repo_root, tmp_path, example=DIAGNOSTIC_LOOP)
     out = result.stdout + result.stderr
     assert result.returncode == 0, out
     for flag in ("enable_writes", "enable_mode_writes", "enable_m2_mode_write"):
-        assert f"{flag}: false" in out, flag
-    assert "ENABLED" not in out
+        assert f"{flag}: true" in out, flag  # défaut
     # 0x0846 lu en octet brut, programmation du bouclage relue toutes les 10 min.
     assert re.search(
         r"name: TEST — Bouclage ECS brut\n(?:    [^\n]*\n)*?    address: 0x846\n", out
@@ -853,7 +889,12 @@ def test_loop_diagnostic_only_adds_read_entities(repo_root):
     example = _active_lines((repo_root / EXAMPLE_V041).read_text(encoding="utf-8"))
     diag = _active_lines((repo_root / DIAGNOSTIC_LOOP).read_text(encoding="utf-8"))
     removed = [line for line in example.splitlines() if line not in diag.splitlines()]
-    assert removed == [], removed
+    # Autorisations à false de la v0.4.1 : retirées (défaut true).
+    assert removed == [
+        "  enable_writes: false",
+        "  enable_mode_writes: false",
+        "  enable_m2_mode_write: false",
+    ], removed
     added = [line for line in diag.splitlines() if line not in example.splitlines()]
     allowed = re.compile(
         r"^\s+(- platform: visslink|name: \"TEST — Bouclage[^\"]*\"|address: 0x0846|"
@@ -879,48 +920,64 @@ def test_v041_config_still_valid(repo_root, tmp_path):
     assert "enable_schedule_writes: false" in out, out
 
 
-def test_example_boost_present_but_inactive(repo_root, tmp_path):
-    text = (repo_root / EXAMPLE).read_text(encoding="utf-8")
-    assert "  enable_schedule_writes: false\n" in text
-    assert "enable_schedule_writes: true" not in text
+def test_example_boost_present_all_days_by_default(repo_root, tmp_path):
+    text = _active_lines((repo_root / EXAMPLE).read_text(encoding="utf-8"))
+    assert "enable_schedule_writes" not in text
+    assert "validated_days" not in text
     result = _run_config(repo_root, tmp_path)
     out = result.stdout + result.stderr
     assert result.returncode == 0, out
     assert "visslink_boost:" in out
-    assert "validated_days: []" in out, out
-    assert "SCHEDULE BLOCK WRITES ENABLED" not in out
+    assert "  validated_days:\n" + "".join(f"    - {d}\n" for d in SEVEN_DAYS) in out, (
+        out
+    )
+    assert "SCHEDULE BLOCK WRITES ENABLED" in out
     # Horloge lue en lecture seule, à 0x088E.
     assert re.search(
         r"name: Vitotronic - Horloge\n(?:    [^\n]*\n)*?    address: 0x88E\n", out
     ), out
 
 
+def test_boost_days_can_still_be_restricted(repo_root, tmp_path):
+    for days, expected in (("[]", "validated_days: []"), ("[sunday]", "  - sunday\n")):
+        result = _run_config(
+            repo_root,
+            tmp_path,
+            lambda s, d=days: s.replace(
+                "\n  time_id: ha_time\n",
+                f"\n  time_id: ha_time\n  validated_days: {d}\n",
+                1,
+            ),
+        )
+        out = result.stdout + result.stderr
+        assert result.returncode == 0, out
+        assert expected in out, out
+        assert "  - monday\n" not in out.partition("visslink_boost:")[2], out
+
+
 def test_schedule_writes_need_enable_writes(repo_root, tmp_path):
     bad = _run_config(
         repo_root,
         tmp_path,
-        lambda s: s.replace(
-            "enable_schedule_writes: false", "enable_schedule_writes: true"
-        ),
+        _with_flags(enable_writes="false", enable_schedule_writes="true"),
     )
     assert bad.returncode != 0, bad.stdout
-    good = _run_config(
-        repo_root,
-        tmp_path,
-        lambda s: s.replace(
-            "enable_schedule_writes: false", "enable_schedule_writes: true"
-        ).replace("enable_writes: false", "enable_writes: true"),
-    )
-    out = good.stdout + good.stderr
-    assert good.returncode == 0, out
-    assert "SCHEDULE BLOCK WRITES ENABLED" in out, out
+    off = _run_config(repo_root, tmp_path, _with_flags(enable_schedule_writes="false"))
+    out = off.stdout + off.stderr
+    assert off.returncode == 0, out
+    assert "enable_schedule_writes: false" in out, out
+    assert "SCHEDULE BLOCK WRITES ENABLED" not in out
 
 
 @pytest.mark.parametrize(
     "case",
     [
-        lambda s: s.replace("validated_days: []", "validated_days: [dimanche]"),
-        lambda s: s.replace("  time_id: ha_time\n  validated_days", "  validated_days"),
+        lambda s: s.replace(
+            "\n  time_id: ha_time\n",
+            "\n  time_id: ha_time\n  validated_days: [dimanche]\n",
+            1,
+        ),
+        lambda s: s.replace("  time_id: ha_time\n  start:", "  start:"),
         lambda s: _drop_first(
             s, '  start:\n    name: "Bouclage ECS — Démarrer maintenant"\n'
         ),
@@ -942,7 +999,11 @@ def test_boost_validated_days_accepted(repo_root, tmp_path):
     result = _run_config(
         repo_root,
         tmp_path,
-        lambda s: s.replace("validated_days: []", "validated_days: [sunday, Monday]"),
+        lambda s: s.replace(
+            "\n  time_id: ha_time\n",
+            "\n  time_id: ha_time\n  validated_days: [sunday, Monday]\n",
+            1,
+        ),
     )
     out = result.stdout + result.stderr
     assert result.returncode == 0, out
@@ -1028,19 +1089,10 @@ def test_eco_party_duplicate_rejected(repo_root, tmp_path):
 ESSAI_V05 = "examples/iot-viessmann-essai-lecture-v0.5.yaml"
 
 
-def test_read_only_trial_config_valid_and_without_writes(repo_root, tmp_path):
+def test_read_trial_config_valid(repo_root, tmp_path):
     result = _run_config(repo_root, tmp_path, example=ESSAI_V05)
     out = result.stdout + result.stderr
     assert result.returncode == 0, out
-    for flag in (
-        "enable_writes",
-        "enable_mode_writes",
-        "enable_m2_mode_write",
-        "enable_schedule_writes",
-    ):
-        assert f"{flag}: false" in out, flag
-    assert "validated_days: []" in out
-    assert "ENABLED" not in out
     for address in ("0x88E", "0x846", "0x2302", "0x2303", "0x3302", "0x3303"):
         assert out.count(f"address: {address}\n") == 1, address
 
@@ -1189,15 +1241,6 @@ def test_loop_hardware_trial_valid_and_without_writes(repo_root, tmp_path):
     result = _run_config(repo_root, tmp_path, example=ESSAI_BOUCLAGE)
     out = result.stdout + result.stderr
     assert result.returncode == 0, out
-    for flag in (
-        "enable_writes",
-        "enable_mode_writes",
-        "enable_m2_mode_write",
-        "enable_schedule_writes",
-    ):
-        assert f"{flag}: false" in out, flag
-    assert "validated_days: []" in out
-    assert "ENABLED" not in out
     # 0x0846 déclaré une seule fois, en octet brut lu toutes les 15 s.
     assert out.count("address: 0x846\n") == 1, out
     assert re.search(
@@ -1283,27 +1326,21 @@ def test_boost_restoring_entity_is_optional(repo_root, tmp_path):
 # --- v0.6 : consigne d'eau chaude sanitaire ---------------------------------
 
 ESSAI_CONSIGNE_ECS = "examples/iot-viessmann-essai-consigne-ecs-v0.6.yaml"
-WRITE_FLAGS = (
-    "enable_writes",
-    "enable_mode_writes",
-    "enable_m2_mode_write",
-    "enable_schedule_writes",
-    "enable_dhw_setpoint_write",
-    "enable_heating_setpoint_writes",
-)
 
 
-def test_dhw_setpoint_write_disabled_by_default(repo_root, tmp_path):
-    text = (repo_root / EXAMPLE).read_text(encoding="utf-8")
-    assert "  enable_dhw_setpoint_write: false\n" in text
-    assert "enable_dhw_setpoint_write: true" not in text
-    result = _run_config(
-        repo_root,
-        tmp_path,
-        lambda s: _drop_first(s, "  enable_dhw_setpoint_write: false\n"),
-    )
+def test_dhw_setpoint_write_enabled_by_default_and_can_be_disabled(repo_root, tmp_path):
+    text = _active_lines((repo_root / EXAMPLE).read_text(encoding="utf-8"))
+    assert "enable_dhw_setpoint_write" not in text
+    result = _run_config(repo_root, tmp_path)
     out = result.stdout + result.stderr
     assert result.returncode == 0, out
+    assert "enable_dhw_setpoint_write: true" in out, out
+    assert "DHW SETPOINT WRITE ENABLED" in out
+    off = _run_config(
+        repo_root, tmp_path, _with_flags(enable_dhw_setpoint_write="false")
+    )
+    out = off.stdout + off.stderr
+    assert off.returncode == 0, out
     assert "enable_dhw_setpoint_write: false" in out, out
     assert "DHW SETPOINT WRITE ENABLED" not in out
 
@@ -1312,27 +1349,17 @@ def test_dhw_setpoint_write_requires_enable_writes(repo_root, tmp_path):
     bad = _run_config(
         repo_root,
         tmp_path,
-        lambda s: s.replace(
-            "enable_dhw_setpoint_write: false", "enable_dhw_setpoint_write: true"
-        ),
+        _with_flags(enable_writes="false", enable_dhw_setpoint_write="true"),
     )
     assert bad.returncode != 0, bad.stdout
     assert "enable_dhw_setpoint_write requires enable_writes: true" in (
         bad.stdout + bad.stderr
     )
-    good = _run_config(
-        repo_root,
-        tmp_path,
-        lambda s: s.replace(
-            "enable_dhw_setpoint_write: false", "enable_dhw_setpoint_write: true"
-        ).replace("enable_writes: false", "enable_writes: true"),
-    )
-    out = good.stdout + good.stderr
-    assert good.returncode == 0, out
-    assert "DHW SETPOINT WRITE ENABLED" in out, out
-    # Aucune autre autorisation n'est activée par la sienne.
-    for flag in WRITE_FLAGS[1:4] + WRITE_FLAGS[5:]:
-        assert f"{flag}: false" in out, flag
+    # enable_writes: false seul : la consigne ECS suit, sans erreur.
+    off = _run_config(repo_root, tmp_path, _with_flags(enable_writes="false"))
+    out = off.stdout + off.stderr
+    assert off.returncode == 0, out
+    assert "enable_dhw_setpoint_write: false" in out, out
 
 
 def test_dhw_limits_and_whitelist_match_cpp(repo_root):
@@ -1378,10 +1405,6 @@ def test_dhw_trial_config_valid_and_without_writes(repo_root, tmp_path):
     result = _run_config(repo_root, tmp_path, example=ESSAI_CONSIGNE_ECS)
     out = result.stdout + result.stderr
     assert result.returncode == 0, out
-    for flag in WRITE_FLAGS:
-        assert f"{flag}: false" in out, flag
-    assert "validated_days: []" in out
-    assert "ENABLED" not in out
     # 0x6300 lu une seule fois : le number, bornes 50..60, 60 s, avec son état.
     assert out.count("address: 0x6300\n") == 1, out
     match = re.search(r"name: ECS - Température de consigne\n((?:    [^\n]*\n)*)", out)
@@ -1415,21 +1438,19 @@ def test_dhw_trial_only_changes_the_dhw_number(repo_root):
 
 @pytest.mark.parametrize(
     "example",
-    [
-        EXAMPLE,
-        ESSAI_V05,
-        ESSAI_BOUCLAGE,
-        ESSAI_CONSIGNE_ECS,
-        "examples/iot-viessmann-essai-chauffage-v0.7.yaml",
-    ],
+    sorted(
+        f"examples/{p.name}"
+        for p in (Path(__file__).resolve().parent.parent / "examples").glob("*.yaml")
+        if p.name != "secrets.yaml"
+    ),
 )
-def test_examples_keep_all_write_flags_false(repo_root, example):
-    text = (repo_root / example).read_text(encoding="utf-8")
-    active = _active_lines(text)
+def test_examples_declare_no_write_flags(repo_root, example):
+    """Configuration minimale : aucun exemple ne déclare les autorisations ni
+    les jours du bouclage (défauts : tout autorisé, sept jours)."""
+    text = _active_lines((repo_root / example).read_text(encoding="utf-8"))
     for flag in WRITE_FLAGS:
-        assert f"  {flag}: false" in active.splitlines(), (example, flag)
-        assert f"{flag}: true" not in active, (example, flag)
-    assert "  validated_days: []" in text
+        assert f"{flag}:" not in text, (example, flag)
+    assert "validated_days" not in text, example
 
 
 # --- v0.7 : consignes de chauffage A1/M2 et climate du plancher M2 -----------
@@ -1438,43 +1459,34 @@ ESSAI_CHAUFFAGE = "examples/iot-viessmann-essai-chauffage-v0.7.yaml"
 HEATING = {0x2306: (16, 23), 0x2307: (10, 20), 0x3306: (16, 22), 0x3307: (14, 20)}
 
 
-def test_heating_setpoint_writes_disabled_by_default(repo_root, tmp_path):
-    text = (repo_root / EXAMPLE).read_text(encoding="utf-8")
-    assert "  enable_heating_setpoint_writes: false\n" in text
-    result = _run_config(
-        repo_root,
-        tmp_path,
-        lambda s: _drop_first(s, "  enable_heating_setpoint_writes: false\n"),
-    )
+def test_heating_setpoint_writes_enabled_by_default_and_can_be_disabled(
+    repo_root, tmp_path
+):
+    result = _run_config(repo_root, tmp_path)
     out = result.stdout + result.stderr
     assert result.returncode == 0, out
+    assert "enable_heating_setpoint_writes: true" in out, out
+    assert "HEATING SETPOINT WRITES ENABLED" in out
+    off = _run_config(
+        repo_root, tmp_path, _with_flags(enable_heating_setpoint_writes="false")
+    )
+    out = off.stdout + off.stderr
+    assert off.returncode == 0, out
     assert "enable_heating_setpoint_writes: false" in out, out
     assert "HEATING SETPOINT WRITES ENABLED" not in out
+    assert "DHW SETPOINT WRITE ENABLED" in out  # isolée : l'ECS reste autorisée
 
 
 def test_heating_setpoint_writes_require_enable_writes(repo_root, tmp_path):
-    def heating_on(s):
-        return s.replace(
-            "enable_heating_setpoint_writes: false",
-            "enable_heating_setpoint_writes: true",
-        )
-
-    bad = _run_config(repo_root, tmp_path, heating_on)
+    bad = _run_config(
+        repo_root,
+        tmp_path,
+        _with_flags(enable_writes="false", enable_heating_setpoint_writes="true"),
+    )
     assert bad.returncode != 0, bad.stdout
     assert "enable_heating_setpoint_writes requires enable_writes: true" in (
         bad.stdout + bad.stderr
     )
-    good = _run_config(
-        repo_root,
-        tmp_path,
-        lambda s: heating_on(s).replace("enable_writes: false", "enable_writes: true"),
-    )
-    out = good.stdout + good.stderr
-    assert good.returncode == 0, out
-    assert "HEATING SETPOINT WRITES ENABLED" in out, out
-    for flag in WRITE_FLAGS[1:5]:  # aucune autre autorisation
-        assert f"{flag}: false" in out, flag
-    assert "DHW SETPOINT WRITE ENABLED" not in out
 
 
 def test_heating_limits_match_cpp(repo_root):
@@ -1508,10 +1520,6 @@ def test_heating_trial_config_valid_and_without_writes(repo_root, tmp_path):
     result = _run_config(repo_root, tmp_path, example=ESSAI_CHAUFFAGE)
     out = result.stdout + result.stderr
     assert result.returncode == 0, out
-    for flag in WRITE_FLAGS:
-        assert f"{flag}: false" in out, flag
-    assert "validated_days: []" in out
-    assert "ENABLED" not in out
     for address in ("0x2306", "0x2307", "0x3306", "0x3307", "0x898", "0x3906"):
         assert out.count(f"address: {address}\n") == 1, address  # une seule lecture
     assert "platform: visslink\n    name: Plancher chauffant\n" in out or (
@@ -1632,23 +1640,13 @@ def test_production_has_no_climate(repo_root):
 # --- v0.7.1 : configuration explicite « toutes écritures autorisées » --------
 
 ECRITURES = "examples/iot-viessmann-ecritures-autorisees.yaml"
-SEVEN_DAYS = (
-    "monday",
-    "tuesday",
-    "wednesday",
-    "thursday",
-    "friday",
-    "saturday",
-    "sunday",
-)
 
 
 def test_all_writes_example_valid_with_six_flags_and_seven_days(repo_root, tmp_path):
     text = _active_lines((repo_root / ECRITURES).read_text(encoding="utf-8"))
     for flag in WRITE_FLAGS:
-        assert f"  {flag}: true" in text.splitlines(), flag
-        assert f"{flag}: false" not in text, flag
-    assert f"  validated_days: [{', '.join(SEVEN_DAYS)}]" in text.splitlines()
+        assert f"{flag}:" not in text, flag  # défaut : true
+    assert "validated_days" not in text  # défaut : les sept jours
     result = _run_config(repo_root, tmp_path, example=ECRITURES)
     out = result.stdout + result.stderr
     assert result.returncode == 0, out
@@ -1673,22 +1671,15 @@ def test_all_writes_example_valid_with_six_flags_and_seven_days(repo_root, tmp_p
 
 
 def test_all_writes_example_only_changes_permissions_and_loop_display(repo_root):
-    """Mêmes entités, bornes et limites que l'essai v0.7 : seules les
-    autorisations, les jours et les affichages du bouclage changent."""
+    """Mêmes entités, bornes et limites que l'essai v0.7 : seuls les
+    affichages du bouclage s'ajoutent."""
     trial = _active_lines((repo_root / ESSAI_CHAUFFAGE).read_text(encoding="utf-8"))
     full = _active_lines((repo_root / ECRITURES).read_text(encoding="utf-8"))
-    removed = [
-        re.sub(r"\s+#.*$", "", line)  # commentaire de fin de ligne
-        for line in trial.splitlines()
-        if line not in full.splitlines()
-    ]
-    assert sorted(removed) == sorted(
-        [f"  {flag}: false" for flag in WRITE_FLAGS] + ["  validated_days: []"]
-    ), removed
+    removed = [line for line in trial.splitlines() if line not in full.splitlines()]
+    assert removed == [], removed
     added = [line for line in full.splitlines() if line not in trial.splitlines()]
     allowed = re.compile(
-        r"^\s+(enable_[a-z0-9_]+: true|validated_days: \[[a-z, ]+\]|"
-        r"- platform: visslink|"
+        r"^\s+(- platform: visslink|"
         r"name: \"Bouclage ECS — (Pompe \(état réel, 0x0846\)|Plage inscrite|"
         r"Temps restant|Restauration en cours)\"|"
         r"address: 0x0846|update_interval: 15s|device_class: running|"

@@ -1,11 +1,13 @@
-# VissLink v0.4.1 — DIAGNOSTIC BOUCLAGE ECS (temporaire, LECTURE SEULE)
+# VissLink v0.4.1 — DIAGNOSTIC BOUCLAGE ECS (temporaire)
 # Base : examples/iot-viessmann.yaml (v0.4.1). Différences :
 #   - programmation du bouclage (0x2200..0x2237) relue toutes les 10 min au
 #     lieu de 6 h, avec le détail des 7 jours ;
 #   - état brut de la pompe de bouclage (0x0846) lu toutes les 60 s.
-# Les trois autorisations d'écriture restent à false : AUCUNE écriture
-# Optolink. Les plages sont modifiées UNIQUEMENT depuis le panneau de la
-# Vitotronic. Procédure : docs/etude-bouclage-ecs.md, § 5.
+# ÉCRITURES AUTORISÉES PAR DÉFAUT (aucune déclaration nécessaire) : consignes,
+# programmes, bouclage ECS les sept jours. Protections internes inchangées
+# (listes blanches, contrôle des valeurs, relecture, restauration). Pour un
+# fonctionnement en lecture seule, ajouter enable_writes: false sous visslink:.
+# Procédure : docs/etude-bouclage-ecs.md, § 5.
 #
 # Charge simulée : ~9,2 lectures/min (exemple : ~7,6), brûleur à 30 s et
 # températures à 60 s inchangés de 2 à 4 s de resynchro.
@@ -76,16 +78,11 @@ visslink:
   sync_timeout: 10s       # attente maximale du caractère de synchro 0x05
   response_timeout: 1s    # attente maximale de la réponse après la requête
   max_retries: 2          # nouvelles tentatives avant d'abandonner le cycle
-  # Écritures Optolink (consignes de la liste blanche uniquement). Laisser à
-  # false tant que la procédure de docs/ecriture-kw.md n'est pas terminée.
-  enable_writes: false
-  # Programmes de fonctionnement (expérimental). Exige aussi enable_writes.
-  # Laisser à false avant l'essai A1 de docs/ecriture-kw.md.
-  enable_mode_writes: false
-  # Programme de M2 (0x3301) : écriture NON documentée pour la KW3. Exige
-  # enable_writes ET enable_mode_writes. Seulement pour l'essai M2, après la
-  # validation de A1.
-  enable_m2_mode_write: false
+  # Écritures : autorisées par défaut, sans déclaration, dans les limites des
+  # protections internes (listes blanches, contrôle des valeurs, relecture
+  # après chaque écriture, restauration du bouclage). Pour désactiver :
+  # enable_writes: false (tout), ou l'autorisation concernée à false
+  # (docs/ecriture-kw.md).
 
 sensor:
   # --- Températures (int16, dixièmes de degré) ------------------------------

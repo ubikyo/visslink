@@ -8,6 +8,27 @@
 > par défaut** (`enable_writes: false`) et doivent le rester jusqu'à la fin de
 > la procédure du § 10.
 
+> **Depuis la v0.7.2 : autorisations actives par défaut.** Les six
+> autorisations (`enable_writes`, `enable_mode_writes`,
+> `enable_m2_mode_write`, `enable_schedule_writes`,
+> `enable_dhw_setpoint_write`, `enable_heating_setpoint_writes`) valent
+> `true` sans déclaration, et le bouclage ECS est autorisé les sept jours
+> (`validated_days`).
+>
+> Chaque autorisation suit son parent :
+>
+> - `enable_writes: false` désactive tout ;
+> - `enable_mode_writes: false` désactive aussi le programme de M2 ;
+> - une autorisation à `false` ne désactive que sa fonction ;
+> - une autorisation explicitement à `true` sous un parent à `false` est
+>   refusée à la validation, comme avant.
+>
+> Les protections internes ne changent pas : listes blanches, contrôle des
+> valeurs, une écriture à la fois, relecture après chaque écriture,
+> restauration du bouclage. Les configurations qui déclarent ces options à
+> `false` restent valides et en lecture seule. Le reste de ce document
+> décrit l'historique de la validation (v0.3 à v0.7.1).
+
 ## 1. Sources
 
 | Source | Version consultée | Apport |

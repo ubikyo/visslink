@@ -5,9 +5,10 @@ Ajoute temporairement, au bloc du jour de la programmation du bouclage
 exactement les 8 octets d'origine. La pompe reste commandée par la
 régulation ; 0x0846 n'est jamais écrit.
 
-Aucune écriture sans `enable_writes: true` ET `enable_schedule_writes: true`
-sur le composant `visslink`, et seulement les jours listés dans
-`validated_days` (correspondance bloc <-> jour vérifiée sur la chaudière).
+Autorisé par défaut (enable_writes et enable_schedule_writes du composant
+`visslink`, défaut true) les sept jours (`validated_days`, défaut : tous) ;
+`false` ou une liste réduite le restreint. Sauvegarde, relecture et
+restauration vérifiée restent obligatoires.
 Procédure : docs/bouclage-ecs-v0.5.md.
 """
 
@@ -52,9 +53,9 @@ CONFIG_SCHEMA = cv.Schema(
         # Heure de Home Assistant : recoupement obligatoire avec l'horloge de
         # la Vitotronic (0x088E).
         cv.Required(CONF_TIME_ID): cv.use_id(time.RealTimeClock),
-        # Jours dont la correspondance avec le bloc 0x2200 + 8 × jour a été
-        # vérifiée sur la chaudière. Liste vide : aucun déclenchement possible.
-        cv.Optional(CONF_VALIDATED_DAYS, default=[]): cv.ensure_list(
+        # Jours autorisés (bloc 0x2200 + 8 × jour). Défaut : les sept jours.
+        # Liste vide : aucun déclenchement possible.
+        cv.Optional(CONF_VALIDATED_DAYS, default=list(DAYS)): cv.ensure_list(
             cv.one_of(*DAYS, lower=True)
         ),
         cv.Required(CONF_START): button.button_schema(

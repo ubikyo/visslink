@@ -8,11 +8,12 @@
 # expérimentaux sont en commentaire en fin de fichier, avec la marche à suivre
 # pour les vérifier avant de les activer.
 #
-# Écritures : DÉSACTIVÉES (enable_writes: false). Les consignes sont exposées
-# en `number` mais restent en lecture seule : une modification depuis Home
-# Assistant est refusée, journalisée, et l'entité revient à la valeur lue.
-# Les écritures KW ne sont pas encore validées sur cette chaudière : lire
-# docs/ecriture-kw.md avant toute activation.
+# ÉCRITURES AUTORISÉES PAR DÉFAUT (aucune déclaration nécessaire) : consignes,
+# programmes, bouclage ECS les sept jours. Protections internes inchangées
+# (listes blanches, contrôle des valeurs, relecture, restauration). Pour un
+# fonctionnement en lecture seule, ajouter enable_writes: false sous visslink:.
+# Une modification refusée (hors limites, liaison, autre écriture en cours)
+# est journalisée et l'entité revient à la valeur lue (docs/ecriture-kw.md).
 #
 # Charge : ~7 lectures/min ici, ~13 avec les registres expérimentaux. Une
 # lecture prend ~2 à 3 s (attente du 0x05), soit 20 à 30 lectures/min au plus :
@@ -82,29 +83,11 @@ visslink:
   sync_timeout: 10s       # attente maximale du caractère de synchro 0x05
   response_timeout: 1s    # attente maximale de la réponse après la requête
   max_retries: 2          # nouvelles tentatives avant d'abandonner le cycle
-  # Écritures Optolink (consignes de la liste blanche uniquement). Laisser à
-  # false tant que la procédure de docs/ecriture-kw.md n'est pas terminée.
-  enable_writes: false
-  # Programmes de fonctionnement (expérimental). Exige aussi enable_writes.
-  # Laisser à false avant l'essai A1 de docs/ecriture-kw.md.
-  enable_mode_writes: false
-  # Programme de M2 (0x3301) : écriture NON documentée pour la KW3. Exige
-  # enable_writes ET enable_mode_writes. Seulement pour l'essai M2, après la
-  # validation de A1.
-  enable_m2_mode_write: false
-  # Bouclage ECS à la demande (v0.5, EXPÉRIMENTAL) : écriture temporaire des
-  # blocs horaires du bouclage (0x2200-0x2237). Exige enable_writes. Laisser
-  # à false avant la procédure de docs/bouclage-ecs-v0.5.md.
-  enable_schedule_writes: false
-  # Consigne ECS (0x6300, v0.6, expérimental) : exige enable_writes ; sans elle,
-  # enable_writes seul ne permet pas d'écrire 0x6300. Écriture limitée en
-  # interne à 50..60 °C. Laisser à false avant docs/consigne-ecs-v0.6.md.
-  enable_dhw_setpoint_write: false
-  # Consignes de chauffage A1/M2 (0x2306, 0x2307, 0x3306, 0x3307, v0.7,
-  # expérimental) : exige enable_writes ; sans elle, enable_writes seul ne
-  # permet pas de les écrire. Limites internes provisoires par registre.
-  # Laisser à false avant docs/consignes-chauffage-v0.7.md.
-  enable_heating_setpoint_writes: false
+  # Écritures : autorisées par défaut, sans déclaration, dans les limites des
+  # protections internes (listes blanches, contrôle des valeurs, relecture
+  # après chaque écriture, restauration du bouclage). Pour désactiver :
+  # enable_writes: false (tout), ou l'autorisation concernée à false
+  # (docs/ecriture-kw.md).
 
 sensor:
   # --- Températures (int16, dixièmes de degré) ------------------------------
@@ -394,12 +377,12 @@ select:
 # puis rétablit exactement le bloc d'origine (sauvegardé en flash avant toute
 # écriture). La pompe reste commandée par la régulation : 0x0846 n'est jamais
 # écrit ; il reste lu pour voir si le circulateur tourne réellement.
-# INACTIF tant que enable_schedule_writes est false, et chaque jour tant que
-# sa correspondance bloc <-> jour n'est pas validée (validated_days).
+# Autorisé par défaut les sept jours (validated_days, sans déclaration ; une
+# liste réduite ou [] le restreint). Sauvegarde en flash, relecture et
+# restauration vérifiée restent obligatoires.
 visslink_boost:
   visslink_id: viessmann
   time_id: ha_time
-  validated_days: []          # ex. [sunday] après validation (docs/bouclage-ecs-v0.5.md)
   start:
     name: "Bouclage ECS — Démarrer maintenant"
   duration:
