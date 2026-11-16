@@ -57,6 +57,62 @@ inline const WritableRegister *find_writable(uint16_t address) {
   return nullptr;
 }
 
+// --- Consigne d'eau chaude sanitaire (v0.6, expérimental) --------------------
+//
+// Liste blanche DISTINCTE : la consigne ECS exige en plus de enable_writes sa
+// propre autorisation, enable_dhw_setpoint_write. Aucune autre autorisation
+// (programmes, M2, blocs horaires) ne la permet.
+static constexpr uint16_t DHW_SETPOINT_ADDRESS = 0x6300;
+static constexpr uint16_t DHW_SETPOINT_WRITE_WHITELIST[] = {DHW_SETPOINT_ADDRESS};
+/// Limites INTERNES d'écriture (°C), plus étroites que la plage documentée
+/// (10..60) : aucune configuration ne peut les élargir. 50 °C au moins
+/// (hygiène : pas de stockage tiède prolongé), 60 °C au plus (plage standard
+/// de la régulation sans codage particulier, risque de brûlure au-delà).
+/// Les bornes min_value/max_value du number restreignent encore cette plage.
+static constexpr uint8_t DHW_WRITE_MIN = 50;
+static constexpr uint8_t DHW_WRITE_MAX = 60;
+
+inline bool is_dhw_setpoint_write_whitelisted(uint16_t address) {
+  for (uint16_t a : DHW_SETPOINT_WRITE_WHITELIST) {
+    if (a == address)
+      return true;
+  }
+  return false;
+}
+
+/// Autorisations de configuration d'une écriture de consigne ECS, vérifiées
+/// à la demande ET juste avant l'émission.
+enum class DhwPermission : uint8_t {
+  OK,
+  WRITES_DISABLED,      ///< enable_writes: false
+  DHW_WRITE_DISABLED,   ///< enable_dhw_setpoint_write: false
+  NOT_WHITELISTED,      ///< pas la consigne ECS
+};
+
+inline const char *dhw_permission_to_string(DhwPermission permission) {
+  switch (permission) {
+    case DhwPermission::OK:
+      return "ok";
+    case DhwPermission::WRITES_DISABLED:
+      return "writes are disabled (enable_writes: false)";
+    case DhwPermission::DHW_WRITE_DISABLED:
+      return "DHW setpoint write is disabled (enable_dhw_setpoint_write: false)";
+    case DhwPermission::NOT_WHITELISTED:
+      return "not the DHW setpoint register";
+  }
+  return "unknown";
+}
+
+inline DhwPermission dhw_write_permitted(uint16_t address, bool enable_writes, bool enable_dhw_setpoint_write) {
+  if (!enable_writes)
+    return DhwPermission::WRITES_DISABLED;
+  if (!enable_dhw_setpoint_write)
+    return DhwPermission::DHW_WRITE_DISABLED;
+  if (!is_dhw_setpoint_write_whitelisted(address))
+    return DhwPermission::NOT_WHITELISTED;
+  return DhwPermission::OK;
+}
+
 // --- Programmes de fonctionnement (v0.3/v0.4, expérimental) ------------------
 //
 // Liste blanche DISTINCTE de celle des consignes. Valeurs lues sur la
@@ -181,6 +237,7 @@ enum class WriteCheck : uint8_t {
   OUT_OF_RANGE,      ///< hors des bornes configurées
   OUT_OF_DOCUMENTED, ///< hors des bornes documentées (ne devrait jamais arriver : refusé par la config)
   VALUE_NOT_ALLOWED, ///< programme : valeur hors de {00, 03, 05}
+  OUT_OF_SAFE_LIMITS, ///< v0.6 : consigne ECS hors des limites internes (DHW_WRITE_MIN..MAX)
 };
 
 inline const char *write_check_to_string(WriteCheck check) {
@@ -201,6 +258,8 @@ inline const char *write_check_to_string(WriteCheck check) {
       return "value outside the documented range";
     case WriteCheck::VALUE_NOT_ALLOWED:
       return "operating mode value not allowed (only 00, 03, 05)";
+    case WriteCheck::OUT_OF_SAFE_LIMITS:
+      return "DHW setpoint outside the internal safety limits (50..60)";
   }
   return "unknown";
 }
@@ -222,6 +281,9 @@ inline WriteCheck check_write_value(uint16_t address, uint8_t length, float valu
     return WriteCheck::OUT_OF_RANGE;
   if (value < reg->min || value > reg->max)
     return WriteCheck::OUT_OF_DOCUMENTED;
+  // v0.6 : limites internes de la consigne ECS, quelle que soit la config.
+  if (is_dhw_setpoint_write_whitelisted(address) && (value < DHW_WRITE_MIN || value > DHW_WRITE_MAX))
+    return WriteCheck::OUT_OF_SAFE_LIMITS;
   out[0] = static_cast<uint8_t>(value);
   return WriteCheck::OK;
 }
@@ -417,8 +479,10 @@ class WriteArbiter {
 
   /// Une écriture partirait maintenant si la ligne était libre (sans rien
   /// retirer de la file).
-  bool ready(uint32_t now, bool link_ok) const {
-    if (this->active_ || this->count_ == 0 || !link_ok)
+  /// v0.6 : `deferred` = propriétaire dont la demande attend (consigne ECS
+  /// pendant une restauration du bouclage), ou NONE.
+  bool ready(uint32_t now, bool link_ok, int deferred = NONE) const {
+    if (this->active_ || this->eligible_count_(deferred) == 0 || !link_ok)
       return false;
     return !this->has_completed_ || time_reached(now, this->completed_ms_ + MIN_SPACING_MS);
   }
@@ -428,14 +492,19 @@ class WriteArbiter {
   /// `link_ok` : dernière transaction réussie (liaison synchronisée).
   /// La demande la plus ancienne passe en premier ; elle devient l'écriture
   /// en cours.
-  bool next(uint32_t now, bool link_ok, Request *out) {
-    if (this->active_ || this->count_ == 0 || !link_ok)
+  /// v0.6 : la demande de `deferred` (s'il n'est pas NONE) est laissée en
+  /// attente ; elle reste soumise à REQUEST_EXPIRY_MS.
+  bool next(uint32_t now, bool link_ok, Request *out, int deferred = NONE) {
+    if (this->active_ || this->eligible_count_(deferred) == 0 || !link_ok)
       return false;
     if (this->has_completed_ && !time_reached(now, this->completed_ms_ + MIN_SPACING_MS))
       return false;
-    size_t oldest = 0;
-    for (size_t i = 1; i < this->count_; i++) {
-      if (static_cast<int32_t>(this->pending_[i].requested_ms - this->pending_[oldest].requested_ms) < 0)
+    size_t oldest = this->count_;
+    for (size_t i = 0; i < this->count_; i++) {
+      if (deferred != NONE && this->pending_[i].owner == deferred)
+        continue;
+      if (oldest == this->count_ ||
+          static_cast<int32_t>(this->pending_[i].requested_ms - this->pending_[oldest].requested_ms) < 0)
         oldest = i;
     }
     this->current_ = this->pending_[oldest];
@@ -469,6 +538,15 @@ class WriteArbiter {
   size_t pending_count() const { return this->count_; }
 
  protected:
+  size_t eligible_count_(int deferred) const {
+    if (deferred == NONE)
+      return this->count_;
+    size_t n = 0;
+    for (size_t i = 0; i < this->count_; i++)
+      n += this->pending_[i].owner != deferred;
+    return n;
+  }
+
   void remove_(size_t index) {
     for (size_t i = index; i + 1 < this->count_; i++)
       this->pending_[i] = this->pending_[i + 1];

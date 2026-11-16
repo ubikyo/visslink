@@ -215,6 +215,12 @@ void VissLinkNumber::publish_unknown(uint8_t /*block*/) {
   if (this->verification_.pending()) {
     ESP_LOGW(TAG, "0x%04X: write %s: read-back failed, requested %u", this->address_,
              verify_result_to_string(this->verification_.on_give_up()), this->verification_.expected());
+    if (is_dhw_setpoint_write_whitelisted(this->address_)) {
+      // v0.6 : consigne ECS, issue inconnue : la dernière valeur confirmée
+      // reste affichée (jamais la valeur demandée).
+      this->restore_read_state();
+      return;
+    }
   }
   if (this->has_read_value())
     this->publish_state(NAN);
@@ -398,6 +404,10 @@ void VissLinkComponent::setup() {
   for (size_t i = 0; i < this->registers_.size(); i++)
     this->scheduler_.add(this->registers_[i]->get_interval(), now + i * STARTUP_STAGGER_MS,
                          this->registers_[i]->get_block_count());
+#ifdef USE_NUMBER
+  if (this->dhw_number_ != nullptr)
+    this->dhw_owner_ = this->index_of_(this->dhw_number_);
+#endif
   // Timer natif d'ESPHome, hors du chemin des lectures.
   this->set_interval("clock", CLOCK_TICK_MS, [this]() {
     for (auto *reg : this->registers_)
@@ -489,6 +499,10 @@ void VissLinkComponent::loop() {
     }
   }
 
+  if (this->dhw_.poll(now))
+    ESP_LOGW(TAG, "0x%04X: DHW setpoint change dropped: no read of the current value", DHW_SETPOINT_ADDRESS);
+  this->dhw_publish_();
+
   this->preempt_unsent_read_(now);
   if (this->kw_.is_idle() && this->scheduler_.current() == RegisterScheduler::NONE && !this->direct_.in_flight) {
     this->drop_expired_writes_(now);
@@ -545,8 +559,13 @@ void VissLinkComponent::handle_result_(KwResult result, uint32_t now) {
       this->link_ok_ = true;
       this->status_clear_warning();
     }
+    // v0.6 : relecture de vérification d'une écriture de ce registre ?
+    const bool verify = this->writes_.active() && this->writes_.current().owner == index &&
+                        this->read_back_.waiting(index);
     if (reg->publish_data(block, data)) {
       this->scheduler_.finish(true, now);
+      if (index == this->dhw_owner_)
+        this->dhw_on_read_(true, data[0], verify, now);
       this->read_back_done_(index, now);  // relecture de vérification terminée ?
       return;
     }
@@ -570,7 +589,11 @@ void VissLinkComponent::handle_result_(KwResult result, uint32_t now) {
   // programmation : conservée).
   if (gave_up) {
     ESP_LOGW(TAG, "0x%04X: giving up for this cycle", address);
+    const bool verify = this->writes_.active() && this->writes_.current().owner == index &&
+                        this->read_back_.waiting(index);
     reg->publish_unknown(block);
+    if (index == this->dhw_owner_)
+      this->dhw_on_read_(false, 0, verify, now);
     this->read_back_done_(index, now);  // relecture de vérification abandonnée ?
   }
 }
@@ -589,6 +612,11 @@ int VissLinkComponent::index_of_(const VissLinkRegister *reg) const {
 #ifdef USE_NUMBER
 void VissLinkComponent::submit_write(VissLinkNumber *number, float value) {
   const uint16_t address = number->get_address();
+  if (is_dhw_setpoint_write_whitelisted(address)) {
+    // v0.6 : consigne ECS, autorisation et transaction dédiées.
+    this->submit_dhw_write_(number, value);
+    return;
+  }
   uint8_t byte = 0;
   const char *refused = nullptr;
   const WriteCheck check = check_write_value(address, number->get_length(), value, number->traits.get_min_value(),
@@ -636,6 +664,8 @@ void VissLinkComponent::drop_expired_writes_(uint32_t now) {
   while (this->writes_.pop_expired(now, &request)) {
     ESP_LOGW(TAG, "0x%04X: write of %u dropped: not sent within %" PRIu32 " s", request.address, request.value,
              WriteArbiter::REQUEST_EXPIRY_MS / 1000);
+    if (request.owner == this->dhw_owner_)
+      this->dhw_.on_dropped(VL_TEXT("délai de 120 s dépassé"));
     if (request.owner == WriteArbiter::BOOST_OWNER) {
       if (this->block_client_ != nullptr)
         this->block_client_->on_block_write(request.address, false, false, now);  // rien d'émis
@@ -647,7 +677,7 @@ void VissLinkComponent::drop_expired_writes_(uint32_t now) {
 
 bool VissLinkComponent::start_write_(uint32_t now) {
   WriteArbiter::Request request;
-  if (!this->enable_writes_ || !this->writes_.next(now, this->link_ok_, &request))
+  if (!this->enable_writes_ || !this->writes_.next(now, this->link_ok_, &request, this->dhw_deferred_owner_()))
     return false;
   // Dernier contrôle avant émission : la demande a été validée au dépôt,
   // mais rien ne part sans un nouveau contrôle complet (adresse de la liste
@@ -677,10 +707,19 @@ bool VissLinkComponent::start_write_(uint32_t now) {
   const bool mode_ok = !is_mode_register(request.address) ||
                        mode_write_permitted(request.address, this->enable_writes_, this->enable_mode_writes_,
                                             this->enable_m2_mode_write_) == ModePermission::OK;
-  if (reg->get_address() != request.address || !is_write_whitelisted(request.address) || !mode_ok ||
+  // v0.6 : consigne ECS : autorisation dédiée, et transaction en attente de
+  // exactement cette valeur.
+  const bool dhw = is_dhw_setpoint_write_whitelisted(request.address);
+  const bool dhw_ok = !dhw || (request.owner == this->dhw_owner_ &&
+                               dhw_write_permitted(request.address, this->enable_writes_,
+                                                   this->enable_dhw_setpoint_write_) == DhwPermission::OK &&
+                               this->dhw_.expects_write(request.value));
+  if (reg->get_address() != request.address || !is_write_whitelisted(request.address) || !mode_ok || !dhw_ok ||
       !reg->write_allowed(request.value) || !this->kw_.request_write(request.address, &request.value, 1, now)) {
     ESP_LOGE(TAG, "0x%04X: write of %u refused at send time", request.address, request.value);
     this->writes_.complete(now);
+    if (dhw)
+      this->dhw_.on_dropped(VL_TEXT("refusée au moment de l'émission"));
     reg->restore_read_state();
     return false;
   }
@@ -702,7 +741,7 @@ void VissLinkComponent::preempt_unsent_read_(uint32_t now) {
   const bool direct_ready = this->direct_.pending && !this->direct_.in_flight && time_reached(now, this->direct_.due_ms);
   if (this->write_in_flight_ || this->direct_.in_flight || current == RegisterScheduler::NONE ||
       this->scheduler_.entry(current).urgent == RegisterScheduler::URGENT_VERIFY || !this->kw_.is_waiting_sync() ||
-      !((this->enable_writes_ && this->writes_.ready(now, this->link_ok_)) || direct_ready))
+      !((this->enable_writes_ && this->writes_.ready(now, this->link_ok_, this->dhw_deferred_owner_())) || direct_ready))
     return;
   if (this->kw_.cancel_before_send()) {
     this->scheduler_.release();
@@ -733,6 +772,12 @@ void VissLinkComponent::handle_write_result_(KwResult result, uint32_t now) {
     return;
   }
   VissLinkRegister *reg = this->registers_[request.owner];
+  if (request.owner == this->dhw_owner_) {
+    this->dhw_.on_ack(result == KwResult::SUCCESS          ? DhwAck::RECEIVED
+                      : result == KwResult::WRITE_REJECTED ? DhwAck::REJECTED
+                      : result == KwResult::SYNC_TIMEOUT   ? DhwAck::NOT_SENT
+                                                           : DhwAck::INDETERMINATE);
+  }
   switch (result) {
     case KwResult::SUCCESS:
       ESP_LOGD(TAG, "0x%04X <- %02X (write acknowledged)", request.address, this->kw_.data()[0]);
@@ -1012,6 +1057,89 @@ void VissLinkComponent::submit_mode_write(VissLinkModeSelect *select, size_t ind
 }
 #endif
 
+// ---------------------------------------------------------------------------
+// Consigne d'eau chaude sanitaire (v0.6, expérimental)
+
+#ifdef USE_NUMBER
+void VissLinkComponent::submit_dhw_write_(VissLinkNumber *number, float value) {
+  const uint32_t now = millis();
+  DhwContext ctx;
+  ctx.enable_writes = this->enable_writes_;
+  ctx.enable_dhw_setpoint_write = this->enable_dhw_setpoint_write_;
+  ctx.link_ok = this->link_ok_;
+  ctx.has_value = number->has_read_value() && this->dhw_owner_ != WriteArbiter::NONE;
+  ctx.config_min = number->traits.get_min_value();
+  ctx.config_max = number->traits.get_max_value();
+  ESP_LOGI(TAG, "0x%04X: DHW setpoint change requested: %.1f (current %.0f)", DHW_SETPOINT_ADDRESS, value,
+           number->has_read_value() ? number->state : NAN);
+  switch (this->dhw_.request(value, ctx, now)) {
+    case DhwAction::PRE_READ:
+      ESP_LOGI(TAG, "0x%04X: permissions ok (enable_writes, enable_dhw_setpoint_write), reading the current value first",
+               DHW_SETPOINT_ADDRESS);
+      // Relecture prioritaire sur les lectures ordinaires, mais jamais
+      // intercalée entre une écriture et sa vérification (URGENT_REFRESH) ;
+      // si le registre est déjà en cours de lecture, c'est elle qui sert.
+      if (!this->scheduler_.expedite_block(this->dhw_owner_, 0, now))
+        ESP_LOGD(TAG, "0x%04X: read already in progress, used as the current value", DHW_SETPOINT_ADDRESS);
+      break;
+    default:
+      ESP_LOGW(TAG, "0x%04X: DHW setpoint %.1f refused: %s; nothing sent", DHW_SETPOINT_ADDRESS, value,
+               this->dhw_.reason());
+      break;
+  }
+  // L'entité affiche toujours la valeur LUE, jamais la demande.
+  number->restore_read_state();
+  this->dhw_publish_();
+}
+#endif
+
+void VissLinkComponent::dhw_on_read_(bool ok, uint8_t value, bool verify, uint32_t now) {
+  const uint32_t panel_changes = this->dhw_.panel_changes();
+  switch (this->dhw_.on_read(ok, value, verify, now)) {
+    case DhwAction::SUBMIT: {
+      const uint8_t target = this->dhw_.target();
+      ESP_LOGI(TAG, "0x%04X: DHW setpoint: current %u, requested %u: write queued", DHW_SETPOINT_ADDRESS, value, target);
+      if (this->writes_.submit(this->dhw_owner_, DHW_SETPOINT_ADDRESS, target, now) == WriteArbiter::Submit::FULL) {
+        ESP_LOGW(TAG, "0x%04X: DHW setpoint write refused: too many pending writes", DHW_SETPOINT_ADDRESS);
+        this->dhw_.on_dropped(VL_TEXT("trop d'écritures en attente"));
+      } else if (this->dhw_deferred_owner_() != WriteArbiter::NONE) {
+        ESP_LOGI(TAG, "0x%04X: DHW setpoint write waits for the circulation schedule restore", DHW_SETPOINT_ADDRESS);
+      }
+      break;
+    }
+    case DhwAction::UNCHANGED:
+      ESP_LOGI(TAG, "0x%04X: DHW setpoint already %u, nothing written", DHW_SETPOINT_ADDRESS, value);
+      break;
+    case DhwAction::REFUSED:
+      ESP_LOGW(TAG, "0x%04X: DHW setpoint change dropped: current value unreadable, nothing written",
+               DHW_SETPOINT_ADDRESS);
+      break;
+    default:
+      if (this->dhw_.panel_changes() != panel_changes)
+        ESP_LOGI(TAG, "0x%04X: DHW setpoint changed outside VissLink (panel?): now %u", DHW_SETPOINT_ADDRESS, value);
+      break;
+  }
+}
+
+void VissLinkComponent::dhw_publish_() {
+  if (this->dhw_.version() == this->dhw_published_)
+    return;
+  this->dhw_published_ = this->dhw_.version();
+  ESP_LOGD(TAG, "DHW setpoint status: %s", this->dhw_.status().c_str());
+#ifdef USE_TEXT_SENSOR
+  if (this->dhw_status_ != nullptr) {
+    std::string text = this->dhw_.status();
+    truncate_state(text);
+    this->dhw_status_->publish_state(text);
+  }
+#endif
+}
+
+int VissLinkComponent::dhw_deferred_owner_() const {
+  return this->block_client_ != nullptr && this->block_client_->restore_priority() ? this->dhw_owner_
+                                                                                     : WriteArbiter::NONE;
+}
+
 void VissLinkComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "VissLink (Optolink KW):");
   ESP_LOGCONFIG(TAG, "  Writes: %s", this->enable_writes_ ? "ENABLED (whitelisted setpoints only)" : "disabled (read-only)");
@@ -1019,6 +1147,8 @@ void VissLinkComponent::dump_config() {
                 this->enable_writes_ && this->enable_mode_writes_ ? "ENABLED (experimental)" : "disabled");
   ESP_LOGCONFIG(TAG, "  Schedule block writes (circulation 0x2200-0x2237): %s",
                 this->schedule_writes_enabled() ? "ENABLED (experimental)" : "disabled");
+  ESP_LOGCONFIG(TAG, "  DHW setpoint write (0x6300, internal limits %u..%u): %s", DHW_WRITE_MIN, DHW_WRITE_MAX,
+                this->dhw_setpoint_writes_enabled() ? "ENABLED (experimental)" : "disabled");
   ESP_LOGCONFIG(TAG, "  M2 operating mode write (0x3301): %s",
                 mode_write_permitted(M2_MODE_REGISTER, this->enable_writes_, this->enable_mode_writes_,
                                      this->enable_m2_mode_write_) == ModePermission::OK

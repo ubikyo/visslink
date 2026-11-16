@@ -11,6 +11,7 @@
 #include <memory>
 
 #include "decode.h"
+#include "dhw_setpoint.h"
 #include "kw_protocol.h"
 #include "schedule.h"
 #include "scheduler.h"
@@ -136,6 +137,30 @@ struct Bench {
   int refused_at_send{0};
   std::vector<std::pair<uint32_t, uint8_t>> params;  ///< (intervalle, blocs) par registre, pour reboot()
 
+  // v0.6 : consigne ECS (même logique que VissLinkComponent).
+  bool enable_dhw_setpoint_write{false};
+  DhwSetpointWriter dhw;
+  int dhw_owner{WriteArbiter::NONE};
+  /// VissLinkBlockClient::restore_priority (bouclage ECS).
+  std::function<bool()> restore_priority;
+  std::vector<DhwAction> dhw_actions;  ///< issues des demandes et relectures
+  /// Observation (tests) : état de restauration du bouclage, indépendant de
+  /// la priorité, et écritures ECS démarrées pendant une restauration.
+  std::function<bool()> restore_observer;
+  int dhw_started_in_restore{0};
+  int dhw_deferred() const {
+    return restore_priority && restore_priority() ? dhw_owner : WriteArbiter::NONE;
+  }
+  /// VissLinkComponent::dhw_on_read_.
+  void dhw_on_read(bool ok, uint8_t value, bool verify, uint32_t now) {
+    const DhwAction a = dhw.on_read(ok, value, verify, now);
+    if (a != DhwAction::NONE)
+      dhw_actions.push_back(a);
+    if (a == DhwAction::SUBMIT &&
+        writes.submit(dhw_owner, DHW_SETPOINT_ADDRESS, dhw.target(), now) == WriteArbiter::Submit::FULL)
+      dhw.on_dropped("full");
+  }
+
   Bench() {
     boiler.registers[0x0800] = {0xCC, 0xFF};  // -5,2 °C
     boiler.registers[0x0802] = {0x2C, 0x02};  // 55,6 °C
@@ -226,6 +251,8 @@ struct Bench {
     regs.push_back(r);
     params.push_back({interval_ms, 1});
     scheduler.add(interval_ms, now + stagger_ms * (regs.size() - 1));
+    if (address == DHW_SETPOINT_ADDRESS)
+      dhw_owner = static_cast<int>(regs.size() - 1);  // VissLinkComponent::set_dhw_setpoint_number
     return regs.size() - 1;
   }
   size_t add_mode(uint16_t address, uint32_t interval_ms, uint32_t now) {
@@ -315,6 +342,22 @@ struct Bench {
   /// "queued" / "replaced" / "unchanged".
   std::string request(size_t index, float value, uint32_t now) {
     const Reg &r = regs[index];
+    if (is_dhw_setpoint_write_whitelisted(r.address)) {
+      // VissLinkComponent::submit_dhw_write_ (v0.6).
+      DhwContext ctx;
+      ctx.enable_writes = enable_writes;
+      ctx.enable_dhw_setpoint_write = enable_dhw_setpoint_write;
+      ctx.link_ok = link_ok;
+      ctx.has_value = has_read_value(index) && dhw_owner != WriteArbiter::NONE;
+      ctx.config_min = r.min;
+      ctx.config_max = r.max;
+      const DhwAction a = dhw.request(value, ctx, now);
+      dhw_actions.push_back(a);
+      if (a != DhwAction::PRE_READ)
+        return std::string("refused: ") + dhw.reason();
+      scheduler.expedite_block(static_cast<size_t>(dhw_owner), 0, now);  // URGENT_REFRESH
+      return "pre-read";
+    }
     uint8_t byte = 0;
     const WriteCheck check = check_write_value(r.address, 1, value, r.min, r.max, &byte);
     if (!enable_writes)
@@ -351,6 +394,7 @@ struct Bench {
     weeks.clear();  // programmations publiées perdues avec la RAM
     day_published_ms.clear();
     writes = WriteArbiter();
+    dhw = DhwSetpointWriter();  // rien de persistant
     write_in_flight = false;
     link_ok = false;
     verify.clear();
@@ -389,6 +433,7 @@ struct Bench {
   /// Même enchaînement que VissLinkComponent::loop() / handle_result_().
   void step(uint32_t now) {
     const KwResult result = kw.loop(now, serial);
+    dhw.poll(now);  // VissLinkComponent::loop
     if (result != KwResult::NONE && write_in_flight && writes.current().owner == WriteArbiter::BOOST_OWNER) {
       // VissLinkComponent::handle_block_write_result_
       write_in_flight = false;
@@ -432,6 +477,11 @@ struct Bench {
       if (result == KwResult::SYNC_TIMEOUT)
         link_ok = false;
       const WriteArbiter::Request &w = writes.current();
+      if (w.owner == dhw_owner)
+        dhw.on_ack(result == KwResult::SUCCESS          ? DhwAck::RECEIVED
+                   : result == KwResult::WRITE_REJECTED ? DhwAck::REJECTED
+                   : result == KwResult::SYNC_TIMEOUT   ? DhwAck::NOT_SENT
+                                                        : DhwAck::INDETERMINATE);
       verify[w.owner].expect(w.value);
       const int peer = mode_peer(w.owner);
       read_back.start(w.owner, peer);
@@ -468,9 +518,13 @@ struct Bench {
           // décodé ci-dessus
         } else if (r.number) {
           const uint8_t value = kw.data()[0];
+          const bool verifying = writes.active() && writes.current().owner == static_cast<int>(index) &&
+                                 read_back.waiting(static_cast<int>(index));
           if (verify[index].pending())
             verify_results.push_back(verify[index].on_read(value));
           number_state[index] = value;  // toujours la valeur lue
+          if (static_cast<int>(index) == dhw_owner)
+            dhw_on_read(true, value, verifying, now);
           read_back_done(index, now);
         } else if (r.mode) {
           const uint8_t raw = kw.data()[0];
@@ -493,12 +547,19 @@ struct Bench {
         if (scheduler.finish(false, now)) {
           gave_up[index]++;
           if (r.number || r.mode) {
-            if (verify[index].pending())
+            const bool verifying = writes.active() && writes.current().owner == static_cast<int>(index) &&
+                                   read_back.waiting(static_cast<int>(index));
+            const bool was_pending = verify[index].pending();
+            if (was_pending)
               verify_results.push_back(verify[index].on_give_up());
-            if (r.number)
+            // VissLinkNumber::publish_unknown : consigne ECS, issue inconnue
+            // -> dernière valeur confirmée conservée (v0.6).
+            if (r.number && !(was_pending && is_dhw_setpoint_write_whitelisted(r.address)))
               number_state[index] = NAN;
-            else
+            else if (r.mode)
               mode_state[index] = -1;
+            if (static_cast<int>(index) == dhw_owner)
+              dhw_on_read(false, 0, verifying, now);
             read_back_done(index, now);
           }
         }
@@ -508,7 +569,7 @@ struct Bench {
     const bool direct_ready = direct.pending && !direct.in_flight && time_reached(now, direct.due_ms);
     if (preempt_unsent_reads && !write_in_flight && !direct.in_flight && kw.is_waiting_sync() &&
         scheduler.current() != RegisterScheduler::NONE && scheduler.entry(scheduler.current()).urgent != RegisterScheduler::URGENT_VERIFY &&
-        ((enable_writes && writes.ready(now, link_ok)) || direct_ready) && kw.cancel_before_send()) {
+        ((enable_writes && writes.ready(now, link_ok, dhw_deferred())) || direct_ready) && kw.cancel_before_send()) {
       scheduler.release();
       preemptions++;
     }
@@ -516,11 +577,13 @@ struct Bench {
       WriteArbiter::Request w;
       while (writes.pop_expired(now, &w)) {
         expired_writes++;
+        if (w.owner == dhw_owner)
+          dhw.on_dropped("expired");
         if (w.owner == WriteArbiter::BOOST_OWNER && on_block_write)
           on_block_write(w.address, false, false, now);
       }
       bool started = false;
-      if (enable_writes && writes.next(now, link_ok, &w)) {
+      if (enable_writes && writes.next(now, link_ok, &w, dhw_deferred())) {
         if (w.owner == WriteArbiter::BOOST_OWNER) {
           // VissLinkComponent::start_write_, bloc horaire : contrôles revérifiés.
           if (w.length == 8 && block_write_allowed(w.address, w.data) &&
@@ -538,7 +601,12 @@ struct Bench {
           // (VissLinkRegister::write_allowed, refus par défaut hors number).
           const Reg &r = regs[w.owner];
           uint8_t encoded = 0;
-          const bool number_ok = r.number && find_writable(w.address) != nullptr &&
+          const bool dhw_ok =
+              !is_dhw_setpoint_write_whitelisted(w.address) ||
+              (w.owner == dhw_owner &&
+               dhw_write_permitted(w.address, enable_writes, enable_dhw_setpoint_write) == DhwPermission::OK &&
+               dhw.expects_write(w.value));
+          const bool number_ok = r.number && find_writable(w.address) != nullptr && dhw_ok &&
                                  check_write_value(w.address, 1, w.value, r.min, r.max, &encoded) == WriteCheck::OK &&
                                  encoded == w.value;
           const bool mode_ok =
@@ -549,6 +617,8 @@ struct Bench {
           if (allowed && kw.request_write(w.address, &w.value, 1, now)) {
             write_in_flight = true;
             started = true;
+            if (static_cast<int>(w.owner) == dhw_owner && restore_observer && restore_observer())
+              dhw_started_in_restore++;
             write_start_ms.push_back(now);
             timing = WriteTiming();
             timing.requested = w.requested_ms;
@@ -556,6 +626,8 @@ struct Bench {
           } else {
             refused_at_send++;
             writes.complete(now);
+            if (is_dhw_setpoint_write_whitelisted(w.address))
+              dhw.on_dropped("refused at send time");
           }
         }
       }
@@ -1328,7 +1400,7 @@ TEST(sim_v03_readback_is_the_next_transaction) {
     V03 v(b);
     b.run(0, BOOT);
     for (uint32_t t = BOOT; t < BOOT + 10 * MIN; t += 37 * S) {
-      CHECK(b.request(v.dhw, (t / (37 * S)) % 2 ? 55 : 45, t) != "full");
+      CHECK(b.request(v.m2_comfort, (t / (37 * S)) % 2 ? 22 : 18, t) != "full");
       b.run(t, 37 * S);
     }
     const auto &log = b.boiler.frame_log;
@@ -1336,7 +1408,7 @@ TEST(sim_v03_readback_is_the_next_transaction) {
     for (size_t i = 0; i + 1 < log.size(); i++) {
       if (log[i].first == 0xF4) {
         writes++;
-        CHECK(log[i + 1] == (std::pair<uint8_t, uint16_t>{0xF7, 0x6300}));
+        CHECK(log[i + 1] == (std::pair<uint8_t, uint16_t>{0xF7, 0x3306}));
       }
     }
     CHECK(writes >= 10);
@@ -1352,8 +1424,10 @@ TEST(sim_v03_disabled_never_writes) {
   b.run(0, BOOT);
   int refused = 0;
   for (uint32_t t = BOOT; t < H; t += 5 * S) {
-    for (size_t n : v.numbers())
-      refused += b.request(n, b.regs[n].min + 1, t) == "disabled";
+    for (size_t n : v.numbers()) {
+      const std::string r = b.request(n, b.regs[n].min + 1, t);
+      refused += r == "disabled" || r == "refused: writes are disabled (enable_writes: false)";
+    }
     b.run(t, 5 * S);
   }
   CHECK(refused > 3000);
@@ -1402,16 +1476,16 @@ TEST(sim_v03_ack_without_effect_is_detected) {
   Bench b;
   V03 v(b, false);
   b.boiler.write_faults[0x2307] = SimBoiler::WriteFault::ACK_IGNORED;
-  b.boiler.write_clamp[0x6300] = {10, 55};
+  b.boiler.write_clamp[0x3306] = {16, 22};
   b.run(0, BOOT);
   CHECK(b.request(v.a1_reduced, 18, BOOT) == "queued");
   b.run(BOOT, MIN);
-  CHECK(b.request(v.dhw, 60, BOOT + MIN) == "queued");
+  CHECK(b.request(v.m2_comfort, 24, BOOT + MIN) == "queued");
   b.run(BOOT + MIN, MIN);
   CHECK((b.write_results == std::vector<KwResult>{KwResult::SUCCESS, KwResult::SUCCESS}));
   CHECK((b.verify_results == std::vector<VerifyResult>{VerifyResult::MISMATCH, VerifyResult::MISMATCH}));
   CHECK_EQ(b.number_state[v.a1_reduced], 16);
-  CHECK_EQ(b.number_state[v.dhw], 55);
+  CHECK_EQ(b.number_state[v.m2_comfort], 22);
   CHECK_EQ(b.boiler.write_frames, 2);
 }
 
@@ -1469,8 +1543,9 @@ TEST(sim_v03_several_entities_serialized_and_spaced) {
   b.run(0, BOOT);
   const int target[] = {22, 18, 23, 19, 55};
   const auto numbers = v.numbers();
+  b.enable_dhw_setpoint_write = true;  // v0.6 : la consigne ECS a sa propre autorisation
   for (size_t i = 0; i < numbers.size(); i++)
-    CHECK(b.request(numbers[i], target[i], BOOT) == "queued");
+    CHECK(b.request(numbers[i], target[i], BOOT) == (numbers[i] == v.dhw ? "pre-read" : "queued"));
   b.run(BOOT, 3 * MIN);
   CHECK_EQ(b.boiler.write_frames, 5);
   CHECK_EQ(b.verify_results.size(), 5u);
@@ -1501,6 +1576,10 @@ TEST(sim_v03_write_spam_keeps_periodic_reads) {
     V03 v(b);
     ref.run(0, BOOT);
     b.run(0, BOOT);
+    // v0.6 : même rotation sur les cinq consignes, mais l'ECS est refusée
+    // (enable_dhw_setpoint_write: false, et 40..42 hors limites internes) :
+    // seules les quatre consignes d'ambiance sont écrites. La charge propre
+    // à l'ECS (relecture préalable) est mesurée par sim_v06_dhw_*.
     const auto numbers = v.numbers();
     const uint32_t end = 6 * H + 30 * MIN;
     int k = 0;
@@ -1529,7 +1608,10 @@ TEST(sim_v03_write_spam_keeps_periodic_reads) {
       CHECK(b.max_gap_ms[v.burner] <= 55 * S);
     } else {
       CHECK(lost <= 50);
-      CHECK(b.max_gap_ms[v.burner] <= 90 * S);  // jamais plus de deux cycles sautés
+      // Jamais plus de deux cycles sautés : 3 × 30 s + latence d'une lecture
+      // (v0.6 : 93 s mesuré, l'ECS ne s'écrivant plus dans cette rafale ;
+      // 85 s en v0.4.1 avec l'ECS).
+      CHECK(b.max_gap_ms[v.burner] <= 95 * S);
     }
     CHECK(b.max_gap_ms[v.outdoor] <= 110 * S);
     if (vltest::failures() > 0)
@@ -1553,7 +1635,7 @@ TEST(sim_v03_link_loss_never_sends_a_stale_write) {
   while (b.timings.empty() && t < BOOT + MIN)
     b.run(t, 5), t += 5;
   CHECK_EQ(b.boiler.write_frames, 1);  // première écriture terminée
-  CHECK(b.request(v.dhw, 45, t) == "queued");  // en attente de l'espacement
+  CHECK(b.request(v.m2_comfort, 23, t) == "queued");  // en attente de l'espacement
   b.boiler.connected = false;
   b.run(t, 30 * S);
   CHECK(!b.link_ok);
@@ -1563,9 +1645,9 @@ TEST(sim_v03_link_loss_never_sends_a_stale_write) {
   b.boiler.connected = true;
   b.run(t + 210 * S, 20 * MIN);
   CHECK_EQ(b.boiler.write_frames, 1);  // jamais envoyée plus tard
-  CHECK_EQ(b.boiler_value(0x6300), 50);
+  CHECK_EQ(b.boiler_value(0x3306), 21);
   CHECK(b.link_ok);
-  CHECK_EQ(b.number_state[v.dhw], 50);
+  CHECK_EQ(b.number_state[v.m2_comfort], 21);
 }
 
 TEST(sim_v041_link_loss_with_preempted_read_sends_nothing) {
@@ -1579,7 +1661,7 @@ TEST(sim_v041_link_loss_with_preempted_read_sends_nothing) {
   while (!b.kw.is_waiting_sync())
     b.run(t, 5), t += 5;
   b.boiler.connected = false;
-  CHECK(b.request(v.dhw, 45, t) == "queued");
+  CHECK(b.request(v.m2_comfort, 23, t) == "queued");
   b.run(t, 30 * S);
   CHECK_EQ(b.preemptions, 1);
   CHECK(b.write_results == std::vector<KwResult>{KwResult::SYNC_TIMEOUT});
@@ -1587,8 +1669,8 @@ TEST(sim_v041_link_loss_with_preempted_read_sends_nothing) {
   b.boiler.connected = true;
   b.run(t + 30 * S, 20 * MIN);
   CHECK_EQ(b.boiler.write_frames, 0);
-  CHECK_EQ(b.boiler_value(0x6300), 50);
-  CHECK_EQ(b.number_state[v.dhw], 50);
+  CHECK_EQ(b.boiler_value(0x3306), 21);
+  CHECK_EQ(b.number_state[v.m2_comfort], 21);
 }
 
 TEST(sim_v03_link_lost_during_write_frame_not_sent) {
@@ -1652,7 +1734,7 @@ TEST(sim_v03_invalid_requests_never_reach_the_line) {
   CHECK(b.request(v.a1_comfort, 15, BOOT) == "value outside the configured range");
   CHECK(b.request(v.a1_comfort, 20.5f, BOOT) == "value is not an integer");
   CHECK(b.request(v.a1_comfort, NAN, BOOT) == "value is not a finite number");
-  CHECK(b.request(v.dhw, 61, BOOT) == "value outside the configured range");
+  CHECK(b.request(v.m2_comfort, 25, BOOT) == "value outside the configured range");
   CHECK(b.request(v.a1_comfort, 20, BOOT) == "unchanged");  // déjà la valeur lue
   // Un registre lu mais hors liste blanche ne peut pas être écrit, même
   // déclaré par erreur comme consigne.
@@ -2191,16 +2273,16 @@ TEST(sim_v041_no_ordinary_read_inside_read_back_retries) {
     b.strict_read_back = b.preempt_unsent_reads = strict;
     V03 v(b);  // programmations comprises
     b.run(0, 75 * S);
-    CHECK(b.request(v.dhw, 45, 75 * S) == "queued");
+    CHECK(b.request(v.m2_comfort, 23, 75 * S) == "queued");
     bool armed = false, cleared = false;
     for (uint32_t t = 75 * S; t < 3 * MIN; t += 5) {
       b.boiler.tick(t);
       b.step(t);
       if (!armed && b.boiler.write_frames == 1) {
-        b.boiler.register_faults[0x6300] = SimBoiler::Fault::SHORT_RESPONSE;  // relecture tronquée
+        b.boiler.register_faults[0x3306] = SimBoiler::Fault::SHORT_RESPONSE;  // relecture tronquée
         armed = true;
       }
-      if (armed && !cleared && b.failures[v.dhw] > 0) {
+      if (armed && !cleared && b.failures[v.m2_comfort] > 0) {
         b.boiler.register_faults.clear();
         cleared = true;
       }
@@ -2210,10 +2292,10 @@ TEST(sim_v041_no_ordinary_read_inside_read_back_retries) {
     while (log[w].first != 0xF4)
       w++;
     CHECK(w + 2 < log.size());
-    CHECK(log[w + 1].second == 0x6300);  // relecture (échouée)
-    const bool next_is_retry = log[w + 2].second == 0x6300;
+    CHECK(log[w + 1].second == 0x3306);  // relecture (échouée)
+    const bool next_is_retry = log[w + 2].second == 0x3306;
     CHECK_EQ(next_is_retry, strict);
-    CHECK_EQ(b.number_state[v.dhw], 45);
+    CHECK_EQ(b.number_state[v.m2_comfort], 23);
     CHECK_EQ(b.boiler.write_frames, 1);  // la relecture est retentée, jamais l'écriture
   }
 }
@@ -3410,4 +3492,331 @@ TEST(sim_v052_boost_reboot_during_restore_window_writes_nothing) {
   CHECK(x.glue.seq.restore_alert());
   CHECK_EQ(writes_to(b.boiler, 0x2230), 1);  // aucune écriture automatique
   CHECK(x.glue.flash_has);
+}
+
+// --- v0.6 : consigne d'eau chaude sanitaire -----------------------------------
+
+namespace {
+
+/// Production v0.6 : consignes v0.3 (ECS 40..60, lue toutes les 5 min).
+struct Dhw {
+  V03 v;
+  Dhw(Bench &b, bool writes = true, bool dhw_write = true) : v(b, false, writes) {
+    b.enable_dhw_setpoint_write = dhw_write;
+  }
+  size_t number() const { return v.dhw; }
+};
+
+/// Pas de 5 ms jusqu'à `done` (au plus `limit`) ; renvoie l'instant atteint.
+template<typename F> uint32_t run_until(Bench &b, uint32_t t, uint32_t limit, F done) {
+  const uint32_t end = t + limit;
+  while (t < end && !done()) {
+    b.boiler.tick(t);
+    b.step(t);
+    t += 5;
+  }
+  return t;
+}
+
+/// Index de la première trame (fonction, adresse) à partir de `from`.
+size_t find_frame(const SimBoiler &boiler, uint8_t fn, uint16_t address, size_t from = 0) {
+  for (size_t i = from; i < boiler.frame_log.size(); i++) {
+    if (boiler.frame_log[i] == std::pair<uint8_t, uint16_t>{fn, address})
+      return i;
+  }
+  return SIZE_MAX;
+}
+
+/// Chaque trame d'écriture est suivie immédiatement de la relecture de la
+/// même adresse.
+bool read_back_follows_each_write(const SimBoiler &boiler) {
+  const auto &log = boiler.frame_log;
+  for (size_t i = 0; i < log.size(); i++) {
+    if (log[i].first == 0xF4 && (i + 1 >= log.size() || log[i + 1] != std::pair<uint8_t, uint16_t>{0xF7, log[i].second}))
+      return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+TEST(sim_v06_dhw_read_and_refused_without_both_permissions) {
+  struct Case {
+    bool writes, dhw, others;
+    const char *reason;
+  };
+  for (const Case &c : {Case{false, false, false, "refused: writes are disabled (enable_writes: false)"},
+                        Case{true, false, false,
+                             "refused: DHW setpoint write is disabled (enable_dhw_setpoint_write: false)"},
+                        // Les autres autorisations ne permettent jamais 0x6300.
+                        Case{true, false, true,
+                             "refused: DHW setpoint write is disabled (enable_dhw_setpoint_write: false)"}}) {
+    Bench b;
+    Dhw d(b, c.writes, c.dhw);
+    b.enable_mode_writes = b.enable_m2_mode_write = b.enable_schedule_writes = c.others;
+    b.run(0, BOOT);
+    CHECK_EQ(b.number_state[d.number()], 50);  // lecture valide de 0x6300
+    CHECK(b.request(d.number(), 55, BOOT) == c.reason);
+    b.run(BOOT, 10 * MIN);
+    CHECK_EQ(b.boiler.write_frames, 0);
+    CHECK_EQ(writes_to(b.boiler, 0x6300), 0);
+    CHECK_EQ(b.boiler_value(0x6300), 50);
+    CHECK_EQ(b.number_state[d.number()], 50);
+    CHECK(!b.dhw.busy());
+  }
+}
+
+TEST(sim_v06_dhw_write_confirmed_after_fresh_read) {
+  for (uint32_t post : {2000u, 3000u, 4000u}) {
+    Bench b;
+    b.boiler.post_response_delay_ms = post;
+    Dhw d(b);
+    b.run(0, BOOT);
+    const size_t before = b.boiler.frame_log.size();
+    CHECK(b.request(d.number(), 55, BOOT) == "pre-read");
+    CHECK_EQ(b.number_state[d.number()], 50);  // rien n'est publié avant la relecture
+    const uint32_t done = run_until(b, BOOT, MIN, [&] { return !b.dhw.busy(); });
+    CHECK(!b.dhw.busy());
+    CHECK(b.dhw.last_outcome() == DhwOutcome::CONFIRMED);
+    // Relecture préalable, puis écriture, puis relecture de vérification.
+    const size_t pre = find_frame(b.boiler, 0xF7, 0x6300, before);
+    const size_t write = find_frame(b.boiler, 0xF4, 0x6300, before);
+    CHECK(pre < write && write != SIZE_MAX);
+    CHECK(read_back_follows_each_write(b.boiler));
+    CHECK_EQ(b.boiler.write_frames, 1);
+    CHECK(b.boiler.write_log[0] == (std::vector<uint8_t>{0x01, 0xF4, 0x63, 0x00, 0x01, 0x37}));
+    CHECK(b.write_results == std::vector<KwResult>{KwResult::SUCCESS});
+    CHECK(b.verify_results == std::vector<VerifyResult>{VerifyResult::CONFIRMED});
+    CHECK_EQ(b.boiler_value(0x6300), 55);
+    CHECK_EQ(b.number_state[d.number()], 55);
+    CHECK(b.dhw.status() == "Confirmée : 55 °C relue (précédente 50 °C, accusé reçu)");
+    CHECK(done - BOOT <= 3 * post + 6 * S);  // demande -> confirmation : quelques transactions
+    CHECK(b.failures.empty());
+    if (report_enabled())
+      std::printf("  resynchro %u s : demande -> confirmation %.1f s\n", static_cast<unsigned>(post / 1000),
+                  (done - BOOT) / 1000.0);
+  }
+}
+
+TEST(sim_v06_dhw_unchanged_and_panel_changes) {
+  Bench b;
+  Dhw d(b);
+  b.run(0, BOOT);
+  // Panneau : 55 °C, l'entité affiche encore 50 (lecture toutes les 5 min).
+  b.boiler.registers[0x6300] = {55};
+  CHECK(b.request(d.number(), 55, BOOT) == "pre-read");
+  uint32_t t = run_until(b, BOOT, MIN, [&] { return !b.dhw.busy(); });
+  CHECK(b.dhw.last_outcome() == DhwOutcome::UNCHANGED);  // déjà 55 : rien n'est écrit
+  CHECK_EQ(b.boiler.write_frames, 0);
+  CHECK_EQ(b.number_state[d.number()], 55);  // affichage synchronisé par la relecture
+  // Panneau : 53 °C ; demande 55 (égale à l'affichage périmé) : la relecture
+  // révèle 53, l'écriture a lieu.
+  b.boiler.registers[0x6300] = {53};
+  CHECK(b.request(d.number(), 55, t) == "pre-read");
+  t = run_until(b, t, MIN, [&] { return !b.dhw.busy(); });
+  CHECK(b.dhw.last_outcome() == DhwOutcome::CONFIRMED);
+  CHECK_EQ(b.boiler.write_frames, 1);
+  CHECK_EQ(b.boiler_value(0x6300), 55);
+  // Panneau : 52 °C, sans demande : la lecture périodique la publie.
+  b.boiler.registers[0x6300] = {52};
+  b.run(t, 6 * MIN);
+  CHECK_EQ(b.number_state[d.number()], 52);
+  CHECK(b.dhw.panel_changes() >= 1);
+  CHECK(b.dhw.status() == "Modifiée hors de Home Assistant (panneau ?) : 55 -> 52 °C");
+  CHECK_EQ(b.boiler.write_frames, 1);  // jamais corrigée automatiquement
+}
+
+TEST(sim_v06_dhw_out_of_range_and_repeated_requests) {
+  Bench b;
+  Dhw d(b);
+  b.run(0, BOOT);
+  CHECK(b.request(d.number(), 45, BOOT) == "refused: DHW setpoint outside the internal safety limits (50..60)");
+  CHECK(b.request(d.number(), 61, BOOT) == "refused: value outside the configured range");
+  CHECK(b.request(d.number(), 55, BOOT) == "pre-read");
+  CHECK(b.request(d.number(), 56, BOOT + 100) == "refused: another DHW setpoint change is in progress");
+  CHECK(b.request(d.number(), 57, BOOT + 200) == "refused: another DHW setpoint change is in progress");
+  uint32_t t = run_until(b, BOOT, MIN, [&] { return !b.dhw.busy(); });
+  CHECK_EQ(b.boiler.write_frames, 1);
+  CHECK_EQ(b.boiler_value(0x6300), 55);
+  CHECK(b.request(d.number(), 56, t) == "refused: too soon after the previous write");
+  b.run(t, DhwSetpointWriter::MIN_INTERVAL_MS);
+  t += DhwSetpointWriter::MIN_INTERVAL_MS;
+  CHECK(b.request(d.number(), 56, t) == "pre-read");
+  t = run_until(b, t, MIN, [&] { return !b.dhw.busy(); });
+  b.run(t, 20 * MIN);
+  CHECK_EQ(b.boiler.write_frames, 2);  // 55 puis 56, rien d'autre
+  CHECK_EQ(b.boiler.write_log[1][5], 56);
+  CHECK_EQ(b.number_state[d.number()], 56);
+}
+
+TEST(sim_v06_dhw_negative_ack_or_clamped_value_never_retried) {
+  {
+    Bench b;
+    Dhw d(b);
+    b.boiler.write_faults[0x6300] = SimBoiler::WriteFault::NACK_OTHER;
+    b.run(0, BOOT);
+    CHECK(b.request(d.number(), 55, BOOT) == "pre-read");
+    b.run(BOOT, 20 * MIN);
+    CHECK(b.write_results == std::vector<KwResult>{KwResult::WRITE_REJECTED});
+    CHECK(b.dhw.last_outcome() == DhwOutcome::MISMATCH);
+    CHECK(b.dhw.status() == "Échec : relu 50 °C au lieu de 55 °C (accusé négatif) ; pas de nouvel essai");
+    CHECK_EQ(b.number_state[d.number()], 50);
+    CHECK_EQ(b.boiler.write_frames, 1);
+  }
+  {
+    Bench b;
+    Dhw d(b);
+    b.boiler.write_clamp[0x6300] = {10, 55};  // la régulation borne à 55
+    b.run(0, BOOT);
+    CHECK(b.request(d.number(), 58, BOOT) == "pre-read");
+    b.run(BOOT, 20 * MIN);
+    CHECK(b.dhw.last_outcome() == DhwOutcome::MISMATCH);
+    CHECK(b.dhw.status() == "Échec : relu 55 °C au lieu de 58 °C (accusé reçu) ; pas de nouvel essai");
+    CHECK_EQ(b.number_state[d.number()], 55);  // la valeur relue, jamais la valeur demandée
+    CHECK_EQ(b.boiler.write_frames, 1);
+  }
+}
+
+TEST(sim_v06_dhw_link_lost_during_operation) {
+  {  // Interface débranchée au moment d'émettre : rien n'est émis, issue
+     // indéterminée, dernière valeur confirmée affichée, aucune réémission.
+    Bench b;
+    Dhw d(b);
+    b.run(0, BOOT);
+    CHECK(b.request(d.number(), 55, BOOT) == "pre-read");
+    uint32_t t = run_until(b, BOOT, MIN, [&] { return b.write_in_flight; });
+    CHECK(b.write_in_flight);
+    b.boiler.connected = false;
+    t = run_until(b, t, 2 * MIN, [&] { return !b.dhw.busy(); });
+    CHECK(b.dhw.last_outcome() == DhwOutcome::INDETERMINATE);
+    CHECK(b.dhw.status() ==
+          "Indéterminé : relecture impossible après l'écriture de 55 °C (trame non émise) ; dernière valeur "
+          "confirmée 50 °C");
+    CHECK_EQ(b.number_state[d.number()], 50);
+    b.boiler.connected = true;
+    b.run(t, 20 * MIN);
+    CHECK_EQ(b.boiler.write_frames, 0);
+    CHECK_EQ(b.boiler_value(0x6300), 50);
+    CHECK_EQ(b.number_state[d.number()], 50);
+  }
+  {  // Liaison perdue pendant la relecture préalable : rien n'est écrit.
+    Bench b;
+    Dhw d(b);
+    b.run(0, BOOT);
+    b.boiler.connected = false;
+    CHECK(b.request(d.number(), 55, BOOT) == "pre-read");
+    uint32_t t = run_until(b, BOOT, 3 * MIN, [&] { return !b.dhw.busy(); });
+    CHECK(!b.dhw.busy());
+    CHECK(b.dhw.last_outcome() == DhwOutcome::DROPPED);
+    b.boiler.connected = true;
+    b.run(t, 20 * MIN);
+    CHECK_EQ(b.boiler.write_frames, 0);
+    CHECK_EQ(b.boiler_value(0x6300), 50);
+  }
+}
+
+TEST(sim_v06_dhw_reboot_during_operation_writes_nothing) {
+  enum Cut { PRE_READ, QUEUED, IN_FLIGHT };
+  for (Cut cut : {PRE_READ, QUEUED, IN_FLIGHT}) {
+    Bench b;
+    Dhw d(b);
+    b.run(0, BOOT);
+    CHECK(b.request(d.number(), 55, BOOT) == "pre-read");
+    uint32_t t = BOOT;
+    if (cut == QUEUED)
+      t = run_until(b, t, MIN, [&] { return b.dhw.state() == DhwState::WRITING && !b.write_in_flight; });
+    if (cut == IN_FLIGHT)
+      t = run_until(b, t, MIN, [&] { return b.write_in_flight; });
+    const int frames = b.boiler.write_frames;
+    b.reboot(t);
+    b.boiler_only(t, 5 * S);
+    b.run(t + 5 * S, 30 * MIN);
+    CHECK(!b.dhw.busy());
+    CHECK_EQ(b.boiler.write_frames, frames);  // aucune écriture après le redémarrage
+    // Valeur affichée = valeur lue : 50, ou 55 si la trame était partie.
+    CHECK_EQ(b.number_state[d.number()], b.boiler_value(0x6300));
+    if (vltest::failures() > 0)
+      std::printf("    coupure %d\n", static_cast<int>(cut));
+  }
+}
+
+TEST(sim_v06_dhw_waits_for_circulation_restore) {
+  // Consigne ECS demandée autour de l'expiration du bouclage : jamais
+  // d'écriture de consigne pendant une restauration ; les deux opérations
+  // aboutissent, chaque écriture suivie de sa relecture.
+  // `a1_before_ms` : consigne A1 demandée juste avant ; l'espacement de 10 s
+  // qui suit son écriture retient la consigne ECS dans l'arbitre au moment
+  // où la restauration dépose son bloc (le cas que la priorité protège).
+  auto scenario = [](int32_t offset_ms, bool priority, uint32_t a1_before_ms = 0) {
+    Bench b;
+    BoostBench x(b);
+    const size_t dhw = x.modes.base.dhw;
+    b.enable_dhw_setpoint_write = true;
+    if (priority)
+      b.restore_priority = [&x] { return boost_restore_priority(x.glue.seq); };
+    b.restore_observer = [&x] { return boost_restore_priority(x.glue.seq); };
+    run_boost(b, x.glue, 0, BOOT);
+    CHECK(x.glue.start(10, ha_now(BOOT), BOOT) == "accepted");
+    const uint32_t confirmed =
+        run_boost_until(b, x.glue, BOOT, MIN, [&] { return x.glue.seq.state() == BoostState::ACTIVE; });
+    const uint32_t ask = confirmed + 10 * MIN + offset_ms;
+    if (a1_before_ms != 0) {
+      run_boost(b, x.glue, confirmed, ask - a1_before_ms - confirmed);
+      CHECK(b.request(x.modes.base.a1_comfort, 21, ask - a1_before_ms) == "queued");
+      run_boost(b, x.glue, ask - a1_before_ms, a1_before_ms);
+    } else {
+      run_boost(b, x.glue, confirmed, ask - confirmed);
+    }
+    CHECK(b.request(dhw, 55, ask) == "pre-read");
+    run_boost(b, x.glue, ask, 3 * MIN);
+    CHECK(x.glue.seq.idle());
+    CHECK(b.boiler.registers[0x2230] == LOOP_SUNDAY);
+    CHECK(!x.glue.flash_has);
+    CHECK_EQ(b.boiler_value(0x6300), 55);
+    CHECK(b.dhw.last_outcome() == DhwOutcome::CONFIRMED);
+    CHECK(read_back_follows_each_write(b.boiler));
+    CHECK_EQ(writes_to(b.boiler, 0x0846), 0);
+    return b.dhw_started_in_restore;
+  };
+  int without = 0;
+  for (int32_t offset : {-20000, -6000, -3000, -1000, 0, 2000}) {
+    for (uint32_t a1 : {0u, 4000u, 8000u, 12000u}) {
+      CHECK_EQ(scenario(offset, true, a1), 0);
+      without += scenario(offset, false, a1);
+    }
+  }
+  // Contrôle : sans la priorité, la consigne passe au moins une fois pendant
+  // une restauration (le test détecte bien le défaut).
+  CHECK(without > 0);
+  if (report_enabled())
+    std::printf("  sans priorité : %d cas d'écriture ECS pendant une restauration\n", without);
+}
+
+TEST(sim_v06_dhw_realistic_use_keeps_periodic_reads) {
+  // Trois modifications par heure pendant 6 h 30 (programmations comprises) :
+  // lecture du brûleur comparée à la même installation sans demande.
+  for (uint32_t post : {2000u, 3000u, 4000u}) {
+    Bench ref, b;
+    ref.boiler.post_response_delay_ms = b.boiler.post_response_delay_ms = post;
+    V03 r(ref);
+    V03 v(b);
+    b.enable_dhw_setpoint_write = true;
+    ref.run(0, BOOT);
+    b.run(0, BOOT);
+    const uint32_t end = 6 * H + 30 * MIN;
+    int k = 0;
+    for (uint32_t t = BOOT; t < end; t += 20 * MIN, k++) {
+      b.request(v.dhw, k % 2 ? 50 : 55, t);
+      ref.run(t, 20 * MIN);
+      b.run(t, 20 * MIN);
+    }
+    CHECK(b.failures.empty());
+    CHECK_EQ(b.boiler.write_frames, k);
+    const int lost = ref.successes[r.burner] - b.successes[v.burner];
+    CHECK(lost <= 2);
+    if (report_enabled() || vltest::failures() > 0)
+      std::printf("  resynchro %u s : %d écritures ECS, brûleur %d/%d, écart max %.1f s (réf. %.1f s)\n",
+                  static_cast<unsigned>(post / 1000), b.boiler.write_frames, b.successes[v.burner],
+                  ref.successes[r.burner], b.max_gap_ms[v.burner] / 1000.0, ref.max_gap_ms[r.burner] / 1000.0);
+  }
 }

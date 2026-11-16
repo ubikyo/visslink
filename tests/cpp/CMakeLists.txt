@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # en en-têtes seuls.
 add_executable(visslink_tests
   main.cpp test_decode.cpp test_scheduler.cpp test_kw_protocol.cpp test_simulation.cpp
-  test_schedule.cpp test_kw_write.cpp test_write_guard.cpp test_boost.cpp)
+  test_schedule.cpp test_kw_write.cpp test_write_guard.cpp test_boost.cpp test_dhw.cpp)
 target_include_directories(visslink_tests PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../../components/visslink ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(visslink_tests PRIVATE -Wall -Wextra -Werror -fsanitize=address,undefined)

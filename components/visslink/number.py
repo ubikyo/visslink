@@ -1,5 +1,11 @@
 """Plateforme `number` (v0.3) : consigne réglable depuis Home Assistant.
 
+v0.6 : la consigne ECS (0x6300) exige en plus `enable_dhw_setpoint_write`
+(composant `visslink`), est relue juste avant d'écrire, et ne s'écrit que
+dans les limites internes DHW_WRITE_LIMITS, quelles que soient min_value et
+max_value. Option `status` (0x6300 seulement) : texte « ECS - État
+modification consigne ».
+
 Le registre est lu périodiquement (`update_interval`, 5 min par défaut) et
 l'état publié est toujours la valeur LUE. Une modification n'est écrite que si
 le composant `visslink` a `enable_writes: true` ; sinon elle est refusée et
@@ -12,11 +18,12 @@ rester identique à WRITABLE_REGISTERS (write_guard.h) : un test le vérifie.
 
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.components import number
+from esphome.components import number, text_sensor
 from esphome.const import (
     CONF_ADDRESS,
     CONF_MAX_VALUE,
     CONF_MIN_VALUE,
+    CONF_STATUS,
     CONF_STEP,
     CONF_UPDATE_INTERVAL,
 )
@@ -32,6 +39,7 @@ from . import (
 )
 
 DEPENDENCIES = ["visslink"]
+AUTO_LOAD = ["text_sensor"]
 
 VissLinkNumber = visslink_ns.class_("VissLinkNumber", number.Number, VissLinkRegister)
 
@@ -44,6 +52,13 @@ WRITABLE_REGISTERS = {
     0x3307: (3, 37),  # M2, consigne d'ambiance réduite (éco)
     0x6300: (10, 60),  # consigne d'eau chaude sanitaire
 }
+
+# v0.6 : consigne ECS, liste blanche distincte et limites INTERNES d'écriture
+# (DHW_WRITE_MIN / DHW_WRITE_MAX, write_guard.h ; un test vérifie la
+# concordance). min_value/max_value peuvent être plus larges pour l'affichage
+# (configurations existantes : 40..60) mais n'élargissent jamais l'écriture.
+DHW_SETPOINT_ADDRESS = 0x6300
+DHW_WRITE_LIMITS = (50, 60)
 
 
 def _integer(value):
@@ -78,6 +93,12 @@ def _validate(config):
         raise cv.Invalid(
             "min_value must be lower than max_value", path=[CONF_MAX_VALUE]
         )
+    if CONF_STATUS in config and address != DHW_SETPOINT_ADDRESS:
+        raise cv.Invalid(
+            f"status is only available for the DHW setpoint "
+            f"(0x{DHW_SETPOINT_ADDRESS:04X})",
+            path=[CONF_STATUS],
+        )
     return config
 
 
@@ -96,6 +117,10 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(
                 CONF_UPDATE_INTERVAL, default="5min"
             ): UPDATE_INTERVAL_VALIDATOR,
+            # v0.6 : état de la dernière modification de la consigne ECS.
+            cv.Optional(CONF_STATUS): text_sensor.text_sensor_schema(
+                icon="mdi:information-outline", entity_category="diagnostic"
+            ),
         }
     ),
     _validate,
@@ -114,3 +139,8 @@ async def to_code(config):
     parent = await cg.get_variable(config[CONF_VISSLINK_ID])
     cg.add(var.set_parent(parent))
     await register_register(var, config)
+    if config[CONF_ADDRESS] == DHW_SETPOINT_ADDRESS:
+        cg.add(parent.set_dhw_setpoint_number(var))
+        if CONF_STATUS in config:
+            status = await text_sensor.new_text_sensor(config[CONF_STATUS])
+            cg.add(parent.set_dhw_status_sensor(status))

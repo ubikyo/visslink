@@ -86,6 +86,9 @@ class VissLinkBoost : public Component, public visslink::VissLinkBlockClient {
   bool expects_block_write(uint16_t address, const uint8_t *data) const override {
     return this->sequencer_.expects_write(address, data);
   }
+  /// v0.6 : restauration ou récupération en cours : passe avant la consigne
+  /// ECS (la machine à états du bouclage n'est pas modifiée).
+  bool restore_priority() const override { return visslink::boost_restore_priority(this->sequencer_); }
 
  protected:
   void dispatch_(uint32_t now);

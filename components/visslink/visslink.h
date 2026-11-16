@@ -28,6 +28,7 @@
 
 #include "circulation_boost.h"
 #include "decode.h"
+#include "dhw_setpoint.h"
 #include "kw_protocol.h"
 #include "schedule.h"
 #include "scheduler.h"
@@ -188,6 +189,9 @@ class VissLinkBlockClient {
   virtual void on_block_write(uint16_t address, bool sent, bool acked, uint32_t now) = 0;
   /// Contrôle croisé juste avant émission.
   virtual bool expects_block_write(uint16_t address, const uint8_t *data) const = 0;
+  /// v0.6 : une restauration (ou récupération) de bloc est en cours : elle
+  /// passe avant une écriture de consigne ECS.
+  virtual bool restore_priority() const { return false; }
 };
 
 #ifdef USE_NUMBER
@@ -316,6 +320,18 @@ class VissLinkComponent : public Component, public uart::UARTDevice {
   /// Écriture des blocs horaires du bouclage (v0.5, expérimental) : false par
   /// défaut, exige aussi enable_writes.
   void set_enable_schedule_writes(bool enable) { this->enable_schedule_writes_ = enable; }
+  /// Écriture de la consigne ECS (0x6300, v0.6, expérimental) : false par
+  /// défaut, exige aussi enable_writes. Aucune autre autorisation ne la permet.
+  void set_enable_dhw_setpoint_write(bool enable) { this->enable_dhw_setpoint_write_ = enable; }
+  bool dhw_setpoint_writes_enabled() const { return this->enable_writes_ && this->enable_dhw_setpoint_write_; }
+#ifdef USE_NUMBER
+  /// Le number de la consigne ECS (0x6300), s'il est déclaré.
+  void set_dhw_setpoint_number(VissLinkNumber *number) { this->dhw_number_ = number; }
+#endif
+#ifdef USE_TEXT_SENSOR
+  /// Texte facultatif « ECS - État modification consigne » (v0.6).
+  void set_dhw_status_sensor(text_sensor::TextSensor *sensor) { this->dhw_status_ = sensor; }
+#endif
 
   // --- Blocs horaires (v0.5) ---
   void set_block_client(VissLinkBlockClient *client) { this->block_client_ = client; }
@@ -347,6 +363,8 @@ class VissLinkComponent : public Component, public uart::UARTDevice {
   /// Demande d'écriture venant de Home Assistant (VissLinkNumber::control).
   void submit_write(VissLinkNumber *number, float value);
 #endif
+  /// v0.6 : transaction de consigne ECS (état, pour les journaux et tests).
+  const DhwSetpointWriter &dhw_setpoint() const { return this->dhw_; }
   /// Registre de programme (select A1 ou text_sensor), au plus deux.
   void add_mode_register(VissLinkRegister *reg);
 #ifdef USE_SELECT
@@ -377,6 +395,15 @@ class VissLinkComponent : public Component, public uart::UARTDevice {
   int mode_peer_of_(int index) const;
   void read_back_done_(int index, uint32_t now);
   void log_mode_divergence_after_write_();
+  // v0.6 : consigne ECS.
+#ifdef USE_NUMBER
+  void submit_dhw_write_(VissLinkNumber *number, float value);
+#endif
+  void dhw_on_read_(bool ok, uint8_t value, bool verify, uint32_t now);
+  void dhw_publish_();
+  /// Propriétaire dont la demande attend (consigne ECS pendant une
+  /// restauration du bouclage), ou WriteArbiter::NONE.
+  int dhw_deferred_owner_() const;
 
   KwProtocol kw_;
   RegisterScheduler scheduler_;
@@ -386,6 +413,16 @@ class VissLinkComponent : public Component, public uart::UARTDevice {
   bool enable_mode_writes_{false};
   bool enable_m2_mode_write_{false};
   bool enable_schedule_writes_{false};
+  bool enable_dhw_setpoint_write_{false};
+  DhwSetpointWriter dhw_;
+  int dhw_owner_{WriteArbiter::NONE};  ///< index du number 0x6300
+  uint32_t dhw_published_{0};          ///< version du texte publiée
+#ifdef USE_NUMBER
+  VissLinkNumber *dhw_number_{nullptr};
+#endif
+#ifdef USE_TEXT_SENSOR
+  text_sensor::TextSensor *dhw_status_{nullptr};
+#endif
   VissLinkBlockClient *block_client_{nullptr};
   /// Lecture ponctuelle (v0.5) : une à la fois, nouvelles tentatives comme
   /// une lecture ordinaire.

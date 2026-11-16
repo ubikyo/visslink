@@ -1277,3 +1277,148 @@ def test_boost_restoring_entity_is_optional(repo_root, tmp_path):
 
     result = _run_config(repo_root, tmp_path, drop, example=ESSAI_BOUCLAGE)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+# --- v0.6 : consigne d'eau chaude sanitaire ---------------------------------
+
+ESSAI_CONSIGNE_ECS = "examples/iot-viessmann-essai-consigne-ecs-v0.6.yaml"
+WRITE_FLAGS = (
+    "enable_writes",
+    "enable_mode_writes",
+    "enable_m2_mode_write",
+    "enable_schedule_writes",
+    "enable_dhw_setpoint_write",
+)
+
+
+def test_dhw_setpoint_write_disabled_by_default(repo_root, tmp_path):
+    text = (repo_root / EXAMPLE).read_text(encoding="utf-8")
+    assert "  enable_dhw_setpoint_write: false\n" in text
+    assert "enable_dhw_setpoint_write: true" not in text
+    result = _run_config(
+        repo_root,
+        tmp_path,
+        lambda s: _drop_first(s, "  enable_dhw_setpoint_write: false\n"),
+    )
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "enable_dhw_setpoint_write: false" in out, out
+    assert "DHW SETPOINT WRITE ENABLED" not in out
+
+
+def test_dhw_setpoint_write_requires_enable_writes(repo_root, tmp_path):
+    bad = _run_config(
+        repo_root,
+        tmp_path,
+        lambda s: s.replace(
+            "enable_dhw_setpoint_write: false", "enable_dhw_setpoint_write: true"
+        ),
+    )
+    assert bad.returncode != 0, bad.stdout
+    assert "enable_dhw_setpoint_write requires enable_writes: true" in (
+        bad.stdout + bad.stderr
+    )
+    good = _run_config(
+        repo_root,
+        tmp_path,
+        lambda s: s.replace(
+            "enable_dhw_setpoint_write: false", "enable_dhw_setpoint_write: true"
+        ).replace("enable_writes: false", "enable_writes: true"),
+    )
+    out = good.stdout + good.stderr
+    assert good.returncode == 0, out
+    assert "DHW SETPOINT WRITE ENABLED" in out, out
+    # Aucune autre autorisation n'est activée par la sienne.
+    for flag in WRITE_FLAGS[1:4]:
+        assert f"{flag}: false" in out, flag
+
+
+def test_dhw_limits_and_whitelist_match_cpp(repo_root):
+    header = (repo_root / "components/visslink/write_guard.h").read_text(
+        encoding="utf-8"
+    )
+    low = int(re.search(r"DHW_WRITE_MIN = (\d+);", header).group(1))
+    high = int(re.search(r"DHW_WRITE_MAX = (\d+);", header).group(1))
+    number_py = (repo_root / "components/visslink/number.py").read_text(
+        encoding="utf-8"
+    )
+    limits = re.search(r"DHW_WRITE_LIMITS = \((\d+), (\d+)\)", number_py)
+    assert (low, high) == (int(limits.group(1)), int(limits.group(2))) == (50, 60)
+    assert "DHW_SETPOINT_ADDRESS = 0x6300" in number_py
+    whitelist = re.search(
+        r"DHW_SETPOINT_WRITE_WHITELIST\[\] = \{([^}]*)\}", header
+    ).group(1)
+    assert whitelist.strip() == "DHW_SETPOINT_ADDRESS"
+    assert "static constexpr uint16_t DHW_SETPOINT_ADDRESS = 0x6300;" in header
+    # Dans la plage documentée de la liste blanche générale.
+    assert WRITABLE[0x6300][0] <= low and high <= WRITABLE[0x6300][1]
+
+
+def test_number_status_only_for_dhw_setpoint(repo_root, tmp_path):
+    def status_on(address):
+        def transform(text):
+            old = f"    address: {address}\n"
+            assert old in text
+            return text.replace(old, old + '    status:\n      name: "TEST état"\n', 1)
+
+        return transform
+
+    bad = _run_config(repo_root, tmp_path, status_on("0x2306"))
+    assert bad.returncode != 0, bad.stdout
+    assert "status is only available for the DHW setpoint (0x6300)" in (
+        bad.stdout + bad.stderr
+    )
+    good = _run_config(repo_root, tmp_path, status_on("0x6300"))
+    assert good.returncode == 0, good.stdout + good.stderr
+
+
+def test_dhw_trial_config_valid_and_without_writes(repo_root, tmp_path):
+    result = _run_config(repo_root, tmp_path, example=ESSAI_CONSIGNE_ECS)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    for flag in WRITE_FLAGS:
+        assert f"{flag}: false" in out, flag
+    assert "validated_days: []" in out
+    assert "ENABLED" not in out
+    # 0x6300 lu une seule fois : le number, bornes 50..60, 60 s, avec son état.
+    assert out.count("address: 0x6300\n") == 1, out
+    match = re.search(r"name: ECS - Température de consigne\n((?:    [^\n]*\n)*)", out)
+    assert match, out
+    entry = match.group(1)
+    for line in (
+        "address: 0x6300",
+        "min_value: 50",
+        "max_value: 60",
+        "update_interval: 60s",
+    ):
+        assert f"    {line}\n" in entry, line
+    assert "name: ECS - État modification consigne" in out, out
+
+
+def test_dhw_trial_only_changes_the_dhw_number(repo_root):
+    example = _active_lines((repo_root / EXAMPLE).read_text(encoding="utf-8"))
+    trial = _active_lines((repo_root / ESSAI_CONSIGNE_ECS).read_text(encoding="utf-8"))
+    removed = [line for line in example.splitlines() if line not in trial.splitlines()]
+    assert removed == ['    name: "ECS - Consigne"', "    min_value: 40"], removed
+    added = [line for line in trial.splitlines() if line not in example.splitlines()]
+    assert added == [
+        '    name: "ECS - Température de consigne"',
+        "    min_value: 50",
+        # update_interval: 60s existe déjà ailleurs : vérifié par
+        # test_dhw_trial_config_valid_and_without_writes.
+        "    status:",
+        '      name: "ECS - État modification consigne"',
+    ], added
+
+
+@pytest.mark.parametrize(
+    "example",
+    [EXAMPLE, ESSAI_V05, ESSAI_BOUCLAGE, ESSAI_CONSIGNE_ECS],
+)
+def test_examples_keep_all_write_flags_false(repo_root, example):
+    text = (repo_root / example).read_text(encoding="utf-8")
+    active = _active_lines(text)
+    for flag in WRITE_FLAGS:
+        assert f"  {flag}: false" in active.splitlines(), (example, flag)
+        assert f"{flag}: true" not in active, (example, flag)
+    assert "  validated_days: []" in text

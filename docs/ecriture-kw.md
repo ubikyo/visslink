@@ -118,6 +118,10 @@ contrôle, `06`/`15`) n'est utilisé.
 | `0x3307` | M2, consigne d'ambiance réduite | **oui** | **par analogie seulement** (idem) | **non** |
 | `0x6300` | consigne d'eau chaude sanitaire | **oui** | oui : vcontrold (V200KW2), openv (10..60) | **non** |
 
+**v0.6 :** `0x6300` exige en plus `enable_dhw_setpoint_write: true`. Il est
+relu avant d'être écrit, et son écriture est limitée en interne à 50..60 °C.
+Voir [`consigne-ecs-v0.6.md`](consigne-ecs-v0.6.md).
+
 Aucune source ne publie de liste d'adresses propre à la Vitotronic 300 KW3
 (`209C`). Toutes les écritures « documentées » le sont pour une autre
 régulation KW (200 KW2) ou par un tableau générique. Elles restent à
