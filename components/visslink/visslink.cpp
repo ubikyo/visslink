@@ -565,6 +565,7 @@ void VissLinkComponent::handle_result_(KwResult result, uint32_t now) {
     const bool verify = this->writes_.active() && this->writes_.current().owner == index &&
                         this->read_back_.waiting(index);
     if (reg->publish_data(block, data)) {
+      reg->mark_read_ok(now);  // v0.7.3 : fraîcheur (climate M2)
       this->scheduler_.finish(true, now);
       if (SetpointChannel *ch = this->setpoint_channel_(index))
         this->setpoint_on_read_(*ch, true, data[0], verify, now);
@@ -1216,22 +1217,59 @@ int VissLinkCircuitClimate::mode_raw_() const {
   return this->mode_select_ != nullptr ? this->mode_select_->mode_raw() : -1;
 }
 
+int VissLinkCircuitClimate::fresh_mode_raw_(uint32_t now) const {
+  if (this->mode_select_ == nullptr || !this->mode_select_->read_fresh(now))
+    return -1;
+  return this->mode_select_->mode_raw();
+}
+
+#ifdef USE_BINARY_SENSOR
+int VissLinkCircuitClimate::fresh_binary_(const VissLinkBinarySensor *sensor, uint32_t now) {
+  if (sensor == nullptr || !sensor->has_state() || !sensor->read_fresh(now))
+    return -1;
+  return sensor->state ? 1 : 0;
+}
+#endif
+
+void VissLinkCircuitClimate::publish_status_() {
+  // v0.7.3 : publié dès le démarrage (« Inconnu »), puis à chaque changement.
+  if (this->status_published_ && this->published_status_ == this->state_.status)
+    return;
+  this->status_published_ = true;
+  this->published_status_ = this->state_.status;
+  ESP_LOGD(CLIMATE_TAG, "M2 state: %s", circuit_status_text(this->state_.status));
+#ifdef USE_TEXT_SENSOR
+  if (this->status_sensor_ != nullptr)
+    this->status_sensor_->publish_state(circuit_status_text(this->state_.status));
+#endif
+}
+
 void VissLinkCircuitClimate::refresh_(bool force) {
+  const uint32_t now = millis();
   float room = NAN;
 #ifdef USE_SENSOR
   if (this->room_ != nullptr && this->room_->has_state())
     room = this->room_->state;
 #endif
-  int pump = -1;
+  int pump = -1, burner = -1;
 #ifdef USE_BINARY_SENSOR
-  if (this->pump_ != nullptr && this->pump_->has_state())
-    pump = this->pump_->state ? 1 : 0;
+  pump = fresh_binary_(this->pump_, now);
+  burner = fresh_binary_(this->burner_, now);
 #endif
-  const CircuitClimateState next =
-      circuit_climate_state(this->state_, room, this->comfort_->setpoint_value(), this->mode_raw_(), pump);
-  if (!next.ready || (!force && next.same_as(this->state_)))
+  // Données périmées = inconnues : l'état et l'action passent à Inconnu /
+  // idle ; le mode affiché garde la dernière valeur lue (jamais deviné).
+  const CircuitClimateState next = circuit_climate_state(this->state_, room, this->comfort_->setpoint_value(),
+                                                         this->fresh_mode_raw_(now), pump, burner);
+  if (!next.ready) {
+    // Climate pas encore publié : seul l'état texte l'est.
+    this->state_.status = next.status;
+    this->publish_status_();
+    return;
+  }
+  if (!force && next.same_as(this->state_))
     return;
   this->state_ = next;
+  this->publish_status_();
   this->current_temperature = next.current;
   this->target_temperature = next.target;
   this->mode = next.hvac == CircuitHvac::HEAT ? climate::CLIMATE_MODE_HEAT : climate::CLIMATE_MODE_OFF;
@@ -1326,6 +1364,12 @@ void VissLinkCircuitClimate::dump_config() {
   ESP_LOGCONFIG(CLIMATE_TAG, "  Target: comfort setpoint 0x%04X; mode: 0x%04X (HEAT=03, OFF=00 DHW only)",
                 this->comfort_->get_address(),
                 this->mode_select_ != nullptr ? this->mode_select_->get_address() : 0);
+#ifdef USE_BINARY_SENSOR
+  ESP_LOGCONFIG(CLIMATE_TAG, "  State: pump 0x3906 %s, burner 0x0842 %s (stale after 3 intervals + 30 s)",
+                this->pump_ != nullptr ? "yes" : "no", this->burner_ != nullptr ? "yes" : "no");
+  if (this->pump_ != nullptr && this->burner_ == nullptr)
+    ESP_LOGCONFIG(CLIMATE_TAG, "  No burner_id: heating vs inertia cannot be told apart, action never 'heating'");
+#endif
 }
 #endif
 

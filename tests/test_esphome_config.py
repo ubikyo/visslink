@@ -1545,14 +1545,17 @@ def test_heating_trial_only_adds_reads_climate_and_status(repo_root):
     added = [line for line in trial.splitlines() if line not in example.splitlines()]
     allowed = re.compile(
         r"^\s*(- platform: visslink|visslink_id: viessmann|climate:|"
-        r"id: (m2_room_temperature|m2_pump|m2_comfort_setpoint|m2_mode)|"
+        r"id: (m2_room_temperature|m2_pump|m2_comfort_setpoint|m2_mode|"
+        r"bruleur_actif)|"
         r'name: "(Plancher chauffant - Température ambiante \(Vitotrol\)|'
         r"Plancher chauffant - Circulateur|Plancher chauffant|"
+        r"Plancher chauffant - État|"
         r'(Radiateurs|Plancher) - Consigne (confort|réduite) - État modification)"|'
         r"address: 0x(0898|3906)|data_type: int16|invalid_values: \[0xFFFF\]|"
         r"min_value: (14|22|23)|max_value: (22|23)|"
         r"status:|comfort_setpoint_id: m2_comfort_setpoint|mode_id: m2_mode|"
-        r"current_temperature_id: m2_room_temperature|pump_id: m2_pump)$"
+        r"current_temperature_id: m2_room_temperature|pump_id: m2_pump|"
+        r"burner_id: bruleur_actif)$"
     )
     assert all(allowed.match(line) for line in added), [
         line for line in added if not allowed.match(line)
@@ -1586,6 +1589,16 @@ def _climate_transform(**changes):
             "current_temperature_id: m2_room_temperature",
             "current_temperature_id: m2_flow",
             "current_temperature_id must be a room temperature, not 0x3900",
+        ),
+        (
+            "burner_id: bruleur_actif",
+            "burner_id: m2_pump",
+            "burner_id must be the visslink binary_sensor of the burner (0x0842)",
+        ),
+        (
+            "pump_id: m2_pump",
+            "pump_id: bruleur_actif",
+            "pump_id must be the visslink binary_sensor of the M2 circulation",
         ),
     ],
 )
@@ -1621,6 +1634,8 @@ def test_climate_optional_sources(repo_root, tmp_path):
         for line in (
             "    current_temperature_id: m2_room_temperature\n",
             "    pump_id: m2_pump\n",
+            "    burner_id: bruleur_actif\n",
+            '    status:\n      name: "Plancher chauffant - État"\n',
         ):
             assert line in text
             text = text.replace(line, "", 1)
@@ -1628,6 +1643,52 @@ def test_climate_optional_sources(repo_root, tmp_path):
 
     result = _run_config(repo_root, tmp_path, transform, example=ESSAI_CHAUFFAGE)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "example",
+    [ESSAI_CHAUFFAGE, "examples/iot-viessmann-ecritures-autorisees.yaml"],
+)
+def test_climate_m2_state_from_existing_reads(repo_root, tmp_path, example):
+    """v0.7.3 : état du plancher à partir des lectures existantes (0x3301,
+    0x3906, 0x0842), sans lecture supplémentaire."""
+    result = _run_config(repo_root, tmp_path, example=example)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "burner_id: bruleur_actif" in out, out
+    assert "name: Plancher chauffant - État" in out, out
+    for address in ("0x3301", "0x3906", "0x842"):
+        assert out.count(f"address: {address}\n") == 1, address  # une seule lecture
+
+
+def test_climate_burner_must_be_a_visslink_binary_sensor(repo_root, tmp_path):
+    def transform(text):
+        old = "    burner_id: bruleur_actif\n"
+        assert old in text
+        text = text.replace(old, "    burner_id: other_burner\n", 1)
+        return text.replace(
+            "binary_sensor:\n",
+            "binary_sensor:\n  - platform: template\n    id: other_burner\n"
+            '    name: "Autre"\n',
+            1,
+        )
+
+    result = _run_config(repo_root, tmp_path, transform, example=ESSAI_CHAUFFAGE)
+    assert result.returncode != 0, result.stdout + result.stderr
+
+
+def test_climate_m2_state_documented(repo_root):
+    """Les quatre états et la péremption figurent dans le code et la doc."""
+    header = (repo_root / "components/visslink/circuit_climate.h").read_text(
+        encoding="utf-8"
+    )
+    for text in ('"Chauffe"', '"Inertie"', '"Arrêt"', '"Inconnu"'):
+        assert text in header, text
+    assert "STALE_INTERVALS = 3" in header
+    assert "STALE_MARGIN_MS = 30000" in header
+    doc = (repo_root / "docs/consignes-chauffage-v0.7.md").read_text(encoding="utf-8")
+    for text in ("Chauffe", "Inertie", "Arrêt", "Inconnu", "burner_id", "30 s"):
+        assert text in doc, text
 
 
 def test_production_has_no_climate(repo_root):

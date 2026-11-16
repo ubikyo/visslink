@@ -231,6 +231,7 @@ binary_sensor:
   # 0x00 = arrêt, 0x01 = marche. Toute autre valeur : état inconnu + avertissement
   # dans les journaux (aucune interprétation arbitraire).
   - platform: visslink
+    id: bruleur_actif
     name: "Brûleur actif"
     address: 0x0842
     update_interval: 30s
@@ -422,6 +423,11 @@ climate:
     mode_id: m2_mode
     current_temperature_id: m2_room_temperature
     pump_id: m2_pump
+    # v0.7.3 : état Chauffe / Inertie / Arrêt / Inconnu (brûleur 0x0842 déjà
+    # lu, aucune lecture supplémentaire) ; « heating » seulement en Chauffe.
+    burner_id: bruleur_actif
+    status:
+      name: "Plancher chauffant - État"
 
 # --- Bouclage ECS à la demande (v0.5, EXPÉRIMENTAL) ---------------------------
 # Ajoute une plage temporaire au bloc du jour de la programmation du bouclage,

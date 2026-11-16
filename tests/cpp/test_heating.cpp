@@ -213,35 +213,93 @@ TEST(climate_mode_mapping) {
 TEST(climate_state_from_read_entities) {
   CircuitClimateState s;
   // Rien de lu : pas prêt, rien n'est publié.
-  s = circuit_climate_state(s, NAN, -1, -1, -1);
+  s = circuit_climate_state(s, NAN, -1, -1, -1, -1);
   CHECK(!s.ready);
-  s = circuit_climate_state(s, 20.4f, 21, -1, -1);
+  CHECK(s.status == CircuitStatus::UNKNOWN);
+  s = circuit_climate_state(s, 20.4f, 21, -1, -1, -1);
   CHECK(!s.ready);  // programme inconnu
-  s = circuit_climate_state(s, 20.4f, 21, 0x03, 1);
+  s = circuit_climate_state(s, 20.4f, 21, 0x03, 1, 1);
   CHECK(s.ready);
   CHECK_NEAR(s.current, 20.4, 1e-4);  // ambiance Vitotrol
   CHECK_EQ(s.target, 21.0f);          // consigne confort lue
   CHECK(s.hvac == CircuitHvac::HEAT);
+  CHECK(s.status == CircuitStatus::HEATING);
   CHECK(s.action == CircuitAction::HEATING);
-  // Circulateur arrêté : en attente, pas « chauffe ».
-  s = circuit_climate_state(s, 20.4f, 21, 0x03, 0);
+  // v0.7.3 : circulateur en marche, brûleur arrêté : inertie, pas « chauffe ».
+  s = circuit_climate_state(s, 20.4f, 21, 0x03, 1, 0);
+  CHECK(s.status == CircuitStatus::INERTIA);
   CHECK(s.action == CircuitAction::IDLE);
-  // Programme illisible ou inattendu : mode inchangé, jamais deviné.
-  s = circuit_climate_state(s, 20.4f, 21, 0x07, 0);
+  // Circulateur arrêté : arrêt (idle), quel que soit le brûleur.
+  s = circuit_climate_state(s, 20.4f, 21, 0x03, 0, 1);
+  CHECK(s.status == CircuitStatus::STOPPED);
+  CHECK(s.action == CircuitAction::IDLE);
+  // Programme illisible ou inattendu : mode inchangé, jamais deviné ; état inconnu.
+  s = circuit_climate_state(s, 20.4f, 21, 0x07, 1, 1);
   CHECK(s.hvac == CircuitHvac::HEAT);
-  // ECS seule : OFF.
-  s = circuit_climate_state(s, 20.4f, 21, 0x00, 1);
+  CHECK(s.status == CircuitStatus::UNKNOWN);
+  CHECK(s.action == CircuitAction::IDLE);  // jamais « chauffe » sans preuve
+  // ECS seule : OFF, même circulateur et brûleur en marche (ECS).
+  s = circuit_climate_state(s, 20.4f, 21, 0x00, 1, 1);
   CHECK(s.hvac == CircuitHvac::OFF);
+  CHECK(s.status == CircuitStatus::STOPPED);
   CHECK(s.action == CircuitAction::OFF);
   // Ambiance inconnue : pas de température actuelle (jamais une autre).
-  s = circuit_climate_state(s, NAN, 21, 0x03, -1);
+  s = circuit_climate_state(s, NAN, 21, 0x03, -1, 1);
   CHECK(std::isnan(s.current));
+  CHECK(s.status == CircuitStatus::UNKNOWN);
   CHECK(s.action == CircuitAction::IDLE);
   CircuitClimateState t = s;
   CHECK(t.same_as(s));
-  t = circuit_climate_state(t, NAN, 22, 0x03, -1);  // modification depuis le panneau
+  t = circuit_climate_state(t, NAN, 22, 0x03, -1, 1);  // modification depuis le panneau
   CHECK(!t.same_as(s));
   CHECK_EQ(t.target, 22.0f);
+  // Seul l'état change : republié.
+  CircuitClimateState u = circuit_climate_state(t, NAN, 22, 0x03, 1, 0);
+  CHECK(!u.same_as(t));
+}
+
+TEST(climate_m2_status_table) {
+  // (programme, circulateur, brûleur) -> état ; -1 = inconnu ou périmé.
+  struct Row {
+    int mode, pump, burner;
+    CircuitStatus status;
+  };
+  const Row rows[] = {
+      {0x03, 1, 1, CircuitStatus::HEATING},   {0x03, 1, 0, CircuitStatus::INERTIA},
+      {0x03, 0, 1, CircuitStatus::STOPPED},   {0x03, 0, 0, CircuitStatus::STOPPED},
+      {0x03, 0, -1, CircuitStatus::STOPPED},  {0x00, 1, 1, CircuitStatus::STOPPED},
+      {0x00, -1, -1, CircuitStatus::STOPPED}, {0x05, 1, 1, CircuitStatus::STOPPED},
+      {0x03, 1, -1, CircuitStatus::UNKNOWN},  {0x03, -1, 1, CircuitStatus::UNKNOWN},
+      {0x03, -1, 0, CircuitStatus::UNKNOWN},  {-1, 1, 1, CircuitStatus::UNKNOWN},
+      {-1, 0, 0, CircuitStatus::UNKNOWN},     {0x07, 1, 1, CircuitStatus::UNKNOWN},
+  };
+  for (const Row &r : rows) {
+    CHECK(circuit_status(r.mode, r.pump, r.burner) == r.status);
+    // heating uniquement en Chauffe ; off uniquement chauffage désactivé.
+    const CircuitHvac hvac = circuit_hvac_from_mode(r.mode);
+    const CircuitAction action = circuit_action(hvac == CircuitHvac::UNKNOWN ? CircuitHvac::HEAT : hvac, r.status);
+    CHECK((action == CircuitAction::HEATING) == (r.status == CircuitStatus::HEATING));
+    CHECK((action == CircuitAction::OFF) == (hvac == CircuitHvac::OFF));
+  }
+  CHECK(std::string(circuit_status_text(CircuitStatus::HEATING)) == "Chauffe");
+  CHECK(std::string(circuit_status_text(CircuitStatus::INERTIA)) == "Inertie");
+  CHECK(std::string(circuit_status_text(CircuitStatus::STOPPED)) == "Arrêt");
+  CHECK(std::string(circuit_status_text(CircuitStatus::UNKNOWN)) == "Inconnu");
+}
+
+TEST(climate_m2_readings_go_stale_after_three_intervals_plus_30s) {
+  CHECK_EQ(stale_after_ms(30000), 120000u);   // brûleur 30 s : 2 min
+  CHECK_EQ(stale_after_ms(60000), 210000u);   // circulateur 60 s : 3 min 30 s
+  CHECK_EQ(stale_after_ms(300000), 930000u);  // programme 5 min : 15 min 30 s
+  CHECK(!reading_fresh(false, 0, 30000, 0));  // jamais lu
+  CHECK(reading_fresh(true, 1000, 30000, 1000));
+  CHECK(reading_fresh(true, 1000, 30000, 121000));
+  CHECK(!reading_fresh(true, 1000, 30000, 121001));
+  // Débordement de millis() (49,7 jours) : écart calculé modulo 2^32.
+  CHECK(reading_fresh(true, 0xFFFFF000u, 30000, 0x00001000u));
+  CHECK(!reading_fresh(true, 0xFFFFF000u, 30000, 0xFFFFF000u + 120001u));
+  // Intervalle très long : pas de débordement du seuil.
+  CHECK(reading_fresh(true, 0, 0xFFFFFFFFu, 0xFFFFFFFFu));
 }
 
 TEST(climate_temperature_commands_filtered) {

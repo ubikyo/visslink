@@ -127,6 +127,9 @@ climate:
     mode_id: m2_mode                             # select 0x3301 (obligatoire)
     current_temperature_id: m2_room_temperature  # ambiance Vitotrol 0x0898 (facultatif)
     pump_id: m2_pump                             # circulateur 0x3906 (facultatif)
+    burner_id: bruleur_actif                     # brûleur 0x0842 (facultatif, v0.7.3)
+    status:                                      # text_sensor d'état (facultatif, v0.7.3)
+      name: "Plancher chauffant - État"
 ```
 
 Le climate **ne lit aucun registre et n'écrit rien lui-même**. Il agrège
@@ -137,8 +140,38 @@ des entités existantes ; chaque registre n'est lu qu'une fois.
 | Température actuelle | ambiance Vitotrol `0x0898` | observée cohérente, **pas encore validée** (§ 6). Jamais la température de départ : la validation refuse `0x3900`, `0x0802`, `0x0804`, `0x0800` |
 | Température cible | consigne **confort** `0x3306` lue | voir ci-dessous |
 | Mode | programme `0x3301` lu | `03` → HEAT ; `00` (ECS seule) et `05` (arrêt) → OFF ; autre valeur : mode inchangé, jamais deviné |
-| Action | circulateur `0x3906` | état remonté, **pas encore validé** (§ 6). HEATING si `01`, IDLE sinon, OFF en mode OFF. Affichage seulement |
+| Action et état (v0.7.3) | programme `0x3301`, circulateur `0x3906`, brûleur `0x0842` | voir « État du plancher » ci-dessous. Affichage seulement |
 | Température de départ `0x3900` | entité `sensor` séparée | un climate ESPHome n'a pas d'attribut libre |
+
+### État du plancher (v0.7.3)
+
+Calculé à partir des entités déjà lues (programme `0x3301`, circulateur
+`0x3906`, brûleur `0x0842`), **sans aucune lecture Optolink
+supplémentaire** :
+
+| État (`status`) | Condition | `hvac_action` |
+|---|---|---|
+| **Chauffe** | chauffage (`03`) + circulateur en marche + brûleur en marche | `heating` |
+| **Inertie** | chauffage (`03`) + circulateur en marche + brûleur arrêté | `idle` |
+| **Arrêt** | chauffage désactivé (`00` ou `05`) | `off` |
+| **Arrêt** | chauffage (`03`) + circulateur arrêté | `idle` |
+| **Inconnu** | donnée nécessaire inconnue ou périmée | `idle` (`off` si le mode affiché est OFF) |
+
+- `heating` n'est publié **qu'en Chauffe** : jamais sur le seul circulateur.
+  Sans `burner_id`, l'action n'est donc jamais `heating` (Inconnu quand le
+  circulateur tourne).
+- Seules les données nécessaires comptent : chauffage désactivé → Arrêt quels
+  que soient le circulateur et le brûleur ; circulateur arrêté → Arrêt quel
+  que soit le brûleur.
+- **Données périmées** : une valeur est périmée sans lecture réussie depuis
+  **3 intervalles de lecture + 30 s** de son entité (brûleur à 30 s : 2 min ;
+  circulateur à 60 s : 3 min 30 s ; programme à 5 min : 15 min 30 s). Elle
+  compte alors comme inconnue ; l'état passe à Inconnu. Le mode affiché
+  garde la dernière valeur lue (jamais deviné).
+- `pump_id` et `burner_id` doivent désigner les `binary_sensor` visslink de
+  `0x3906` et `0x0842` (vérifié à la validation).
+- Le circulateur `0x3906` reste **à valider** (§ 6) ; l'état n'est qu'un
+  affichage, jamais une commande.
 
 **Température cible = consigne confort de M2, en permanence.** Pendant une
 période réduite de la programmation, la Vitotronic régule sur la consigne

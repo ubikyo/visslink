@@ -90,9 +90,21 @@ class VissLinkRegister {
   virtual void restore_read_state() {}
   virtual void dump_register_config() = 0;
 
+  /// v0.7.3 : lecture réussie (données acceptées) à l'instant `now`.
+  void mark_read_ok(uint32_t now) {
+    this->last_read_ok_ms_ = now;
+    this->has_read_ok_ = true;
+  }
+  /// v0.7.3 : lecture réussie depuis moins de 3 intervalles + 30 s.
+  bool read_fresh(uint32_t now) const {
+    return reading_fresh(this->has_read_ok_, this->last_read_ok_ms_, this->interval_ms_, now);
+  }
+
  protected:
   uint16_t address_{0};
   uint32_t interval_ms_{60000};
+  uint32_t last_read_ok_ms_{0};
+  bool has_read_ok_{false};
 };
 
 #ifdef USE_SENSOR
@@ -483,7 +495,11 @@ class VissLinkCircuitClimate : public climate::Climate, public Component {
   void set_room_sensor(sensor::Sensor *sensor) { this->room_ = sensor; }
 #endif
 #ifdef USE_BINARY_SENSOR
-  void set_pump_sensor(binary_sensor::BinarySensor *sensor) { this->pump_ = sensor; }
+  void set_pump_sensor(VissLinkBinarySensor *sensor) { this->pump_ = sensor; }
+  void set_burner_sensor(VissLinkBinarySensor *sensor) { this->burner_ = sensor; }
+#endif
+#ifdef USE_TEXT_SENSOR
+  void set_status_sensor(text_sensor::TextSensor *sensor) { this->status_sensor_ = sensor; }
 #endif
 
   void setup() override;
@@ -496,6 +512,13 @@ class VissLinkCircuitClimate : public climate::Climate, public Component {
   /// Recalcule l'état depuis les entités ; publie s'il a changé (ou `force`).
   void refresh_(bool force);
   int mode_raw_() const;
+  /// v0.7.3 : programme lu et frais (-1 sinon).
+  int fresh_mode_raw_(uint32_t now) const;
+#ifdef USE_BINARY_SENSOR
+  /// v0.7.3 : 1/0 lu et frais, -1 sinon (absent, inconnu ou périmé).
+  static int fresh_binary_(const VissLinkBinarySensor *sensor, uint32_t now);
+#endif
+  void publish_status_();
 
   VissLinkComponent *parent_{nullptr};
   VissLinkNumber *comfort_{nullptr};
@@ -504,9 +527,15 @@ class VissLinkCircuitClimate : public climate::Climate, public Component {
   sensor::Sensor *room_{nullptr};
 #endif
 #ifdef USE_BINARY_SENSOR
-  binary_sensor::BinarySensor *pump_{nullptr};
+  VissLinkBinarySensor *pump_{nullptr};
+  VissLinkBinarySensor *burner_{nullptr};
+#endif
+#ifdef USE_TEXT_SENSOR
+  text_sensor::TextSensor *status_sensor_{nullptr};
 #endif
   CircuitClimateState state_;
+  CircuitStatus published_status_{CircuitStatus::UNKNOWN};
+  bool status_published_{false};
 };
 #endif
 

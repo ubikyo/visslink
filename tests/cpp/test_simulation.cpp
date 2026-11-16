@@ -4034,17 +4034,29 @@ struct ClimateGlue {
   const Heat &h;
   CircuitClimateState state;
   int publishes{0};
+  bool with_burner{true};  ///< v0.7.3 : burner_id déclaré
+  uint32_t now{0};          ///< heure du dernier refresh (millis())
   ClimateGlue(Bench &bench, const Heat &heat) : b(bench), h(heat) {}
+  /// VissLinkRegister::read_fresh (v0.7.3).
+  bool fresh(size_t index) const {
+    const auto it = b.last_success_ms.find(index);
+    return reading_fresh(it != b.last_success_ms.end(), it == b.last_success_ms.end() ? 0 : it->second,
+                         b.params[index].first, now);
+  }
+  int fresh_mode() const { return fresh(h.m2_mode) ? b.mode_of(h.m2_mode) : -1; }
+  int fresh_binary(size_t index) const {
+    const auto it = b.last_binary.find(index);
+    if (!fresh(index) || it == b.last_binary.end() || it->second == BinaryValue::INVALID)
+      return -1;
+    return it->second == BinaryValue::ON ? 1 : 0;
+  }
   int comfort() const { return b.has_read_value(h.v.m2_comfort) ? static_cast<int>(b.number_state.at(h.v.m2_comfort)) : -1; }
   /// VissLinkCircuitClimate::refresh_ (toutes les secondes).
   void refresh(bool force = false) {
     const auto room_it = b.last_value.find(h.room);
     const float room = room_it == b.last_value.end() ? NAN : static_cast<float>(room_it->second);
-    const auto pump_it = b.last_binary.find(h.pump);
-    const int pump = pump_it == b.last_binary.end() || pump_it->second == BinaryValue::INVALID
-                         ? -1
-                         : (pump_it->second == BinaryValue::ON ? 1 : 0);
-    const CircuitClimateState next = circuit_climate_state(state, room, comfort(), b.mode_of(h.m2_mode), pump);
+    const CircuitClimateState next = circuit_climate_state(state, room, comfort(), fresh_mode(), fresh_binary(h.pump),
+                                                           with_burner ? fresh_binary(h.v.burner) : -1);
     if (!next.ready || (!force && next.same_as(state)))
       return;
     state = next;
@@ -4086,6 +4098,7 @@ struct ClimateGlue {
   void run(uint32_t from, uint32_t duration) {
     for (uint32_t t = from; t - from < duration; t += 100) {
       b.run(t, 100);
+      now = t + 100;
       if (t % 1000 == 0)
         refresh();
     }
@@ -4372,6 +4385,85 @@ TEST(sim_v07_climate_follows_the_vitotronic_and_never_commands_by_itself) {
   CHECK(c.state.ready);
   CHECK_EQ(c.state.target, 19.0f);
   CHECK_EQ(b.boiler.write_frames, 0);  // aucune commande intempestive
+}
+
+TEST(sim_v073_climate_m2_heating_inertia_stopped_and_stale_readings) {
+  Bench b;
+  Heat h(b, false, false);
+  ClimateGlue c(b, h);
+  c.run(0, BOOT);
+  // Programme 03, circulateur 01, brûleur 01 : Chauffe.
+  CHECK(c.state.status == CircuitStatus::HEATING);
+  CHECK(c.state.action == CircuitAction::HEATING);
+  uint32_t t = BOOT;
+  // Brûleur arrêté, circulateur toujours en marche : Inertie (idle).
+  b.boiler.registers[0x0842] = {0x00};
+  c.run(t, MIN);
+  t += MIN;
+  CHECK(c.state.status == CircuitStatus::INERTIA);
+  CHECK(c.state.action == CircuitAction::IDLE);
+  b.boiler.registers[0x0842] = {0x01};
+  c.run(t, MIN);
+  t += MIN;
+  CHECK(c.state.status == CircuitStatus::HEATING);
+  // Brûleur plus lu (aucune réponse) : la dernière valeur reste fraîche
+  // 3 intervalles + 30 s (2 min), puis Inconnu, jamais « chauffe ».
+  b.boiler.register_faults[0x0842] = SimBoiler::Fault::NO_RESPONSE;
+  const uint32_t last = b.last_success_ms[h.v.burner];
+  const uint32_t limit = (last + 119 * S) / S * S;  // refresh du climate : secondes rondes
+  c.run(t, limit - t);
+  CHECK(c.state.status == CircuitStatus::HEATING);
+  c.run(limit, 3 * S);
+  CHECK(c.state.status == CircuitStatus::UNKNOWN);
+  CHECK(c.state.action == CircuitAction::IDLE);
+  CHECK(c.state.hvac == CircuitHvac::HEAT);  // mode lu conservé
+  t = limit + 3 * S;
+  b.boiler.register_faults.erase(0x0842);
+  c.run(t, MIN);
+  t += MIN;
+  CHECK(c.state.status == CircuitStatus::HEATING);
+  // Circulateur arrêté : Arrêt quel que soit le brûleur (idle, mode HEAT).
+  b.boiler.registers[0x3906] = {0x00};
+  c.run(t, 2 * MIN);
+  t += 2 * MIN;
+  CHECK(c.state.status == CircuitStatus::STOPPED);
+  CHECK(c.state.action == CircuitAction::IDLE);
+  // Chauffage désactivé (ECS seule) : Arrêt, action off.
+  b.boiler.registers[0x3906] = {0x01};
+  b.boiler.registers[0x3301] = {0x00};
+  c.run(t, 6 * MIN);
+  t += 6 * MIN;
+  CHECK(c.state.status == CircuitStatus::STOPPED);
+  CHECK(c.state.action == CircuitAction::OFF);
+  CHECK(c.state.hvac == CircuitHvac::OFF);
+  // Interface débranchée : tout devient périmé ou inconnu, jamais « chauffe ».
+  b.boiler.registers[0x3301] = {0x03};
+  c.run(t, 6 * MIN);
+  t += 6 * MIN;
+  CHECK(c.state.status == CircuitStatus::HEATING);
+  b.boiler.connected = false;
+  c.run(t, 20 * MIN);
+  t += 20 * MIN;
+  CHECK(c.state.status == CircuitStatus::UNKNOWN);
+  CHECK(c.state.action != CircuitAction::HEATING);
+  b.boiler.connected = true;
+  c.run(t, 6 * MIN);
+  CHECK(c.state.status == CircuitStatus::HEATING);
+  CHECK_EQ(b.boiler.write_frames, 0);  // affichage seulement
+}
+
+TEST(sim_v073_climate_without_burner_never_reports_heating) {
+  Bench b;
+  Heat h(b, false, false);
+  ClimateGlue c(b, h);
+  c.with_burner = false;  // ancienne configuration, sans burner_id
+  c.run(0, BOOT);
+  CHECK(c.state.ready);
+  CHECK(c.state.status == CircuitStatus::UNKNOWN);  // circulateur en marche, brûleur non déclaré
+  CHECK(c.state.action == CircuitAction::IDLE);
+  b.boiler.registers[0x3906] = {0x00};
+  c.run(BOOT, 2 * MIN);
+  CHECK(c.state.status == CircuitStatus::STOPPED);
 }
 
 TEST(sim_v07_climate_commands_use_the_secured_paths) {
