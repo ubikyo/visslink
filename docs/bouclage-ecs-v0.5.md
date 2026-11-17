@@ -338,6 +338,22 @@ les 30 s par le séquenceur, **pendant la plage seulement**, avec les délais
 mesurés dans l'état. Elle ne déciderait de rien. À envisager seulement si
 l'historique ne suffit pas.
 
+## 5 quinquies. Cohabitation avec l'éditeur des programmations (v0.8)
+
+L'éditeur des programmations (docs/programmations-v0.8.md) peut aussi
+écrire les blocs `0x2200`. Pour éviter toute collision, les deux
+fonctions s'excluent :
+
+- pendant toute l'opération du bouclage (lecture de l'horloge, plage
+  active, restauration, récupération), l'éditeur refuse explicitement toute
+  modification et signale le jour concerné ;
+- pendant une modification de programmation, le bouton du bouclage est
+  refusé (« modification de programmation en cours ») ;
+- la restauration ne compare qu'au bloc temporaire : une programmation
+  modifiée depuis n'est jamais écrasée par la sauvegarde.
+
+Le fonctionnement du bouclage 10/20/30 min est inchangé.
+
 ## 5 quater. Sept jours, affichage et appuis répétés (v0.7.1)
 
 ### Autorisation explicite

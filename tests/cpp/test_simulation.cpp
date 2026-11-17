@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <string>
 #include <memory>
@@ -20,6 +21,8 @@
 #include "test_framework.h"
 #include "write_guard.h"
 #include "circulation_boost.h"
+#include "block_client.h"
+#include "schedule_editor.h"
 #include <functional>
 
 using namespace esphome::visslink;
@@ -81,7 +84,21 @@ struct Bench {
     uint16_t address{0};
     uint8_t length{0}, failures{0};
     uint32_t due_ms{0};
+    int owner{WriteArbiter::BOOST_OWNER};  ///< v0.8 : client destinataire
   } direct;
+  /// v0.8 : éditeur des programmations (VissLinkComponent::block_clients_).
+  BlockClient *editor{nullptr};
+  /// v0.8 : octets lus de chaque jour (VissLinkSchedule::raw_week).
+  std::map<size_t, WeekBlocks> raw_weeks;
+  /// VissLinkComponent::block_clients_ : bouclage (fonctions ci-dessous) et éditeur.
+  bool boost_busy() const { return boost_busy_fn && boost_busy_fn(); }
+  std::function<bool()> boost_busy_fn;
+  std::function<bool(uint16_t)> boost_locks_fn;
+  bool locked_by_other(int owner, uint16_t address) const {
+    if (owner == WriteArbiter::BOOST_OWNER)
+      return editor != nullptr && editor->locks_block(address);
+    return boost_locks_fn && boost_locks_fn(address);
+  }
   bool block_verify_pending{false};
   std::function<void(uint16_t, bool, const uint8_t *, uint8_t, uint32_t)> on_direct_read;
   std::function<void(uint16_t, bool, bool, uint32_t)> on_block_write;
@@ -91,22 +108,41 @@ struct Bench {
 
   bool schedule_writes_enabled() const { return enable_writes && enable_schedule_writes; }
   bool writes_idle() const { return writes.pending_count() == 0 && !writes.active(); }
-  bool block_write_allowed(uint16_t address, const uint8_t *data) const {
+  static bool is_block_owner(int owner) { return BlockClients::is_block_owner(owner); }
+  bool block_write_allowed(uint16_t address, const uint8_t *data, int owner = WriteArbiter::BOOST_OWNER) const {
     ScheduleSlots slots;
-    return schedule_writes_enabled() && is_schedule_write_whitelisted(address) &&
-           decode_schedule_slots(data, SCHEDULE_BLOCK_LENGTH, &slots) == ScheduleError::NONE && expects_block_write &&
-           expects_block_write(address, data);
+    const bool whitelisted = owner == WriteArbiter::BOOST_OWNER    ? is_schedule_write_whitelisted(address)
+                             : owner == WriteArbiter::EDITOR_OWNER ? is_schedule_editor_whitelisted(address)
+                                                                   : false;
+    const bool expected = owner == WriteArbiter::BOOST_OWNER
+                              ? (expects_block_write && expects_block_write(address, data))
+                              : (editor != nullptr && editor->expects_block_write(address, data));
+    return schedule_writes_enabled() && whitelisted &&
+           decode_schedule_slots(data, SCHEDULE_BLOCK_LENGTH, &slots) == ScheduleError::NONE &&
+           !locked_by_other(owner, address) && expected;
   }
-  bool submit_block_write(uint16_t address, const uint8_t *data, uint32_t now) {
-    if (!block_write_allowed(address, data))
+  bool submit_block_write(uint16_t address, const uint8_t *data, uint32_t now, int owner = WriteArbiter::BOOST_OWNER) {
+    if (!block_write_allowed(address, data, owner))
       return false;
-    return writes.submit_block(WriteArbiter::BOOST_OWNER, address, data, now) == WriteArbiter::Submit::QUEUED;
+    return writes.submit_block(owner, address, data, now) == WriteArbiter::Submit::QUEUED;
   }
-  bool request_direct_read(uint16_t address, uint8_t len, uint32_t now) {
-    const bool allowed = len == 8 && (address == VITO_CLOCK_ADDRESS || is_schedule_write_whitelisted(address));
+  void notify_block_write(int owner, uint16_t address, bool sent, bool acked, uint32_t now) {
+    if (owner == WriteArbiter::EDITOR_OWNER) {
+      if (editor != nullptr)
+        editor->on_block_write(address, sent, acked, now);
+    } else if (on_block_write) {
+      on_block_write(address, sent, acked, now);
+    }
+  }
+  bool request_direct_read(uint16_t address, uint8_t len, uint32_t now, int owner = WriteArbiter::BOOST_OWNER) {
+    const bool block_ok = owner == WriteArbiter::EDITOR_OWNER ? is_schedule_editor_whitelisted(address)
+                                                              : is_schedule_write_whitelisted(address);
+    const bool allowed =
+        len == 8 && ((owner == WriteArbiter::BOOST_OWNER && address == VITO_CLOCK_ADDRESS) || block_ok);
     if (!allowed || direct.pending)
       return false;
     direct = DirectRead();
+    direct.owner = owner;
     direct.pending = true;
     direct.address = address;
     direct.length = len;
@@ -119,8 +155,25 @@ struct Bench {
       block_verify_pending = false;
       writes.complete(now);
     }
-    if (on_direct_read)
+    if (direct.owner == WriteArbiter::EDITOR_OWNER) {
+      if (editor != nullptr)
+        editor->on_direct_read(direct.address, ok, ok ? kw.data() : nullptr, ok ? kw.data_length() : 0, now);
+    } else if (on_direct_read) {
       on_direct_read(direct.address, ok, ok ? kw.data() : nullptr, ok ? kw.data_length() : 0, now);
+    }
+  }
+  /// v0.8 : VissLinkSchedule::publish_data appelé par l'éditeur (bloc relu).
+  void publish_schedule_block(uint16_t address, const uint8_t *data, uint32_t now) {
+    size_t index;
+    uint8_t block;
+    DaySchedule day;
+    if (!find_schedule_block(address, &index, &block) ||
+        decode_schedule_day(data, SCHEDULE_BLOCK_LENGTH, &day) != ScheduleError::NONE)
+      return;
+    weeks[index].set_day(block, day);
+    std::memcpy(raw_weeks[index].raw[block], data, SCHEDULE_BLOCK_LENGTH);
+    raw_weeks[index].known_mask |= static_cast<uint8_t>(1u << block);
+    (void) now;
   }
   ReadBackTracker read_back;
   std::map<size_t, int> mode_state;  ///< programme publié (brut 00/03/05, -1 = inconnu)
@@ -436,6 +489,7 @@ struct Bench {
       scheduler.add(params[i].first, now + stagger_ms * i, params[i].second);
     today_requested.clear();
     weeks.clear();  // programmations publiées perdues avec la RAM
+    raw_weeks.clear();
     day_published_ms.clear();
     writes = WriteArbiter();
     dhw = SetpointWriter();  // rien de persistant
@@ -482,7 +536,7 @@ struct Bench {
     dhw.poll(now);  // VissLinkComponent::loop
     for (auto &kv : heat)
       kv.second.poll(now);
-    if (result != KwResult::NONE && write_in_flight && writes.current().owner == WriteArbiter::BOOST_OWNER) {
+    if (result != KwResult::NONE && write_in_flight && is_block_owner(writes.current().owner)) {
       // VissLinkComponent::handle_block_write_result_
       write_in_flight = false;
       block_write_results.push_back(result);
@@ -490,12 +544,12 @@ struct Bench {
       if (!sent)
         link_ok = false;
       const uint16_t address = writes.current().address;
+      const int owner = writes.current().owner;
       if (sent)
         block_verify_pending = true;
       else
         writes.complete(now);
-      if (on_block_write)
-        on_block_write(address, sent, result == KwResult::SUCCESS, now);
+      notify_block_write(owner, address, sent, result == KwResult::SUCCESS, now);
       if (sent && !direct.pending) {
         block_verify_pending = false;
         writes.complete(now);
@@ -554,6 +608,8 @@ struct Bench {
         accepted = decode_schedule_day(kw.data(), kw.data_length(), &day) == ScheduleError::NONE;
         if (accepted) {
           weeks[index].set_day(block, day);
+          std::memcpy(raw_weeks[index].raw[block], kw.data(), SCHEDULE_BLOCK_LENGTH);
+          raw_weeks[index].known_mask |= static_cast<uint8_t>(1u << block);
           day_published_ms[index].emplace(block, now);
           schedule_reads.push_back({now, block_address(r, block)});
         } else
@@ -628,22 +684,21 @@ struct Bench {
         expired_writes++;
         if (SetpointWriter *sw = writer_for(w.owner))
           sw->on_dropped("expired");
-        if (w.owner == WriteArbiter::BOOST_OWNER && on_block_write)
-          on_block_write(w.address, false, false, now);
+        if (is_block_owner(w.owner))
+          notify_block_write(w.owner, w.address, false, false, now);
       }
       bool started = false;
       if (enable_writes && writes.next(now, link_ok, &w, deferred_setpoints())) {
-        if (w.owner == WriteArbiter::BOOST_OWNER) {
+        if (is_block_owner(w.owner)) {
           // VissLinkComponent::start_write_, bloc horaire : contrôles revérifiés.
-          if (w.length == 8 && block_write_allowed(w.address, w.data) &&
+          if (w.length == 8 && block_write_allowed(w.address, w.data, w.owner) &&
               kw.request_write(w.address, w.data, 8, now)) {
             write_in_flight = true;
             started = true;
           } else {
             block_refused_at_send++;
             writes.complete(now);
-            if (on_block_write)
-              on_block_write(w.address, false, false, now);
+            notify_block_write(w.owner, w.address, false, false, now);
           }
         } else {
           // VissLinkComponent::start_write_ : contrôle complet avant émission
@@ -2469,6 +2524,8 @@ struct BoostGlue {
       dispatch(now);
     };
     b.expects_block_write = [this](uint16_t a, const uint8_t *d) { return seq.expects_write(a, d); };
+    b.boost_busy_fn = [this]() { return !seq.idle(); };
+    b.boost_locks_fn = [this](uint16_t a) { return seq.locks_block(a); };
   }
   /// VissLinkBoost::press(START).
   std::string start(uint16_t duration, const HaTime &ha, uint32_t now) {
@@ -2478,6 +2535,8 @@ struct BoostGlue {
       return "link";
     if (!b.writes_idle() && seq.idle())
       return "busy";
+    if (seq.idle() && b.editor != nullptr && b.editor->block_operation_busy())
+      return "editor";  // v0.8 : modification de programmation en cours
     const BoostStart r = seq.start(duration, ha, now);
     dispatch(now);
     return r == BoostStart::ACCEPTED ? "accepted" : r == BoostStart::RECOVERY_PENDING ? "recovery" : "refused";
@@ -4527,4 +4586,410 @@ TEST(sim_v07_climate_link_loss_shows_unknown_never_commands) {
   c.run(BOOT + 10 * MIN, 10 * MIN);
   CHECK_EQ(c.state.target, 21.0f);
   CHECK_EQ(b.boiler.write_frames, 0);
+}
+
+// --- v0.8 : éditeur des programmations -----------------------------------------
+//
+// Chaudière SIMULÉE (blocs de 8 octets acceptés et accusés par 00, hypothèse
+// vcontrold) : rien ici ne valide l'écriture des programmations sur la KW3.
+
+namespace {
+
+/// Même logique que VissLinkScheduleEditor (components/visslink_schedule_editor).
+struct EditorGlue : BlockClient {
+  Bench &b;
+  ScheduleEditor seq;
+  size_t index[EDITOR_CIRCUIT_COUNT];  ///< registre de chaque programmation
+  bool flash_has{false};
+  EditorRecord flash;
+  int saves{0};
+  std::string last_error;
+
+  EditorGlue(Bench &bench, size_t a1, size_t m2, size_t dhw, size_t loop) : b(bench), index{a1, m2, dhw, loop} {
+    boot(0);
+  }
+  void boot(uint32_t now) {
+    seq = ScheduleEditor();
+    seq.boot(flash_has ? &flash : nullptr, now);
+    b.editor = this;
+  }
+  /// VissLinkScheduleEditor::context_ + submit_.
+  bool submit(EditKind kind, const char *circuit, const std::string &days, const std::string &ranges, int source,
+              const std::string &expected, uint32_t now) {
+    last_error.clear();
+    if (!b.schedule_writes_enabled())
+      return refuse("disabled");
+    if (!b.link_ok)
+      return refuse("link");
+    const uint8_t c = editor_circuit_from_key(circuit);
+    if (c >= EDITOR_CIRCUIT_COUNT)
+      return refuse("circuit");
+    EditContext ctx;
+    ctx.cache = b.raw_weeks[index[c]];
+    for (uint8_t d = 0; d < SCHEDULE_DAYS; d++)
+      if (b.locked_by_other(WriteArbiter::EDITOR_OWNER, schedule_day_address(EDITOR_CIRCUIT_ADDRESSES[c], d)))
+        ctx.locked_mask |= static_cast<uint8_t>(1u << d);
+    ctx.busy = seq.busy() || b.boost_busy();
+    if (!seq.busy() && ctx.busy)
+      return refuse("bouclage ECS temporaire en cours : réessayer après la restauration");
+    DayList list;
+    if (!parse_day_list(days, list.days, &list.count))
+      return refuse("jours illisibles");
+    EditRequest r;
+    const std::string e = prepare_edit(kind, circuit, list, ranges, source, expected, ctx, &r);
+    if (!e.empty())
+      return refuse(e);
+    CHECK(seq.start(r, now));
+    dispatch(now);
+    return true;
+  }
+  bool undo(uint32_t now) {
+    EditRequest r;
+    if (!seq.undo_request(&r))
+      return refuse("rien");
+    if (seq.busy() || b.boost_busy())
+      return refuse("busy");
+    CHECK(seq.start(r, now));
+    dispatch(now);
+    return true;
+  }
+  bool refresh(const char *circuit, uint32_t now) {
+    const uint8_t c = editor_circuit_from_key(circuit);
+    return c < EDITOR_CIRCUIT_COUNT && b.scheduler.request_cycle(index[c], now);
+  }
+  bool refuse(const std::string &why) {
+    last_error = why;
+    return false;
+  }
+  std::string expected(const char *circuit) {
+    return format_expected_week(b.raw_weeks[index[editor_circuit_from_key(circuit)]]);
+  }
+  void dispatch(uint32_t now) {
+    for (int guard = 0; guard < 8; guard++) {
+      const EditorAction a = seq.poll(now);
+      switch (a.type) {
+        case EditorActionType::READ:
+          if (!b.request_direct_read(a.address, 8, now, WriteArbiter::EDITOR_OWNER))
+            seq.on_read_not_submitted();
+          return;
+        case EditorActionType::WRITE:
+          if (!b.submit_block_write(a.address, a.data, now, WriteArbiter::EDITOR_OWNER)) {
+            seq.on_write(false, false, now);
+            break;
+          }
+          return;
+        case EditorActionType::SAVE:
+          saves++;
+          flash = a.record;
+          flash_has = true;
+          seq.on_saved(true, now);
+          break;
+        default:
+          return;
+      }
+    }
+  }
+  void on_direct_read(uint16_t address, bool ok, const uint8_t *data, uint8_t length, uint32_t now) override {
+    if (seq.on_read(ok, data, length, now))
+      b.publish_schedule_block(address, data, now);
+    dispatch(now);
+  }
+  void on_block_write(uint16_t, bool sent, bool acked, uint32_t now) override {
+    seq.on_write(sent, acked, now);
+    dispatch(now);
+  }
+  bool expects_block_write(uint16_t a, const uint8_t *d) const override { return seq.expects_write(a, d); }
+  bool block_operation_busy() const override { return seq.busy(); }
+  bool locks_block(uint16_t a) const override { return seq.locks_block(a); }
+};
+
+/// Production v0.8 : registres actifs, quatre programmations (6 h), blocs
+/// des quatre circuits acceptés en écriture par la chaudière simulée.
+struct EditBench {
+  Active act;
+  Circuits circuits;
+  EditorGlue ed;
+  explicit EditBench(Bench &b)
+      : act(b, 0), circuits(b, 0), ed(b, circuits.a1, circuits.m2, circuits.dhw, circuits.loop) {
+    b.enable_writes = b.enable_schedule_writes = true;
+    for (uint16_t monday : EDITOR_CIRCUIT_ADDRESSES)
+      for (uint8_t d = 0; d < SCHEDULE_DAYS; d++)
+        b.boiler.writable.insert(schedule_day_address(monday, d));
+  }
+};
+
+void run_edit(Bench &b, EditorGlue &ed, uint32_t from, uint32_t duration_ms, BoostGlue *boost = nullptr) {
+  for (uint32_t t = from; t - from < duration_ms; t += 5) {
+    if (t % 1000 == 0) {
+      set_vito_clock(b.boiler, t);
+      b.clock_tick(t);
+    }
+    b.boiler.tick(t);
+    b.step(t);
+    ed.dispatch(t);
+    if (boost != nullptr) {
+      boost->dispatch(t);
+      boost->refresh(t);
+    }
+  }
+}
+
+std::vector<uint8_t> enc(const std::string &ranges) {
+  DaySchedule d;
+  CHECK(parse_ranges(ranges, &d) == RangesError::NONE);
+  uint8_t out[8];
+  CHECK(encode_day_block(d, out));
+  return std::vector<uint8_t>(out, out + 8);
+}
+
+constexpr uint32_t READ_ALL = 5 * MIN;  ///< 4 programmations lues (7 blocs, 30 s entre deux)
+
+std::map<uint16_t, std::vector<uint8_t>> snapshot(const SimBoiler &boiler) {
+  std::map<uint16_t, std::vector<uint8_t>> m;
+  for (uint16_t monday : EDITOR_CIRCUIT_ADDRESSES)
+    for (uint8_t d = 0; d < SCHEDULE_DAYS; d++)
+      m[schedule_day_address(monday, d)] = boiler.registers.at(schedule_day_address(monday, d));
+  return m;
+}
+
+}  // namespace
+
+TEST(sim_v08_four_schedules_read_then_one_day_edited) {
+  Bench b;
+  EditBench x(b);
+  run_edit(b, x.ed, 0, READ_ALL);
+  for (size_t i : {x.circuits.a1, x.circuits.m2, x.circuits.dhw, x.circuits.loop})
+    CHECK_EQ(b.raw_weeks[i].known_mask, EDITOR_ALL_DAYS);
+  CHECK(x.ed.expected("ecs").find("20B8FFFFFFFFFFFF") == 0);
+  const auto before = snapshot(b.boiler);
+  const int burner_before = b.successes[x.act.burner];
+  const size_t frames = b.boiler.frame_log.size();
+  CHECK(x.ed.submit(EditKind::SET, "a1", "2", "05:30-08:00,16:30-22:30", -1, x.ed.expected("a1"), READ_ALL));
+  run_edit(b, x.ed, READ_ALL, MIN);
+  CHECK(!x.ed.seq.busy());
+  CHECK(x.ed.seq.status() == "Enregistré et relu : Radiateurs Me");
+  CHECK(b.boiler.registers[0x2010] == enc("05:30-08:00,16:30-22:30"));
+  // Trames : lecture préalable, écriture de 8 octets, relecture ; rien d'autre écrit.
+  CHECK_EQ(b.boiler.write_frames, 1);
+  CHECK(b.boiler.write_log[0] ==
+        (std::vector<uint8_t>{0x01, 0xF4, 0x20, 0x10, 0x08, 0x2B, 0x40, 0x83, 0xB3, 0xFF, 0xFF, 0xFF, 0xFF}));
+  std::vector<std::pair<uint8_t, uint16_t>> block_frames;
+  for (size_t i = frames; i < b.boiler.frame_log.size(); i++)
+    if (b.boiler.frame_log[i].second == 0x2010)
+      block_frames.push_back(b.boiler.frame_log[i]);
+  CHECK(block_frames == (std::vector<std::pair<uint8_t, uint16_t>>{{0xF7, 0x2010}, {0xF4, 0x2010}, {0xF7, 0x2010}}));
+  // Affichage : le bloc relu, sans attendre le cycle de 6 h.
+  CHECK(format_day(b.weeks[x.circuits.a1].days[2]) == "05:30-08:00, 16:30-22:30");
+  // Autres jours et circuits intacts ; lectures ordinaires poursuivies.
+  for (const auto &kv : before)
+    if (kv.first != 0x2010)
+      CHECK(b.boiler.registers[kv.first] == kv.second);
+  CHECK(b.successes[x.act.burner] > burner_before);
+  CHECK(b.failures.empty());
+  CHECK_EQ(x.ed.saves, 1);
+}
+
+TEST(sim_v08_copy_monday_to_weekdays_block_by_block) {
+  Bench b;
+  EditBench x(b);
+  run_edit(b, x.ed, 0, READ_ALL);
+  CHECK(x.ed.submit(EditKind::SET, "m2", "0", "05:00-07:30,17:00-22:00", -1, x.ed.expected("m2"), READ_ALL));
+  run_edit(b, x.ed, READ_ALL, MIN);
+  uint32_t t = READ_ALL + MIN;
+  CHECK(x.ed.submit(EditKind::COPY, "m2", "0,1,2,3,4", "", 0, x.ed.expected("m2"), t));
+  // Pendant l'opération : jamais « semaine enregistrée » avant la fin.
+  bool partial_seen = false;
+  for (int i = 0; i < 120 && x.ed.seq.busy(); i++) {
+    run_edit(b, x.ed, t, S);
+    t += S;
+    if (x.ed.seq.busy())
+      CHECK(x.ed.seq.status().find("Enregistré et relu") == std::string::npos);
+    partial_seen |= x.ed.seq.busy() && x.ed.seq.saved_mask() != 0;
+  }
+  CHECK(partial_seen);
+  CHECK(!x.ed.seq.busy());
+  CHECK(x.ed.seq.status() == "Enregistré et relu : Plancher Ma, Me, Je, Ve");
+  for (uint8_t d = 0; d < 5; d++)
+    CHECK(b.boiler.registers[schedule_day_address(M2, d)] == enc("05:00-07:30,17:00-22:00"));
+  for (uint8_t d = 5; d < 7; d++)
+    CHECK(b.boiler.registers[schedule_day_address(M2, d)] == (std::vector<uint8_t>{0x30, 0xB0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}));
+  CHECK_EQ(writes_to(b.boiler, 0x3000), 1);  // lundi déjà écrit, jamais réécrit
+  for (uint8_t d = 1; d < 5; d++)
+    CHECK_EQ(writes_to(b.boiler, schedule_day_address(M2, d)), 1);
+  // 10 s au moins entre deux écritures (WriteArbiter::MIN_SPACING_MS).
+  CHECK_EQ(b.boiler.write_frames, 5);
+  CHECK(b.failures.empty());
+}
+
+TEST(sim_v08_panel_change_after_display_is_never_overwritten) {
+  Bench b;
+  EditBench x(b);
+  run_edit(b, x.ed, 0, READ_ALL);
+  const std::string shown = x.ed.expected("ecs");
+  // Modification au panneau après l'affichage, avant « Enregistrer ».
+  const std::vector<uint8_t> panel = {0x28, 0xA8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};  // 05:00-21:00
+  b.boiler.registers[schedule_day_address(DHW, 4)] = panel;
+  CHECK(x.ed.submit(EditKind::SET, "ecs", "3,4,5", "04:00-22:00", -1, shown, READ_ALL));
+  run_edit(b, x.ed, READ_ALL, 2 * MIN);
+  CHECK(b.boiler.registers[schedule_day_address(DHW, 4)] == panel);  // conservé
+  CHECK(x.ed.seq.result(3) == JobResult::SAVED);
+  CHECK(x.ed.seq.result(4) == JobResult::FAILED);
+  CHECK(x.ed.seq.result(5) == JobResult::NOT_DONE);
+  CHECK(b.boiler.registers[schedule_day_address(DHW, 5)] == (std::vector<uint8_t>{0x20, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}));
+  CHECK(x.ed.seq.status() ==
+        "Échec ECS Ve : modifié depuis la Vitotronic (05:00-21:00), non écrasé : programmation rechargée · "
+        "enregistrés : Je · non traités : Sa");
+  CHECK(format_day(b.weeks[x.circuits.dhw].days[4]) == "05:00-21:00");  // affichage resynchronisé
+  // Nouvelle référence de la carte : la modification passe.
+  CHECK(x.ed.submit(EditKind::SET, "ecs", "4", "04:00-22:00", -1, x.ed.expected("ecs"), READ_ALL + 2 * MIN));
+  run_edit(b, x.ed, READ_ALL + 2 * MIN, MIN);
+  CHECK(b.boiler.registers[schedule_day_address(DHW, 4)] == enc("04:00-22:00"));
+  // Référence de la carte périmée alors que l'ESP connaît déjà le changement.
+  b.boiler.registers[schedule_day_address(DHW, 6)] = panel;
+  CHECK(x.ed.refresh("ecs", READ_ALL + 3 * MIN));
+  run_edit(b, x.ed, READ_ALL + 3 * MIN, 4 * MIN);
+  CHECK(!x.ed.submit(EditKind::SET, "ecs", "6", "04:00-22:00", -1, shown, READ_ALL + 7 * MIN));
+  CHECK(x.ed.last_error.find("ECS Di modifié depuis l'affichage") == 0);
+}
+
+TEST(sim_v08_link_lost_after_the_write_then_recovered) {
+  Bench b;
+  EditBench x(b);
+  run_edit(b, x.ed, 0, READ_ALL);
+  CHECK(x.ed.submit(EditKind::SET, "bouclage", "1", "06:00-06:30", -1, "", READ_ALL));
+  uint32_t t = READ_ALL;
+  while (b.boiler.write_frames == 0 && t < READ_ALL + MIN) {
+    run_edit(b, x.ed, t, 5);
+    t += 5;
+  }
+  CHECK_EQ(b.boiler.write_frames, 1);
+  run_edit(b, x.ed, t, 30);  // accusé
+  t += 30;
+  b.boiler.connected = false;  // interface débranchée juste après l'écriture
+  run_edit(b, x.ed, t, 3 * MIN);
+  t += 3 * MIN;
+  CHECK(x.ed.seq.busy());
+  CHECK(x.ed.seq.saved_mask() == 0);  // jamais « enregistré » sans relecture
+  CHECK(x.ed.seq.status().find("nouvelle relecture dans 30 s") != std::string::npos);
+  CHECK(x.ed.seq.locks_block(0x2208));
+  CHECK(x.ed.block_operation_busy());
+  b.boiler.connected = true;
+  run_edit(b, x.ed, t, 2 * MIN);
+  CHECK(!x.ed.seq.busy());
+  CHECK(x.ed.seq.status() == "Enregistré et relu : Bouclage ECS Ma");
+  CHECK_EQ(b.boiler.write_frames, 1);  // jamais réémise
+}
+
+TEST(sim_v08_esp_reboot_checks_the_last_write_without_writing) {
+  Bench b;
+  EditBench x(b);
+  run_edit(b, x.ed, 0, READ_ALL);
+  CHECK(x.ed.submit(EditKind::SET, "a1", "6", "07:00-23:00", -1, "", READ_ALL));
+  uint32_t t = READ_ALL;
+  while (b.boiler.write_frames == 0) {
+    run_edit(b, x.ed, t, 5);
+    t += 5;
+  }
+  // Coupure de l'ESP juste après l'émission (relecture jamais faite).
+  b.reboot(t + 20);
+  x.ed.boot(t + 20);
+  CHECK(x.ed.seq.busy());  // vérification de la dernière écriture
+  const int writes = b.boiler.write_frames;
+  run_edit(b, x.ed, t + 20, 2 * MIN);
+  CHECK(!x.ed.seq.busy());
+  CHECK(x.ed.seq.status() == "Dernière modification (Radiateurs Di) confirmée par relecture");
+  CHECK_EQ(b.boiler.write_frames, writes);  // aucune écriture au démarrage
+  // L'annulation reste possible : bloc d'origine réécrit et relu.
+  run_edit(b, x.ed, t + 20 + 2 * MIN, READ_ALL);
+  t += 20 + 2 * MIN + READ_ALL;
+  CHECK(x.ed.undo(t));
+  run_edit(b, x.ed, t, MIN);
+  CHECK(b.boiler.registers[0x2030] == (std::vector<uint8_t>{0x30, 0xB0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}));
+  CHECK(x.ed.seq.status() == "Annulation enregistrée et relue : Radiateurs Di");
+}
+
+TEST(sim_v08_editor_and_boost_exclude_each_other) {
+  Bench b;
+  EditBench x(b);
+  BoostGlue boost(b, 0x7F);
+  run_edit(b, x.ed, 0, READ_ALL, &boost);
+  uint32_t t = READ_ALL;
+  // Bouclage temporaire (dimanche, 0x2230) : toute modification refusée
+  // explicitement jusqu'à la fin de la restauration ; le jour est signalé.
+  CHECK(boost.start(10, ha_now(t), t) == "accepted");
+  run_edit(b, x.ed, t, MIN, &boost);
+  t += MIN;
+  CHECK(boost.seq.state() == BoostState::ACTIVE);
+  CHECK(b.locked_by_other(WriteArbiter::EDITOR_OWNER, 0x2230));
+  CHECK(!b.locked_by_other(WriteArbiter::EDITOR_OWNER, 0x2228));
+  CHECK(!x.ed.submit(EditKind::SET, "bouclage", "6", "06:00-06:30", -1, "", t));
+  CHECK(x.ed.last_error == "bouclage ECS temporaire en cours : réessayer après la restauration");
+  CHECK(!x.ed.submit(EditKind::SET, "a1", "0", "06:00-21:00", -1, "", t));
+  // Pendant la restauration aussi.
+  CHECK(boost.restore(t));
+  run_edit(b, x.ed, t, 50, &boost);
+  t += 50;
+  CHECK(!boost.seq.idle());
+  CHECK(!x.ed.submit(EditKind::SET, "bouclage", "6", "06:00-06:30", -1, "", t));
+  run_edit(b, x.ed, t, 2 * MIN, &boost);
+  t += 2 * MIN;
+  CHECK(boost.seq.idle());
+  CHECK(b.boiler.registers[0x2230] == LOOP_SUNDAY);  // restauration intacte
+  // Bouclage terminé : modification acceptée ; pendant celle-ci, le bouclage
+  // refuse de démarrer.
+  CHECK(x.ed.submit(EditKind::SET, "bouclage", "6", "06:00-06:30,21:40-21:50", -1, "", t));
+  CHECK(boost.start(10, ha_now(t), t) == "editor");
+  run_edit(b, x.ed, t, MIN, &boost);
+  t += MIN;
+  CHECK(x.ed.seq.status() == "Enregistré et relu : Bouclage ECS Di");
+  // Le bouclage repart de la nouvelle programmation et la restaure à l'identique.
+  t += 15 * MIN;  // intervalle minimal entre deux déclenchements
+  run_edit(b, x.ed, t - 15 * MIN, 15 * MIN, &boost);
+  CHECK(boost.start(10, ha_now(t), t) == "accepted");
+  run_edit(b, x.ed, t, 15 * MIN, &boost);
+  CHECK(boost.seq.idle());
+  CHECK(b.boiler.registers[0x2230] == enc("06:00-06:30,21:40-21:50"));
+  CHECK(b.failures.empty());
+}
+
+TEST(sim_v08_manual_refresh_reads_seven_blocks_spaced) {
+  Bench b;
+  EditBench x(b);
+  run_edit(b, x.ed, 0, READ_ALL);
+  // Modification au panneau : visible au prochain cycle (6 h) ou au
+  // rafraîchissement manuel, qui relit les 7 jours espacés de 30 s.
+  b.boiler.registers[schedule_day_address(M2, 3)] = {0x28, 0xA8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  const size_t reads_before = b.schedule_reads.size();
+  CHECK(x.ed.refresh("m2", READ_ALL));
+  run_edit(b, x.ed, READ_ALL, 4 * MIN);
+  std::vector<uint32_t> times;
+  for (size_t i = reads_before; i < b.schedule_reads.size(); i++)
+    if (b.schedule_reads[i].second >= M2 && b.schedule_reads[i].second < M2 + 56)
+      times.push_back(b.schedule_reads[i].first);
+  CHECK_EQ(times.size(), 7u);
+  for (size_t i = 1; i < times.size(); i++)
+    CHECK(times[i] - times[i - 1] >= RegisterScheduler::BLOCK_DELAY_MS);
+  CHECK(format_day(b.weeks[x.circuits.m2].days[3]) == "05:00-21:00");
+  CHECK(x.ed.refresh("m2", READ_ALL + 4 * MIN));
+  CHECK(!x.ed.refresh("zz", READ_ALL));
+}
+
+TEST(sim_v08_editor_disabled_or_refused_without_link) {
+  Bench b;
+  EditBench x(b);
+  run_edit(b, x.ed, 0, READ_ALL);
+  b.enable_schedule_writes = false;
+  CHECK(!x.ed.submit(EditKind::SET, "a1", "0", "06:00-21:00", -1, "", READ_ALL));
+  CHECK(x.ed.last_error == "disabled");
+  b.enable_schedule_writes = true;
+  b.boiler.connected = false;
+  run_edit(b, x.ed, READ_ALL, MIN);
+  CHECK(!x.ed.submit(EditKind::SET, "a1", "0", "06:00-21:00", -1, "", READ_ALL + MIN));
+  CHECK(x.ed.last_error == "link");
+  CHECK_EQ(b.boiler.write_frames, 0);
+  // Écriture du bouclage par l'éditeur ou d'un bloc A1 par le bouclage :
+  // refusées par la liste blanche du propriétaire.
+  const uint8_t block[8] = {0x30, 0xB0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  CHECK(!b.block_write_allowed(0x2000, block, WriteArbiter::BOOST_OWNER));
+  CHECK(!b.block_write_allowed(0x2301, block, WriteArbiter::EDITOR_OWNER));  // pas un bloc
 }

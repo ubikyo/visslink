@@ -8,6 +8,12 @@
 > par défaut** (`enable_writes: false`) et doivent le rester jusqu'à la fin de
 > la procédure du § 10.
 
+> **v0.8 : éditeur des programmations.** `enable_schedule_writes` couvre
+> aussi l'éditeur des programmations (`visslink_schedule_editor`), qui peut
+> écrire les 28 blocs de `0x2000`, `0x3000`, `0x2100` et `0x2200` : un bloc
+> à la fois, lu, comparé, sauvegardé, écrit et relu. Le bouclage reste
+> limité à `0x2200`. Voir docs/programmations-v0.8.md.
+
 > **Depuis la v0.7.2 : autorisations actives par défaut.** Les six
 > autorisations (`enable_writes`, `enable_mode_writes`,
 > `enable_m2_mode_write`, `enable_schedule_writes`,

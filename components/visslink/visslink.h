@@ -1,5 +1,6 @@
 #pragma once
 
+#include <memory>
 #include <vector>
 
 #include "esphome/components/uart/uart.h"
@@ -29,12 +30,14 @@
 #include "esphome/components/climate/climate.h"
 #endif
 
+#include "block_client.h"
 #include "circuit_climate.h"
 #include "circulation_boost.h"
 #include "decode.h"
 #include "dhw_setpoint.h"
 #include "kw_protocol.h"
 #include "schedule.h"
+#include "schedule_editor.h"
 #include "scheduler.h"
 #include "write_guard.h"
 
@@ -167,6 +170,16 @@ class VissLinkSchedule : public text_sensor::TextSensor, public VissLinkRegister
     if (day < SCHEDULE_DAYS)
       this->day_sensors_[day] = sensor;
   }
+  /// v0.8 : conserve les 8 octets lus de chaque jour et l'heure de leur
+  /// lecture (éditeur des programmations). Sans éditeur : rien d'alloué.
+  void enable_raw_cache();
+  bool has_raw_cache() const { return this->raw_ != nullptr; }
+  /// Octets lus (jours connus seulement).
+  void raw_week(WeekBlocks *out) const;
+  /// millis() de la dernière lecture valide d'un jour ; false si jamais lu.
+  bool day_read_ms(uint8_t day, uint32_t *ms) const;
+  /// Programmation décodée (affichage).
+  const WeekSchedule &week() const { return this->week_; }
 #ifdef USE_TIME
   void set_time(time::RealTimeClock *clock) { this->clock_ = clock; }
   void set_today_sensor(text_sensor::TextSensor *sensor) { this->today_sensor_ = sensor; }
@@ -184,6 +197,11 @@ class VissLinkSchedule : public text_sensor::TextSensor, public VissLinkRegister
   bool first_pass_done_{false};  ///< les 7 blocs ont été tentés au moins une fois
   int requested_day_{-1};        ///< dernier jour dont la relecture a été demandée
   text_sensor::TextSensor *day_sensors_[SCHEDULE_DAYS]{};
+  struct RawCache {
+    WeekBlocks week;
+    uint32_t read_ms[SCHEDULE_DAYS]{};
+  };
+  std::unique_ptr<RawCache> raw_;  ///< v0.8, éditeur seulement
 #ifdef USE_TIME
   time::RealTimeClock *clock_{nullptr};
   text_sensor::TextSensor *today_sensor_{nullptr};
@@ -198,19 +216,11 @@ static_assert(SCHEDULE_BLOCK_LENGTH <= KwProtocol::MAX_READ_LENGTH, "schedule bl
 
 class VissLinkComponent;
 
-/// Client du chemin expérimental des blocs horaires (bouclage ECS, v0.5) :
-/// lectures ponctuelles et écritures de 8 octets, résultats rendus ici.
-class VissLinkBlockClient {
- public:
-  virtual void on_direct_read(uint16_t address, bool ok, const uint8_t *data, uint8_t length, uint32_t now) = 0;
-  /// `sent` : trame émise ; `acked` : accusé 00 (jamais une preuve).
-  virtual void on_block_write(uint16_t address, bool sent, bool acked, uint32_t now) = 0;
-  /// Contrôle croisé juste avant émission.
-  virtual bool expects_block_write(uint16_t address, const uint8_t *data) const = 0;
-  /// v0.6 : une restauration (ou récupération) de bloc est en cours : elle
-  /// passe avant une écriture de consigne ECS.
-  virtual bool restore_priority() const { return false; }
-};
+/// Client du chemin expérimental des blocs horaires (bouclage ECS v0.5,
+/// éditeur des programmations v0.8) : block_client.h.
+using VissLinkBlockClient = BlockClient;
+static_assert(BLOCK_OWNER_BOOST == WriteArbiter::BOOST_OWNER, "block owners");
+static_assert(BLOCK_OWNER_EDITOR == WriteArbiter::EDITOR_OWNER, "block owners");
 
 #ifdef USE_NUMBER
 /// Consigne réglable (v0.3) : registre uint8 de la liste blanche, lu
@@ -363,15 +373,28 @@ class VissLinkComponent : public Component, public uart::UARTDevice {
   bool setpoint_pending(const VissLinkRegister *reg, uint8_t *target) const;
 
   // --- Blocs horaires (v0.5) ---
-  void set_block_client(VissLinkBlockClient *client) { this->block_client_ = client; }
+  void set_block_client(VissLinkBlockClient *client) { this->block_clients_.set(BLOCK_OWNER_BOOST, client); }
+  /// v0.8 : éditeur des programmations.
+  void set_editor_client(VissLinkBlockClient *client) { this->block_clients_.set(BLOCK_OWNER_EDITOR, client); }
+  /// v0.8 : l'autre client de blocs (bouclage / éditeur) a une opération en cours.
+  bool block_client_busy_other(int owner) const { return this->block_clients_.other_busy(owner); }
+  /// v0.8 : ce bloc est verrouillé par l'autre client.
+  bool block_locked_by_other(int owner, uint16_t address) const {
+    return this->block_clients_.locked_by_other(owner, address);
+  }
+  /// v0.8 : relance tout de suite le cycle de lecture d'un registre (7 blocs
+  /// d'une programmation, espacés de BLOCK_DELAY_MS). Sans effet si un cycle
+  /// est déjà en cours.
+  bool request_register_cycle(const VissLinkRegister *reg);
   bool schedule_writes_enabled() const { return this->enable_writes_ && this->enable_schedule_writes_; }
   bool link_ok() const { return this->link_ok_; }
   /// Aucune écriture en attente ni en cours (consignes, programmes, blocs).
   bool writes_idle() const { return this->writes_.pending_count() == 0 && !this->writes_.active(); }
-  /// Lecture ponctuelle prioritaire : horloge 0x088E ou bloc du bouclage, 8
-  /// octets. Refusée si une autre est en cours ou si l'adresse n'est pas
-  /// autorisée.
-  bool request_direct_read(uint16_t address, uint8_t length);
+  /// Lecture ponctuelle prioritaire : horloge 0x088E ou bloc du bouclage
+  /// (v0.8, éditeur : bloc d'une des quatre programmations), 8 octets.
+  /// Refusée si une autre est en cours ou si l'adresse n'est pas autorisée.
+  /// Le résultat n'est rendu qu'au client `owner`.
+  bool request_direct_read(uint16_t address, uint8_t length, int owner = BLOCK_OWNER_BOOST);
   /// v0.5.1 : relecture prioritaire d'un seul bloc d'une programmation
   /// déclarée (adresse du jour), publiée comme une lecture normale ; le
   /// cycle hebdomadaire n'est ni avancé ni recommencé. Jamais servie pendant
@@ -384,9 +407,11 @@ class VissLinkComponent : public Component, public uart::UARTDevice {
   bool cancel_block_refresh(uint16_t address);
   /// Un rafraîchissement de ce bloc attend encore son tour (v0.5.1).
   bool block_refresh_pending(uint16_t address) const;
-  /// Écriture d'un bloc du bouclage (8 octets), via l'arbitre. Refusée sans
-  /// les autorisations, hors liste blanche ou si le bloc est invalide.
-  bool submit_block_write(uint16_t address, const uint8_t *data, uint32_t now);
+  /// Écriture d'un bloc (8 octets), via l'arbitre. Refusée sans les
+  /// autorisations, hors liste blanche du propriétaire (bouclage : 0x2200 ;
+  /// éditeur : les 28 blocs des programmations), si le bloc est invalide ou
+  /// verrouillé par l'autre client.
+  bool submit_block_write(uint16_t address, const uint8_t *data, uint32_t now, int owner = BLOCK_OWNER_BOOST);
 
 #ifdef USE_NUMBER
   /// Demande d'écriture venant de Home Assistant (VissLinkNumber::control).
@@ -411,7 +436,7 @@ class VissLinkComponent : public Component, public uart::UARTDevice {
   void handle_block_write_result_(KwResult result, uint32_t now);
   void handle_direct_result_(KwResult result, uint32_t now);
   bool start_direct_read_(uint32_t now);
-  bool block_write_allowed_(uint16_t address, const uint8_t *data) const;
+  bool block_write_allowed_(int owner, uint16_t address, const uint8_t *data) const;
   bool start_write_(uint32_t now);
   void preempt_unsent_read_(uint32_t now);
   void current_day_first_(uint32_t now);
@@ -455,7 +480,7 @@ class VissLinkComponent : public Component, public uart::UARTDevice {
   bool enable_dhw_setpoint_write_{false};
   bool enable_heating_setpoint_writes_{false};
   std::vector<SetpointChannel> setpoints_;  ///< consignes déclarées (au plus 5)
-  VissLinkBlockClient *block_client_{nullptr};
+  BlockClients block_clients_;
   /// Lecture ponctuelle (v0.5) : une à la fois, nouvelles tentatives comme
   /// une lecture ordinaire.
   struct DirectRead {
@@ -465,6 +490,7 @@ class VissLinkComponent : public Component, public uart::UARTDevice {
     uint8_t length{0};
     uint8_t failures{0};
     uint32_t due_ms{0};
+    int owner{BLOCK_OWNER_BOOST};  ///< v0.8 : client destinataire du résultat
   } direct_;
   bool block_verify_pending_{false};  ///< écriture de bloc : arbitre libéré après la relecture
   ReadBackTracker read_back_;

@@ -677,6 +677,18 @@ class BoostSequencer {
   // --- État ------------------------------------------------------------------
   BoostState state() const { return this->state_; }
   bool idle() const { return this->state_ == BoostState::IDLE; }
+  /// v0.8 : bloc du bouclage que l'éditeur ne doit pas modifier : celui de
+  /// l'opération en cours, y compris pendant la restauration et la
+  /// récupération ; tous les blocs du bouclage tant que le jour n'est pas
+  /// encore déterminé (lecture de l'horloge).
+  bool locks_block(uint16_t address) const {
+    if (this->state_ == BoostState::IDLE || !is_schedule_write_whitelisted(address))
+      return false;
+    if (this->state_ == BoostState::READ_CLOCK || this->state_ == BoostState::READ_BLOCK ||
+        this->record_.address == 0)
+      return true;
+    return address == this->record_.address;
+  }
   /// Plage temporaire en place (de la confirmation à la fin de la restauration).
   bool active() const {
     return this->state_ == BoostState::ACTIVE || this->state_ == BoostState::RESTORE_READ ||

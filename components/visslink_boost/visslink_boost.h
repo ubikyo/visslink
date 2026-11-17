@@ -94,6 +94,9 @@ class VissLinkBoost : public Component, public visslink::VissLinkBlockClient {
   /// v0.6 : restauration ou récupération en cours : passe avant la consigne
   /// ECS (la machine à états du bouclage n'est pas modifiée).
   bool restore_priority() const override { return visslink::boost_restore_priority(this->sequencer_); }
+  /// v0.8 : verrou mutuel avec l'éditeur des programmations.
+  bool block_operation_busy() const override { return !this->sequencer_.idle(); }
+  bool locks_block(uint16_t address) const override { return this->sequencer_.locks_block(address); }
 
  protected:
   void dispatch_(uint32_t now);

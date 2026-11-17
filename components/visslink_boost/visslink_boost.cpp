@@ -105,6 +105,11 @@ void VissLinkBoost::press(BoostButton::Kind kind) {
     this->refuse_(VL_TEXT("une autre commande est en cours"), now);
     return;
   }
+  // v0.8 : verrou mutuel avec l'éditeur des programmations.
+  if (this->sequencer_.idle() && this->parent_->block_client_busy_other(visslink::BLOCK_OWNER_BOOST)) {
+    this->refuse_(VL_TEXT("modification de programmation en cours"), now);
+    return;
+  }
   visslink::HaTime ha;
   if (this->clock_ != nullptr) {
     const ESPTime t = this->clock_->now();

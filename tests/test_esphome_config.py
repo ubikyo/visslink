@@ -1763,3 +1763,125 @@ def test_boost_range_and_remaining_are_optional_display(repo_root, tmp_path):
     )
     assert "cv.Optional(CONF_RANGE)" in init
     assert "cv.Optional(CONF_REMAINING)" in init
+
+
+# --- v0.8 : éditeur des programmations ------------------------------------------
+
+PROGRAMMATIONS = "examples/iot-viessmann-programmations-v0.8.yaml"
+EDITOR_ACTIONS = (
+    "visslink_schedule_read",
+    "visslink_schedule_set",
+    "visslink_schedule_copy",
+    "visslink_schedule_clear",
+    "visslink_schedule_refresh",
+    "visslink_schedule_undo",
+)
+
+
+def test_schedule_editor_example_valid(repo_root, tmp_path):
+    text = _active_lines((repo_root / PROGRAMMATIONS).read_text(encoding="utf-8"))
+    for flag in WRITE_FLAGS:
+        assert f"{flag}:" not in text, flag  # défaut : true, jamais réintroduit
+    assert "validated_days" not in text
+    result = _run_config(repo_root, tmp_path, example=PROGRAMMATIONS)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    for action in EDITOR_ACTIONS:
+        assert f"action: {action}\n" in out, action
+    assert "supports_response: optional" in out  # lecture : réponse JSON
+    assert out.count("supports_response: status") == 5  # succès / motif du refus
+    assert "name: Programmations - État de l'édition" in out
+    # Une seule lecture de chaque programmation (aucune lecture en plus).
+    for address in ("0x2000", "0x3000", "0x2100", "0x2200"):
+        assert out.count(f"address: {address}\n") == 1, address
+    assert "SCHEDULE BLOCK WRITES ENABLED" in out
+
+
+def test_schedule_editor_example_only_adds_the_editor(repo_root):
+    """Base : l'exemple « toutes écritures autorisées » ; seuls l'éditeur, ses
+    actions et les identifiants des programmations sont ajoutés."""
+    base = _active_lines((repo_root / ECRITURES).read_text(encoding="utf-8"))
+    new = _active_lines((repo_root / PROGRAMMATIONS).read_text(encoding="utf-8"))
+    removed = [line for line in base.splitlines() if line not in new.splitlines()]
+    assert removed == ["    components: [visslink, visslink_boost]"], removed
+    added = [line for line in new.splitlines() if line not in base.splitlines()]
+    allowed = re.compile(
+        r"^\s*(components: \[visslink, visslink_boost, visslink_schedule_editor\]|"
+        r"actions:|- action: visslink_schedule_[a-z]+|variables:|"
+        r"(circuit|days|ranges|expected): string|source: int|then:|- api\.respond:|"
+        r"data: !lambda .*|success: !lambda .*|error_message: !lambda .*|"
+        r"id: programmation_(a1|m2|ecs|bouclage)|visslink_schedule_editor:|"
+        r"id: programmations|visslink_id: viessmann|schedules:|"
+        r"- programmation_(a1|m2|ecs|bouclage)|status:|"
+        r'name: "Programmations - État de l\'édition")$'
+    )
+    assert all(allowed.match(line) for line in added), [
+        line for line in added if not allowed.match(line)
+    ]
+
+
+@pytest.mark.parametrize(
+    "transform, message",
+    [
+        (
+            lambda t: t.replace(
+                "    - programmation_bouclage\n", "    - programmation_a1\n", 1
+            ),
+            "schedules: 0x2000 declared twice",
+        ),
+        (
+            lambda t: t.replace(
+                'id: programmation_bouclage\n    name: "Bouclage ECS - Programmation"\n'
+                "    address: 0x2200\n",
+                'id: programmation_bouclage\n    name: "Bouclage ECS - Programmation"\n'
+                "    address: 0x2400\n",
+                1,
+            ),
+            "schedules: must be visslink schedule text_sensors",
+        ),
+    ],
+)
+def test_schedule_editor_rejects_wrong_schedules(
+    repo_root, tmp_path, transform, message
+):
+    result = _run_config(repo_root, tmp_path, transform, example=PROGRAMMATIONS)
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, out
+    assert message in out, out
+
+
+def test_schedule_editor_circuits_match_cpp(repo_root):
+    """Mêmes circuits modifiables côté validation (Python) et côté écriture
+    (liste blanche C++), et rien d'autre."""
+    header = (repo_root / "components/visslink/schedule_editor.h").read_text(
+        encoding="utf-8"
+    )
+    cpp = re.search(
+        r"EDITOR_CIRCUIT_ADDRESSES\[EDITOR_CIRCUIT_COUNT\] = \{([^}]*)\}", header
+    )
+    assert cpp is not None
+    addresses = [int(a, 16) for a in re.findall(r"0x([0-9A-Fa-f]{4})", cpp.group(1))]
+    init = (repo_root / "components/visslink_schedule_editor/__init__.py").read_text(
+        encoding="utf-8"
+    )
+    py = [
+        int(a, 16) for a in re.findall(r"^    0x([0-9A-Fa-f]{4}):", init, re.MULTILINE)
+    ]
+    assert addresses == py == [0x2000, 0x3000, 0x2100, 0x2200]
+    assert "EDITOR_LAST_END_MIN = 23 * 60 + 50" in header
+
+
+def test_schedule_editor_has_no_permission_options(repo_root):
+    """Autorisé par défaut depuis la v0.7.2 : aucune option enable_* ni
+    validated_days dans le composant de l'éditeur."""
+    init = (repo_root / "components/visslink_schedule_editor/__init__.py").read_text(
+        encoding="utf-8"
+    )
+    assert "cv.Optional(CONF_ENABLE" not in init
+    assert "validated_days" not in init.split('"""', 2)[2]
+
+
+def test_production_example_unchanged_by_the_editor(repo_root):
+    text = _active_lines((repo_root / EXAMPLE).read_text(encoding="utf-8"))
+    assert "visslink_schedule_editor" not in text
+    assert "actions:" not in text

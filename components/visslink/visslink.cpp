@@ -4,6 +4,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 
 #include "esphome/core/hal.h"
 #include "esphome/core/log.h"
@@ -99,6 +100,11 @@ bool VissLinkSchedule::publish_data(uint8_t block, const uint8_t *data) {
     return false;
   }
   const bool changed = this->week_.set_day(block, day);
+  if (this->raw_ != nullptr) {
+    std::memcpy(this->raw_->week.raw[block], data, SCHEDULE_BLOCK_LENGTH);
+    this->raw_->week.known_mask |= static_cast<uint8_t>(1u << block);
+    this->raw_->read_ms[block] = millis();
+  }
   ESP_LOGD(TAG, "%s %s: %s", this->get_name().c_str(), SCHEDULE_DAY_LABELS[block], format_day(day).c_str());
   if (block + 1 == SCHEDULE_DAYS)
     this->first_pass_done_ = true;
@@ -107,6 +113,22 @@ bool VissLinkSchedule::publish_data(uint8_t block, const uint8_t *data) {
   this->publish_week_();
   if (changed)
     this->refresh_clock_();
+  return true;
+}
+
+void VissLinkSchedule::enable_raw_cache() {
+  if (this->raw_ == nullptr)
+    this->raw_.reset(new RawCache());
+}
+
+void VissLinkSchedule::raw_week(WeekBlocks *out) const {
+  *out = this->raw_ != nullptr ? this->raw_->week : WeekBlocks();
+}
+
+bool VissLinkSchedule::day_read_ms(uint8_t day, uint32_t *ms) const {
+  if (this->raw_ == nullptr || !this->raw_->week.known(day))
+    return false;
+  *ms = this->raw_->read_ms[day];
   return true;
 }
 
@@ -637,9 +659,9 @@ void VissLinkComponent::drop_expired_writes_(uint32_t now) {
              WriteArbiter::REQUEST_EXPIRY_MS / 1000);
     if (SetpointChannel *ch = this->setpoint_channel_(request.owner))
       ch->writer.on_dropped(VL_TEXT("délai de 120 s dépassé"));
-    if (request.owner == WriteArbiter::BOOST_OWNER) {
-      if (this->block_client_ != nullptr)
-        this->block_client_->on_block_write(request.address, false, false, now);  // rien d'émis
+    if (BlockClients::is_block_owner(request.owner)) {
+      if (VissLinkBlockClient *client = this->block_clients_.get(request.owner))
+        client->on_block_write(request.address, false, false, now);  // rien d'émis
     } else {
       this->registers_[request.owner]->restore_read_state();
     }
@@ -653,15 +675,17 @@ bool VissLinkComponent::start_write_(uint32_t now) {
   // Dernier contrôle avant émission : la demande a été validée au dépôt,
   // mais rien ne part sans un nouveau contrôle complet (adresse de la liste
   // blanche, longueur, bornes configurées et documentées).
-  if (request.owner == WriteArbiter::BOOST_OWNER) {
-    // Bloc horaire (v0.5) : autorisations, liste blanche, validité du bloc
-    // et attente effective du client, revérifiées juste avant l'émission.
-    if (request.length != KwProtocol::BLOCK_WRITE_LENGTH || !this->block_write_allowed_(request.address, request.data) ||
+  if (BlockClients::is_block_owner(request.owner)) {
+    // Bloc horaire (v0.5, v0.8) : autorisations, liste blanche du
+    // propriétaire, validité du bloc, verrou de l'autre client et attente
+    // effective du client, revérifiés juste avant l'émission.
+    if (request.length != KwProtocol::BLOCK_WRITE_LENGTH ||
+        !this->block_write_allowed_(request.owner, request.address, request.data) ||
         !this->kw_.request_write(request.address, request.data, KwProtocol::BLOCK_WRITE_LENGTH, now)) {
       ESP_LOGE(TAG, "0x%04X: schedule block write refused at send time", request.address);
       this->writes_.complete(now);
-      if (this->block_client_ != nullptr)
-        this->block_client_->on_block_write(request.address, false, false, now);
+      if (VissLinkBlockClient *client = this->block_clients_.get(request.owner))
+        client->on_block_write(request.address, false, false, now);
       return false;
     }
     ESP_LOGI(TAG, "0x%04X -> %s (schedule block write, experimental)", request.address,
@@ -738,7 +762,7 @@ void VissLinkComponent::handle_write_result_(KwResult result, uint32_t now) {
   this->timing_.acked = now;
   this->timing_valid_ = result != KwResult::SYNC_TIMEOUT;  // sinon, rien n'a été émis
   const WriteArbiter::Request &request = this->writes_.current();
-  if (request.owner == WriteArbiter::BOOST_OWNER) {
+  if (BlockClients::is_block_owner(request.owner)) {
     this->handle_block_write_result_(result, now);
     return;
   }
@@ -794,26 +818,43 @@ void VissLinkComponent::handle_write_result_(KwResult result, uint32_t now) {
 // ---------------------------------------------------------------------------
 // Blocs horaires du bouclage (v0.5, expérimental)
 
-bool VissLinkComponent::block_write_allowed_(uint16_t address, const uint8_t *data) const {
+bool VissLinkComponent::block_write_allowed_(int owner, uint16_t address, const uint8_t *data) const {
+  // Liste blanche propre à chaque client : le bouclage ne touche que 0x2200,
+  // l'éditeur que les 28 blocs des quatre programmations.
+  const bool whitelisted = owner == BLOCK_OWNER_BOOST    ? is_schedule_write_whitelisted(address)
+                           : owner == BLOCK_OWNER_EDITOR ? is_schedule_editor_whitelisted(address)
+                                                         : false;
+  const VissLinkBlockClient *client = this->block_clients_.get(owner);
   ScheduleSlots slots;
-  return this->schedule_writes_enabled() && is_schedule_write_whitelisted(address) &&
-         decode_schedule_slots(data, SCHEDULE_BLOCK_LENGTH, &slots) == ScheduleError::NONE &&
-         this->block_client_ != nullptr && this->block_client_->expects_block_write(address, data);
+  return this->schedule_writes_enabled() && whitelisted &&
+         decode_schedule_slots(data, SCHEDULE_BLOCK_LENGTH, &slots) == ScheduleError::NONE && client != nullptr &&
+         !this->block_clients_.locked_by_other(owner, address) && client->expects_block_write(address, data);
 }
 
-bool VissLinkComponent::submit_block_write(uint16_t address, const uint8_t *data, uint32_t now) {
-  if (!this->block_write_allowed_(address, data)) {
+bool VissLinkComponent::submit_block_write(uint16_t address, const uint8_t *data, uint32_t now, int owner) {
+  if (!this->block_write_allowed_(owner, address, data)) {
     ESP_LOGW(TAG, "0x%04X: schedule block write refused (%s)", address,
              this->schedule_writes_enabled() ? "not allowed" : "enable_writes / enable_schedule_writes: false");
     return false;
   }
-  return this->writes_.submit_block(WriteArbiter::BOOST_OWNER, address, data, now) == WriteArbiter::Submit::QUEUED;
+  return this->writes_.submit_block(owner, address, data, now) == WriteArbiter::Submit::QUEUED;
 }
 
-bool VissLinkComponent::request_direct_read(uint16_t address, uint8_t length) {
-  const bool allowed = length == 8 && (address == VITO_CLOCK_ADDRESS || is_schedule_write_whitelisted(address));
+bool VissLinkComponent::request_register_cycle(const VissLinkRegister *reg) {
+  const int index = this->index_of_(reg);
+  if (index < 0)
+    return false;
+  return this->scheduler_.request_cycle(static_cast<size_t>(index), millis());
+}
+
+bool VissLinkComponent::request_direct_read(uint16_t address, uint8_t length, int owner) {
+  const bool block_ok = owner == BLOCK_OWNER_EDITOR ? is_schedule_editor_whitelisted(address)
+                                                    : is_schedule_write_whitelisted(address);
+  const bool allowed = length == 8 && this->block_clients_.get(owner) != nullptr &&
+                       ((owner == BLOCK_OWNER_BOOST && address == VITO_CLOCK_ADDRESS) || block_ok);
   if (!allowed || this->direct_.pending)
     return false;
+  this->direct_.owner = owner;
   this->direct_.pending = true;
   this->direct_.in_flight = false;
   this->direct_.address = address;
@@ -847,8 +888,8 @@ void VissLinkComponent::handle_direct_result_(KwResult result, uint32_t now) {
       this->block_verify_pending_ = false;
       this->writes_.complete(now);
     }
-    if (this->block_client_ != nullptr)
-      this->block_client_->on_direct_read(address, true, data, this->kw_.data_length(), now);
+    if (VissLinkBlockClient *client = this->block_clients_.get(this->direct_.owner))
+      client->on_direct_read(address, true, data, this->kw_.data_length(), now);
     return;
   }
   if (result == KwResult::SYNC_TIMEOUT) {
@@ -867,8 +908,8 @@ void VissLinkComponent::handle_direct_result_(KwResult result, uint32_t now) {
     this->block_verify_pending_ = false;
     this->writes_.complete(now);
   }
-  if (this->block_client_ != nullptr)
-    this->block_client_->on_direct_read(address, false, nullptr, 0, now);
+  if (VissLinkBlockClient *client = this->block_clients_.get(this->direct_.owner))
+    client->on_direct_read(address, false, nullptr, 0, now);
 }
 
 void VissLinkComponent::handle_block_write_result_(KwResult result, uint32_t now) {
@@ -896,8 +937,8 @@ void VissLinkComponent::handle_block_write_result_(KwResult result, uint32_t now
   } else {
     this->writes_.complete(now);
   }
-  if (this->block_client_ != nullptr)
-    this->block_client_->on_block_write(request.address, sent, result == KwResult::SUCCESS, now);
+  if (VissLinkBlockClient *client = this->block_clients_.get(request.owner))
+    client->on_block_write(request.address, sent, result == KwResult::SUCCESS, now);
   if (sent && !this->direct_.pending) {
     // Le client n'a pas demandé de relecture : ne jamais bloquer l'arbitre.
     this->block_verify_pending_ = false;
@@ -1172,7 +1213,7 @@ bool VissLinkComponent::setpoint_pending(const VissLinkRegister *reg, uint8_t *t
 
 OwnerSet VissLinkComponent::deferred_setpoints_() const {
   OwnerSet set;
-  if (this->block_client_ == nullptr || !this->block_client_->restore_priority())
+  if (!this->block_clients_.restore_priority())
     return set;
   for (const auto &ch : this->setpoints_) {
     if (ch.owner != WriteArbiter::NONE)

@@ -541,7 +541,7 @@ class WriteArbiter {
   };
 
   struct Request {
-    int owner;       ///< index du registre (même index que l'ordonnanceur), ou BOOST_OWNER
+    int owner;       ///< index du registre (même index que l'ordonnanceur), BOOST_OWNER ou EDITOR_OWNER
     uint16_t address;
     uint8_t value;   ///< écriture d'un octet
     uint32_t requested_ms;
@@ -551,6 +551,8 @@ class WriteArbiter {
 
   /// Propriétaire des écritures de blocs horaires (bouclage ECS, v0.5).
   static constexpr int BOOST_OWNER = -2;
+  /// v0.8 : éditeur des programmations horaires.
+  static constexpr int EDITOR_OWNER = -3;
 
   /// Dépose l'écriture d'un bloc de 8 octets. Jamais de remplacement : une
   /// seule demande à la fois pour ce propriétaire.

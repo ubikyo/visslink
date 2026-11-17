@@ -232,6 +232,22 @@ class RegisterScheduler {
     e.due_ms = e.saved_due_ms;
     return true;
   }
+  /// v0.8 : rafraîchissement manuel. Le prochain cycle complet du registre
+  /// commence maintenant (blocs toujours espacés de block_delay) ; sa cadence
+  /// repart de cet instant. Sans effet (true) si un cycle est déjà commencé ;
+  /// false pendant une relecture hors cycle ou de nouvelles tentatives.
+  bool request_cycle(size_t index, uint32_t now) {
+    if (index >= this->entries_.size())
+      return false;
+    Entry &e = this->entries_[index];
+    if (e.done != 0 || static_cast<int>(index) == this->current_)
+      return true;  // cycle déjà en cours
+    if (e.urgent != URGENT_NONE || e.failures != 0)
+      return false;
+    e.due_ms = now;
+    return true;
+  }
+
   /// Un rafraîchissement de ce bloc est en attente (ou en cours).
   bool refresh_pending(size_t index, uint8_t block) const {
     return index < this->entries_.size() && this->entries_[index].urgent == URGENT_REFRESH &&

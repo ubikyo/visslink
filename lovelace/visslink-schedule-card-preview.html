@@ -1,0 +1,96 @@
+<!doctype html>
+<!--
+  Aperçu LOCAL de la carte, avec des données fictives (aucune connexion à
+  Home Assistant ni à l'ESP). Ouvrir ce fichier dans un navigateur, à côté
+  de visslink-schedule-card.js. Les écritures sont simulées : chaque jour
+  est « enregistré (relu) » une seconde après l'autre.
+-->
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VissLink — aperçu de la carte des programmations</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #f4f4f4; margin: 0; padding: 16px; }
+  .wrap { display: flex; flex-wrap: wrap; gap: 24px; align-items: flex-start; }
+  .desktop { width: min(560px, 100%); }
+  .phone { width: 360px; max-width: 100%; }
+  h2 { font-size: 14px; color: #555; margin: 0 0 6px; }
+</style>
+<script src="visslink-schedule-card.js"></script>
+</head>
+<body>
+<div class="wrap">
+  <div class="desktop"><h2>Ordinateur / tablette</h2><div id="a"></div></div>
+  <div class="phone"><h2>Téléphone (360 px)</h2><div id="b"></div></div>
+</div>
+<script>
+  const RAW = { "06:00-22:00": "30B0FFFFFFFFFFFF" };
+  const state = {
+    circuit: "a1",
+    week: {
+      a1: [["06:00-22:00"], ["06:00-22:00"], ["06:00-22:00"], ["06:00-22:00"], ["06:00-22:00"], ["07:00-23:00"], ["07:00-23:00"]],
+      m2: [["05:30-08:00", "16:30-22:30"], ["05:30-08:00", "16:30-22:30"], ["05:30-08:00", "16:30-22:30"], ["05:30-08:00", "16:30-22:30"], ["05:30-08:00", "16:30-22:30"], ["07:00-23:00"], ["07:00-23:00"]],
+      ecs: [["04:00-22:00"], ["04:00-22:00"], ["04:00-22:00"], ["04:00-22:00"], ["04:00-22:00"], ["04:00-22:00"], ["04:00-22:00"]],
+      bouclage: [["06:10-08:30", "21:40-21:50"], ["06:10-08:30", "21:40-21:50"], ["06:10-08:30", "21:40-21:50"], ["06:10-08:30", "21:40-21:50"], ["06:10-08:30", "21:40-21:50"], ["06:10-08:30", "21:40-21:50"], ["06:10-08:30", "14:00-14:30", "21:40-21:50"]],
+    },
+    op: null,
+    status: "Prêt",
+  };
+  const labels = { a1: "Radiateurs", m2: "Plancher", ecs: "ECS", bouclage: "Bouclage ECS" };
+  function read(circuit) {
+    const w = state.week[circuit];
+    return {
+      circuits: Object.keys(labels).map((k) => ({ key: k, label: labels[k] })),
+      circuit, label: labels[circuit], expected: "aperçu", busy: !!(state.op && state.op.busy),
+      status: state.status, writes_enabled: true, link_ok: true,
+      operation: state.op || undefined,
+      days: w.map((ranges, d) => ({ day: d, known: true, locked: circuit === "bouclage" && d === 6,
+        raw: RAW[ranges[0]] || "...", age_s: 2 * 3600 + 300, ranges })),
+    };
+  }
+  function simulate(circuit, days, ranges) {
+    const list = days.split(",").map(Number);
+    let mask = 0; list.forEach((d) => (mask |= 1 << d));
+    state.op = { circuit, busy: true, current_day: list[0], requested: mask, saved: 0, unchanged: 0, not_done: 0, failed_day: -1 };
+    let i = 0;
+    const step = () => {
+      const d = list[i];
+      state.week[circuit][d] = ranges;
+      state.op.saved |= 1 << d;
+      i++;
+      if (i < list.length) {
+        state.op.current_day = list[i];
+        state.status = `${labels[circuit]} : écriture ${["Lu","Ma","Me","Je","Ve","Sa","Di"][list[i]]} (${i + 1}/${list.length})`;
+        setTimeout(step, 1000);
+      } else {
+        state.op.busy = false;
+        state.op.current_day = -1;
+        state.status = `Enregistré et relu : ${labels[circuit]} ` + list.map((x) => ["Lu","Ma","Me","Je","Ve","Sa","Di"][x]).join(", ");
+      }
+      hass.states["sensor.etat"] = { state: state.status };
+      cards.forEach((c) => (c.hass = { ...hass }));
+    };
+    state.status = `${labels[circuit]} : écriture (1/${list.length})`;
+    setTimeout(step, 1000);
+  }
+  const hass = {
+    states: { "sensor.etat": { state: "Prêt" } },
+    callService: async (domain, service, data) => {
+      const name = service.replace("iot_viessmann_visslink_schedule_", "");
+      if (name === "read") return { response: read(data.circuit) };
+      if (name === "set") simulate(data.circuit, data.days, data.ranges ? data.ranges.split(",") : []);
+      if (name === "copy") simulate(data.circuit, data.days, state.week[data.circuit][data.source]);
+      return {};
+    },
+  };
+  const cards = ["a", "b"].map((id) => {
+    const card = document.createElement("visslink-schedule-card");
+    card.setConfig({ device: "iot_viessmann", status_entity: "sensor.etat" });
+    document.getElementById(id).appendChild(card);
+    card.hass = hass;
+    return card;
+  });
+</script>
+</body>
+</html>
