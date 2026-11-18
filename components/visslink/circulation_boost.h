@@ -87,6 +87,25 @@ inline bool boost_duration_valid(uint16_t minutes) {
   return false;
 }
 
+/// v0.8.1 : rang d'une durée dans BOOST_DURATIONS (BOOST_DURATION_COUNT si absente).
+inline size_t boost_duration_index(uint16_t minutes) {
+  for (size_t i = 0; i < BOOST_DURATION_COUNT; i++) {
+    if (BOOST_DURATIONS[i] == minutes)
+      return i;
+  }
+  return BOOST_DURATION_COUNT;
+}
+
+/// v0.8.1 : effet d'un changement de la durée sélectionnée.
+enum class BoostDurationChange : uint8_t {
+  SELECTED,        ///< aucune opération : servira au prochain démarrage
+  UNCHANGED,       ///< opération en cours, même durée
+  SHORTENED,       ///< opération en cours : minuterie raccourcie
+  LONGER_REFUSED,  ///< opération en cours : jamais prolongée
+  TOO_LATE,        ///< restauration commencée ou récupération : sans effet
+  INVALID,
+};
+
 /// Adresse du bloc de bouclage d'un jour (0 = lundi).
 inline uint16_t loop_block_address(uint8_t weekday) { return schedule_day_address(LOOP_SCHEDULE_MONDAY, weekday); }
 
@@ -415,6 +434,39 @@ class BoostSequencer {
     return BoostStart::ACCEPTED;
   }
 
+  /// v0.8.1 : la durée sélectionnée change. Sans opération en cours, elle
+  /// servira au prochain démarrage. Pendant une opération : une durée plus
+  /// courte s'applique à la minuterie (comptée depuis la confirmation de la
+  /// plage, comme au démarrage ; restauration aussitôt si elle est déjà
+  /// écoulée) ; une durée plus longue est refusée (jamais prolongée) ; une
+  /// fois la restauration commencée, plus rien ne change.
+  BoostDurationChange change_duration(uint16_t minutes, uint32_t now) {
+    if (!boost_duration_valid(minutes))
+      return BoostDurationChange::INVALID;
+    if (this->state_ == BoostState::IDLE)
+      return BoostDurationChange::SELECTED;
+    const bool preparing = this->state_ == BoostState::READ_CLOCK || this->state_ == BoostState::READ_BLOCK ||
+                           this->state_ == BoostState::BACKUP_PENDING || this->state_ == BoostState::WRITE_PENDING ||
+                           this->state_ == BoostState::VERIFY_PENDING;
+    const bool timing = this->state_ == BoostState::ACTIVE && !this->expired_ && !this->retrying_ &&
+                        !this->restore_requested_ && !time_reached(now, this->restore_at_ms_);
+    if ((!preparing && !timing) || !boost_duration_valid(this->duration_))
+      return BoostDurationChange::TOO_LATE;
+    if (minutes == this->duration_)
+      return BoostDurationChange::UNCHANGED;
+    if (minutes > this->duration_)
+      return BoostDurationChange::LONGER_REFUSED;
+    this->duration_ = minutes;
+    if (timing) {
+      this->restore_at_ms_ = this->timer_start_ms_ + static_cast<uint32_t>(minutes) * 60000u;
+      this->status_ = this->active_status_();
+    }
+    return BoostDurationChange::SHORTENED;
+  }
+
+  /// v0.8.1 : durée retenue pour l'opération en cours (0 si aucune).
+  uint16_t duration() const { return this->state_ == BoostState::IDLE ? 0 : this->duration_; }
+
   /// Bouton « restaurer » : fin anticipée (plage active) ou récupération.
   bool request_restore(uint32_t now) {
     if (this->state_ == BoostState::ACTIVE) {
@@ -526,13 +578,7 @@ class BoostSequencer {
           this->retrying_ = false;
           this->expired_ = false;
           this->refresh_address_ = this->record_.address;  // plage temporaire confirmée
-          // Heure d'arrêt estimée (horloge Vitotronic), pour l'affichage seulement.
-          const uint32_t stop_s =
-              this->clock_.second_of_day() + (now - this->clock_ms_) / 1000u + this->duration_ * 60u;
-          this->enter_(BoostState::ACTIVE, VL_TEXT("Bouclage en cours : ") + std::to_string(this->duration_) +
-                                               VL_TEXT(" min, arrêt vers ") + hhmm_((stop_s + 30u) / 60u % 1440u) +
-                                               VL_TEXT(" (plage ") + hhmm_(this->plan_.start_min) + VL_TEXT("-") +
-                                               hhmm_(this->plan_.end_min) + VL_TEXT(" programmée)"));
+          this->enter_(BoostState::ACTIVE, this->active_status_());
         } else if (std::memcmp(data, this->record_.original, SCHEDULE_BLOCK_LENGTH) == 0) {
           this->final_message_ = VL_TEXT("Refusé par la régulation : bloc inchangé après écriture");
           this->enter_(BoostState::CLEAR_PENDING, VL_TEXT("Effacement de la sauvegarde"));
@@ -862,16 +908,27 @@ class BoostSequencer {
            hhmm_(this->record_.end_min) + VL_TEXT(" du ") + this->day_name_();
   }
 
-  /// « , après 10 min 02 s » : durée mesurée depuis la confirmation de la
-  /// plage, si elle a été confirmée dans cette session de l'ESP.
+  /// « , après 10 min 02 s (durée demandée : 10 min) » : durée mesurée
+  /// depuis la confirmation de la plage, si elle a été confirmée dans cette
+  /// session de l'ESP, et durée retenue (v0.8.1).
   std::string elapsed_(uint32_t now) const {
     if (!this->active())
       return std::string();
     const uint32_t s = (now - this->timer_start_ms_) / 1000u;
-    char text[40];
-    snprintf(text, sizeof(text), ", après %u min %02u s", static_cast<unsigned>(s / 60u),
-             static_cast<unsigned>(s % 60u));
+    char text[72];
+    snprintf(text, sizeof(text), ", après %u min %02u s (durée demandée : %u min)", static_cast<unsigned>(s / 60u),
+             static_cast<unsigned>(s % 60u), static_cast<unsigned>(this->duration_));
     return text;
+  }
+
+  /// Plage confirmée, minuterie en cours. Heure d'arrêt estimée d'après
+  /// l'horloge de la Vitotronic, pour l'affichage seulement.
+  std::string active_status_() const {
+    const uint32_t stop_s =
+        this->clock_.second_of_day() + (this->timer_start_ms_ - this->clock_ms_) / 1000u + this->duration_ * 60u;
+    return VL_TEXT("Bouclage en cours : ") + std::to_string(this->duration_) + VL_TEXT(" min, arrêt vers ") +
+           hhmm_((stop_s + 30u) / 60u % 1440u) + VL_TEXT(" (plage ") + hhmm_(this->plan_.start_min) + VL_TEXT("-") +
+           hhmm_(this->plan_.end_min) + VL_TEXT(" programmée)");
   }
 
   void on_start_clock_(bool ok, const uint8_t *data, uint8_t length, uint32_t now) {

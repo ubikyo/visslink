@@ -4,6 +4,8 @@
 #include <limits>
 #include <string>
 
+#include "circulation_boost.h"
+#include "schedule_editor.h"
 #include "test_framework.h"
 #include "write_guard.h"
 
@@ -277,5 +279,22 @@ TEST(eco_party_registers_are_never_writable) {
     for (uint8_t v : {0x00, 0x01})
       CHECK_EQ(check_mode_write(a, 1, v), WriteCheck::NOT_WHITELISTED);
     CHECK(mode_write_permitted(a, true, true, true) == ModePermission::NOT_WHITELISTED);
+  }
+}
+
+TEST(v09_eco_party_and_party_setpoints_stay_read_only) {
+  // v0.9 : aucune source ne documente leur écriture sur la Vitotronic 300
+  // KW3 (209C) ; vcontrold ne les déclare que pour la 200 KW2, et rien pour
+  // Éco M2 (0x3302). Lecture seule tant que l'essai sur la chaudière n'est
+  // pas fait (docs/eco-party-v0.9.md).
+  uint8_t out = 0;
+  for (uint16_t a : {0x2302, 0x2303, 0x3302, 0x3303, 0x2308, 0x3308}) {
+    CHECK(find_writable(a) == nullptr);
+    CHECK(!is_write_whitelisted(a));
+    CHECK(!is_mode_write_whitelisted(a));
+    CHECK(!is_schedule_write_whitelisted(a));  // bouclage
+    CHECK(!is_schedule_editor_whitelisted(a));  // éditeur v0.8
+    for (uint8_t v : {0x00, 0x01, 0x04, 0x14, 0x25})
+      CHECK_EQ(check_write_value(a, 1, v, 0, 40, &out), WriteCheck::NOT_WHITELISTED);
   }
 }

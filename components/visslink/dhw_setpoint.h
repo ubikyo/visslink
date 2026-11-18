@@ -95,7 +95,11 @@ class SetpointWriter {
  public:
   /// v0.7 : `address` = consigne ECS (défaut) ou de chauffage.
   explicit SetpointWriter(uint16_t address = DHW_SETPOINT_ADDRESS)
-      : address_(address), heating_(find_heating_setpoint(address)) {}
+      : address_(address), heating_(find_heating_setpoint(address)) {
+    // v0.8.1 : texte publié dès le démarrage, tant qu'aucune modification n'a
+    // été demandée (jamais « inconnu », qui ressemblerait à un défaut).
+    this->status_ = VL_TEXT("Aucune modification effectuée");
+  }
   uint16_t address() const { return this->address_; }
   bool heating() const { return this->heating_ != nullptr; }
 
@@ -361,9 +365,9 @@ class SetpointWriter {
   uint32_t since_ms_{0};
   bool has_written_{false};
   uint32_t written_ms_{0};
-  std::string status_;
+  std::string status_;  ///< v0.8.1 : « Aucune modification effectuée » au départ
   const char *reason_{""};
-  uint32_t version_{0};
+  uint32_t version_{1};  ///< 1 : l'état initial ci-dessus est à publier
   uint32_t panel_changes_{0};
 };
 

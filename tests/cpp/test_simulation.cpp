@@ -4993,3 +4993,35 @@ TEST(sim_v08_editor_disabled_or_refused_without_link) {
   CHECK(!b.block_write_allowed(0x2000, block, WriteArbiter::BOOST_OWNER));
   CHECK(!b.block_write_allowed(0x2301, block, WriteArbiter::EDITOR_OWNER));  // pas un bloc
 }
+
+TEST(sim_v09_party_setpoints_read_only_with_eco_party) {
+  // v0.9 : consignes Party A1/M2 (0x2308, 0x3308) lues en uint8 à 5 min, à
+  // côté des états Éco/Party à 60 s, écritures autorisées par ailleurs. Les
+  // valeurs lues sont publiées ; aucune trame d'écriture n'est émise, ni
+  // vers ces registres ni ailleurs (aucune commande Éco/Party n'existe).
+  Bench b;
+  b.enable_writes = true;
+  V05Config c(b, false);
+  b.boiler.registers[0x2308] = {21};
+  b.boiler.registers[0x3308] = {20};
+  b.boiler.registers[0x3303] = {0x01};  // Party M2 actif (Vitotrol)
+  const size_t a1_party = b.add(0x2308, 5 * MIN, 0, DataType::UINT8, 1);
+  const size_t m2_party = b.add(0x3308, 5 * MIN, 0, DataType::UINT8, 1);
+  b.today = 6;
+  b.run(0, 2 * H);
+  CHECK(b.failures.empty());
+  CHECK(b.boiler.write_log.empty());
+  CHECK(b.boiler.write_log.empty());
+  CHECK_NEAR(b.last_value[a1_party], 21.0, 1e-9);
+  CHECK_NEAR(b.last_value[m2_party], 20.0, 1e-9);
+  CHECK(b.successes[a1_party] >= 23);  // 2 h / 5 min
+  CHECK(b.last_binary[c.eco_party[3]] == BinaryValue::ON);
+  CHECK(b.successes[c.burner] >= 238);  // brûleur à 30 s : charge inchangée
+  // Changement fait à la Vitotrol : relu au cycle suivant, jamais réécrit.
+  b.boiler.registers[0x3308] = {23};
+  b.boiler.registers[0x3303] = {0x00};
+  b.run(2 * H, 6 * MIN);
+  CHECK_NEAR(b.last_value[m2_party], 23.0, 1e-9);
+  CHECK(b.last_binary[c.eco_party[3]] == BinaryValue::OFF);
+  CHECK(b.boiler.write_log.empty());
+}

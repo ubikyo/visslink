@@ -31,6 +31,7 @@ bool VissLinkSensor::publish_data(uint8_t /*block*/, const uint8_t *data) {
                2 * length, decode_raw_le(data, length));
       this->invalid_logged_ = true;
     }
+    this->raw_valid_ = false;
     if (!this->has_state() || !std::isnan(this->get_raw_state()))
       this->publish_state(NAN);
     return true;
@@ -39,11 +40,14 @@ bool VissLinkSensor::publish_data(uint8_t /*block*/, const uint8_t *data) {
     ESP_LOGI(TAG, "0x%04X: value available again", this->address_);
     this->invalid_logged_ = false;
   }
+  this->raw_ = decode_raw_le(data, length);
+  this->raw_valid_ = true;
   this->publish_state(static_cast<float>(decode_value(this->data_type_, data)));
   return true;
 }
 
 void VissLinkSensor::publish_unknown(uint8_t /*block*/) {
+  this->raw_valid_ = false;
   if (this->has_state() && !std::isnan(this->get_raw_state()))
     this->publish_state(NAN);
 }

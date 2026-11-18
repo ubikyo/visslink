@@ -97,7 +97,12 @@ class VissLinkRegister {
   void mark_read_ok(uint32_t now) {
     this->last_read_ok_ms_ = now;
     this->has_read_ok_ = true;
+    this->read_ok_count_++;
   }
+  /// v0.8.1 : nombre de lectures réussies et date de la dernière (suivi des
+  /// cycles du brûleur, sans lecture supplémentaire).
+  uint32_t read_ok_count() const { return this->read_ok_count_; }
+  uint32_t last_read_ok_ms() const { return this->last_read_ok_ms_; }
   /// v0.7.3 : lecture réussie depuis moins de 3 intervalles + 30 s.
   bool read_fresh(uint32_t now) const {
     return reading_fresh(this->has_read_ok_, this->last_read_ok_ms_, this->interval_ms_, now);
@@ -108,6 +113,7 @@ class VissLinkRegister {
   uint32_t interval_ms_{60000};
   uint32_t last_read_ok_ms_{0};
   bool has_read_ok_{false};
+  uint32_t read_ok_count_{0};
 };
 
 #ifdef USE_SENSOR
@@ -123,9 +129,18 @@ class VissLinkSensor : public sensor::Sensor, public VissLinkRegister {
   bool publish_data(uint8_t block, const uint8_t *data) override;
   void publish_unknown(uint8_t block) override;
   void dump_register_config() override;
+  /// v0.8.1 : dernière valeur brute lue, exacte (un compteur uint32 n'est pas
+  /// représentable exactement en float). false si inconnue.
+  bool last_raw(uint32_t *out) const {
+    if (this->raw_valid_)
+      *out = this->raw_;
+    return this->raw_valid_;
+  }
 
  protected:
   DataType data_type_{DataType::INT16};  ///< défaut v0.1 : température
+  uint32_t raw_{0};
+  bool raw_valid_{false};
   InvalidRawValues invalid_raw_;
   bool invalid_logged_{false};  ///< avertissement émis une fois par épisode
 };

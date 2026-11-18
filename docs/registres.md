@@ -370,6 +370,12 @@ la validation, 30 s convient. Pour l'usage courant (présence),
 **v0.5.1 : 60 s retenu dans tous les exemples** (production et essai), pour
 éviter une saturation inutile de la liaison.
 
+### v0.9 : analyse des commandes
+
+Analyse des sources, consignes Party (`0x2308`, `0x3308`, lues en v0.9) et
+procédure d'essai sur la chaudière : `docs/eco-party-v0.9.md`. Conclusion :
+aucune écriture documentée pour la KW3, donc toujours en lecture seule.
+
 ### Perspectives (non implémentées)
 
 Ces états serviront plus tard au pilotage par présence depuis Home

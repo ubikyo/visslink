@@ -41,9 +41,16 @@ class BoostButton : public button::Button {
 
 /// Durée demandée (10, 20, 30 min). Réglage local : rien n'est écrit dans la
 /// régulation en changeant la durée.
+/// v0.8.1 : pendant une opération, le choix passe par le composant (durée
+/// raccourcie, ou refusée et ramenée à la durée en cours) : le select affiche
+/// toujours la durée réellement utilisée.
 class BoostDurationSelect : public select::Select {
+ public:
+  void set_parent(VissLinkBoost *parent) { this->parent_ = parent; }
+
  protected:
-  void control(size_t index) override { this->publish_state(index); }
+  void control(size_t index) override;
+  VissLinkBoost *parent_{nullptr};
 };
 
 /// v0.5.1 : BoostRefreshPort sur le composant visslink.
@@ -69,6 +76,8 @@ class VissLinkBoost : public Component, public visslink::VissLinkBlockClient {
   void set_time(time::RealTimeClock *clock) { this->clock_ = clock; }
   void set_validated_days_mask(uint8_t mask) { this->config_.validated_days_mask = mask; }
   void set_duration_select(BoostDurationSelect *s) { this->duration_ = s; }
+  /// v0.8.1 : durée choisie dans Home Assistant (rang dans BOOST_DURATIONS).
+  void duration_selected(size_t index);
   void set_active_sensor(binary_sensor::BinarySensor *s) { this->active_sensor_ = s; }
   void set_restore_required_sensor(binary_sensor::BinarySensor *s) { this->restore_sensor_ = s; }
   void set_restoring_sensor(binary_sensor::BinarySensor *s) { this->restoring_sensor_ = s; }

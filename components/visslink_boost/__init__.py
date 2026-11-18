@@ -122,6 +122,7 @@ async def to_code(config):
         cg.add(b.set_parent(var, kind))
     sel = await select.new_select(config[CONF_DURATION], options=DURATION_OPTIONS)
     cg.add(var.set_duration_select(sel))
+    cg.add(sel.set_parent(var))
     active = await binary_sensor.new_binary_sensor(config[CONF_ACTIVE])
     cg.add(var.set_active_sensor(active))
     restore = await binary_sensor.new_binary_sensor(config[CONF_RESTORE_REQUIRED])

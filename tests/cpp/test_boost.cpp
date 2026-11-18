@@ -406,7 +406,7 @@ TEST(boost_sequence_nominal) {
   CHECK(q.idle());
   CHECK(r.regs[0x2230] == REAL);
   CHECK(!r.flash_has);
-  CHECK(q.status() == "Programmation restaurée (vérifiée par relecture), après 10 min 00 s");
+  CHECK(q.status() == "Programmation restaurée (vérifiée par relecture), après 10 min 00 s (durée demandée : 10 min)");
   CHECK_EQ(r.writes, 2);
   CHECK_EQ(r.saves, 2);  // une sauvegarde, un effacement : usure minimale
 }
@@ -982,7 +982,7 @@ TEST(boost_ten_minutes_restore_after_ten_minutes_not_at_range_end) {
   CHECK_EQ(write_at(r, 1) - confirmed, 10u * 60 * 1000);
   CHECK(r.regs[0x2230] == MORNING_ONLY);
   CHECK(!r.flash_has);
-  CHECK(q.status() == "Programmation restaurée (vérifiée par relecture), après 10 min 00 s");
+  CHECK(q.status() == "Programmation restaurée (vérifiée par relecture), après 10 min 00 s (durée demandée : 10 min)");
   // Heure de la régulation à la restauration : 21:38:30, avant la fin de plage.
   CHECK(r.regs[VITO_CLOCK_ADDRESS] == (Block{0x20, 0x26, 0x11, 0x15, 0x07, 0x21, 0x38, 0x30}));
 }
@@ -1352,4 +1352,124 @@ TEST(boost_repeated_presses_never_extend_the_timer) {
   // Juste après : 15 min minimum entre deux déclenchements.
   CHECK(q.start(10, ha_at(853), r.now) == BoostStart::RATE_LIMITED);
   CHECK_EQ(r.writes, 2);
+}
+
+// --- v0.8.1 : durée sélectionnée dans Home Assistant --------------------------
+// Défaut constaté : 10 min sélectionnées, « Programmation restaurée après
+// 30 min 07 s ». La minuterie suit la durée figée à l'appui (ici 30 min,
+// sélection précédente encore affichée) ; une sélection de 10 min faite
+// ensuite était ignorée en silence.
+
+TEST(boost_v081_ten_minutes_selected_restores_at_ten_not_thirty) {
+  // Sélection de 10 min avant l'appui : restauration à 10 min, jamais à 30,
+  // quelle que soit la fin de la plage inscrite.
+  Rig r(21u * 3600 + 28 * 60 + 30, 5000);
+  r.regs[0x2230] = MORNING_ONLY;
+  BoostSequencer q;
+  const uint32_t confirmed = confirm(r, q, BOOST_DURATIONS[0], 21 * 60 + 28);
+  CHECK_EQ(q.duration(), 10);
+  CHECK_EQ(q.remaining_s(r.now), 600u);
+  CHECK(r.run_until(q, [&] { return q.idle(); }, 31u * 60 * 1000));
+  CHECK_EQ(r.writes, 2);
+  CHECK_EQ(write_at(r, 1) - confirmed, 10u * 60 * 1000);  // pas 30 min
+  CHECK(q.status() == "Programmation restaurée (vérifiée par relecture), après 10 min 00 s (durée demandée : 10 min)");
+}
+
+TEST(boost_v081_reproduces_thirty_minutes_then_ten_selected_during_boost) {
+  // Reproduction exacte : la sélection affichait encore 30 min à l'appui,
+  // puis 10 min est choisi pendant le bouclage. Avant v0.8.1 : restauration
+  // à 30 min (« après 30 min 0x s »). Désormais : à 10 min.
+  Rig r;
+  r.regs[0x2230] = MORNING_ONLY;
+  BoostSequencer q;
+  const uint32_t confirmed = confirm(r, q, 30, 843);
+  CHECK(q.status().find("Bouclage en cours : 30 min") == 0);
+  r.run(q, 60 * 1000);  // 1 min plus tard, 10 min sélectionnées
+  CHECK(q.change_duration(10, r.now) == BoostDurationChange::SHORTENED);
+  CHECK_EQ(q.duration(), 10);
+  CHECK(q.status().find("Bouclage en cours : 10 min") == 0);
+  CHECK_EQ(q.remaining_s(r.now), 9u * 60);
+  r.run(q, 9u * 60 * 1000 - 1000);
+  CHECK(q.state() == BoostState::ACTIVE);  // une seconde avant : rien
+  CHECK_EQ(r.writes, 1);
+  CHECK(r.run_until(q, [&] { return q.idle(); }, 5000));
+  CHECK_EQ(r.writes, 2);
+  CHECK_EQ(write_at(r, 1) - confirmed, 10u * 60 * 1000);
+  CHECK(r.regs[0x2230] == MORNING_ONLY);
+  CHECK(q.status() == "Programmation restaurée (vérifiée par relecture), après 10 min 00 s (durée demandée : 10 min)");
+}
+
+TEST(boost_v081_shorter_selection_after_elapsed_restores_now) {
+  // 30 min en cours depuis 12 min, 10 min sélectionnées : déjà écoulée,
+  // restauration immédiate.
+  Rig r;
+  r.regs[0x2230] = MORNING_ONLY;
+  BoostSequencer q;
+  const uint32_t confirmed = confirm(r, q, 30, 843);
+  r.run(q, 12u * 60 * 1000);
+  CHECK(q.change_duration(10, r.now) == BoostDurationChange::SHORTENED);
+  const uint32_t selected = r.now;
+  CHECK(r.run_until(q, [&] { return q.idle(); }, 5000));
+  CHECK_EQ(write_at(r, 1), selected);
+  CHECK(write_at(r, 1) - confirmed >= 12u * 60 * 1000);
+  CHECK(q.status().find("(durée demandée : 10 min)") != std::string::npos);
+}
+
+TEST(boost_v081_selection_during_preparation_is_used) {
+  // Sélection changée entre l'appui et la confirmation : la durée la plus
+  // courte est retenue pour la minuterie.
+  Rig r;
+  r.regs[0x2230] = MORNING_ONLY;
+  BoostSequencer q;
+  q.configure(sunday_validated());
+  q.boot(nullptr);
+  CHECK(q.start(30, ha_at(843), r.now) == BoostStart::ACCEPTED);
+  CHECK(q.change_duration(10, r.now) == BoostDurationChange::SHORTENED);
+  CHECK(r.run_until(q, [&] { return q.state() == BoostState::ACTIVE; }, 60000));
+  const uint32_t confirmed = r.now;
+  CHECK_EQ(q.remaining_s(r.now), 600u);
+  CHECK(r.run_until(q, [&] { return q.idle(); }, 31u * 60 * 1000));
+  CHECK_EQ(write_at(r, 1) - confirmed, 10u * 60 * 1000);
+}
+
+TEST(boost_v081_longer_selection_never_extends) {
+  Rig r;
+  r.regs[0x2230] = MORNING_ONLY;
+  BoostSequencer q;
+  const uint32_t confirmed = confirm(r, q, 10, 843);
+  r.run(q, 2u * 60 * 1000);
+  CHECK(q.change_duration(30, r.now) == BoostDurationChange::LONGER_REFUSED);
+  CHECK(q.change_duration(20, r.now) == BoostDurationChange::LONGER_REFUSED);
+  CHECK(q.change_duration(10, r.now) == BoostDurationChange::UNCHANGED);
+  CHECK_EQ(q.duration(), 10);
+  CHECK(r.run_until(q, [&] { return q.idle(); }, 31u * 60 * 1000));
+  CHECK_EQ(write_at(r, 1) - confirmed, 10u * 60 * 1000);
+}
+
+TEST(boost_v081_selection_when_idle_or_restoring) {
+  Rig r;
+  r.regs[0x2230] = MORNING_ONLY;
+  BoostSequencer q;
+  q.configure(sunday_validated());
+  q.boot(nullptr);
+  CHECK(q.change_duration(30, r.now) == BoostDurationChange::SELECTED);  // prochain démarrage
+  CHECK_EQ(q.duration(), 0);
+  CHECK(q.change_duration(15, r.now) == BoostDurationChange::INVALID);
+  // Restauration demandée : plus aucun changement.
+  BoostSequencer q2;
+  confirm(r, q2, 20, 843);
+  CHECK(q2.request_restore(r.now));
+  CHECK(q2.change_duration(10, r.now) == BoostDurationChange::TOO_LATE);
+  CHECK_EQ(q2.duration(), 20);
+  CHECK(r.run_until(q2, [&] { return q2.idle(); }, 5000));
+  CHECK_EQ(q2.duration(), 0);
+}
+
+TEST(boost_v081_duration_index_matches_select_options) {
+  // Options du select : « 10 min », « 20 min », « 30 min » (même ordre).
+  CHECK_EQ(boost_duration_index(10), 0u);
+  CHECK_EQ(boost_duration_index(20), 1u);
+  CHECK_EQ(boost_duration_index(30), 2u);
+  CHECK_EQ(boost_duration_index(15), BOOST_DURATION_COUNT);
+  CHECK_EQ(BOOST_DURATIONS[BOOST_DEFAULT_DURATION_INDEX], 10);
 }

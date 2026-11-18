@@ -126,10 +126,14 @@ void VissLinkBoost::press(BoostButton::Kind kind) {
                                 : 0;
   switch (this->sequencer_.start(duration, ha, now)) {
     case visslink::BoostStart::ACCEPTED:
-      ESP_LOGI(TAG, "Circulation boost requested (%u min)", duration);
+      ESP_LOGI(TAG, "Circulation boost requested (%u min, selected option index %u)", duration,
+               index.has_value() ? static_cast<unsigned>(index.value()) : 0u);
       break;
     case visslink::BoostStart::BUSY:
-      this->refuse_(VL_TEXT("opération déjà en cours (minuterie non prolongée)"), now);
+      // v0.8.1 : la durée de l'opération en cours, pas celle de cet appui.
+      this->refuse_(VL_TEXT("opération déjà en cours (") + std::to_string(this->sequencer_.duration()) +
+                        VL_TEXT(" min, minuterie non prolongée)"),
+                    now);
       break;
     case visslink::BoostStart::RECOVERY_PENDING:
       this->refuse_(VL_TEXT("récupération nécessaire d'abord"), now);
@@ -142,6 +146,49 @@ void VissLinkBoost::press(BoostButton::Kind kind) {
       break;
   }
   this->dispatch_(now);
+}
+
+void BoostDurationSelect::control(size_t index) {
+  if (this->parent_ != nullptr) {
+    this->parent_->duration_selected(index);
+  } else {
+    this->publish_state(index);
+  }
+}
+
+void VissLinkBoost::duration_selected(size_t index) {
+  const uint32_t now = millis();
+  if (index >= visslink::BOOST_DURATION_COUNT)
+    return;
+  const uint16_t minutes = visslink::BOOST_DURATIONS[index];
+  const uint16_t current = this->sequencer_.duration();
+  switch (this->sequencer_.change_duration(minutes, now)) {
+    case visslink::BoostDurationChange::SELECTED:
+      ESP_LOGD(TAG, "Duration selected: %u min (used at the next start)", minutes);
+      this->duration_->publish_state(index);
+      break;
+    case visslink::BoostDurationChange::UNCHANGED:
+      this->duration_->publish_state(index);
+      break;
+    case visslink::BoostDurationChange::SHORTENED:
+      ESP_LOGI(TAG, "Duration shortened during the operation: %u -> %u min (from the range confirmation)", current,
+               minutes);
+      this->duration_->publish_state(index);
+      break;
+    case visslink::BoostDurationChange::LONGER_REFUSED:
+      this->duration_->publish_state(visslink::boost_duration_index(current));
+      this->refuse_(VL_TEXT("durée en cours ") + std::to_string(current) + VL_TEXT(" min, jamais prolongée"), now);
+      break;
+    case visslink::BoostDurationChange::TOO_LATE:
+    case visslink::BoostDurationChange::INVALID: {
+      const size_t used = visslink::boost_duration_index(current);
+      if (used < visslink::BOOST_DURATION_COUNT)
+        this->duration_->publish_state(used);
+      this->refuse_(VL_TEXT("restauration déjà commencée, durée inchangée"), now);
+      break;
+    }
+  }
+  this->publish_(now);
 }
 
 bool VissLinkBoost::persist_(const visslink::BoostRecord &record) {

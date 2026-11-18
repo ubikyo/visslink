@@ -1885,3 +1885,230 @@ def test_production_example_unchanged_by_the_editor(repo_root):
     text = _active_lines((repo_root / EXAMPLE).read_text(encoding="utf-8"))
     assert "visslink_schedule_editor" not in text
     assert "actions:" not in text
+
+
+# --- v0.8.1 : diagnostics et cycles du brûleur -----------------------------------
+
+DIAGNOSTICS = "examples/iot-viessmann-diagnostics-v0.8.1.yaml"
+
+
+def test_diagnostics_example_valid_without_extra_burner_reads(repo_root, tmp_path):
+    text = (repo_root / DIAGNOSTICS).read_text(encoding="utf-8")
+    assert "A38F" not in text.upper()  # puissance brute : toujours FF FF
+    active = _active_lines(text)
+    for flag in WRITE_FLAGS:
+        assert f"{flag}:" not in active, flag
+    assert "validated_days" not in active
+    result = _run_config(repo_root, tmp_path, example=DIAGNOSTICS)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    # Registres réutilisés : chacun lu une seule fois, par son entité.
+    # (esphome config affiche 0x842 pour 0x0842.)
+    for address in ("0x842", "0x88A", "0x8A7", "0x802", "0x5502"):
+        assert out.count(f"address: {address}\n") == 1, address
+    for name in (
+        "Brûleur - Démarrages sur 24 h",
+        "Brûleur - Démarrages par heure",
+        "Brûleur - Durée moyenne de fonctionnement",
+        "Brûleur - Durée du dernier cycle (estimation)",
+        "Brûleur - Durée du dernier arrêt (estimation)",
+        "Brûleur - Température chaudière au démarrage (estimation)",
+        "Brûleur - Température chaudière à l'arrêt (estimation)",
+        "Brûleur - Précision des cycles",
+        "Consigne chaudière calculée",
+        "VissLink - Uptime",
+        "VissLink - Signal Wi-Fi",
+        "VissLink - Adresse IP",
+        "Programmations - État de l'édition",
+        "Bouclage ECS — État de l'opération",
+    ):
+        assert f"name: {name}\n" in out, name
+
+
+def test_diagnostics_example_only_adds_diagnostics(repo_root):
+    """Base : l'exemple v0.8 ; seuls les diagnostics v0.8.1 sont ajoutés."""
+    base = _active_lines((repo_root / PROGRAMMATIONS).read_text(encoding="utf-8"))
+    new = _active_lines((repo_root / DIAGNOSTICS).read_text(encoding="utf-8"))
+    removed = [line for line in base.splitlines() if line not in new.splitlines()]
+    assert removed == [
+        "    components: [visslink, visslink_boost, visslink_schedule_editor]"
+    ], removed
+    added = [line for line in new.splitlines() if line not in base.splitlines()]
+    allowed = re.compile(
+        r"^\s*(components: \[visslink, visslink_boost, visslink_schedule_editor, "
+        r"visslink_burner\]|"
+        r"id: (temperature_chaudiere|demarrages_bruleur|fonctionnement_bruleur)|"
+        r"- platform: (visslink|wifi_signal|uptime|wifi_info)|"
+        r'name: "(Consigne chaudière calculée|VissLink - [^"]+|Brûleur - [^"]+)"|'
+        r"address: 0x5502|update_interval: (2min|60s)|entity_category: diagnostic|"
+        r"(ip_address|ssid):|visslink_burner:|"
+        r"(burner|starts|runtime|boiler_temperature)_id: [a-z_]+|"
+        r"(starts_24h|starts_per_hour|average_runtime|last_cycle|last_stop|"
+        r"start_temperature|stop_temperature|status):)$"
+    )
+    assert all(allowed.match(line) for line in added), [
+        line for line in added if not allowed.match(line)
+    ]
+
+
+@pytest.mark.parametrize(
+    "transform, message",
+    [
+        (
+            lambda t: t.replace(
+                "  burner_id: bruleur_actif\n", "  burner_id: m2_pump\n"
+            ),
+            "burner_id must be the visslink binary_sensor of the burner (0x0842)",
+        ),
+        (
+            lambda t: t.replace(
+                "  starts_id: demarrages_bruleur\n",
+                "  starts_id: temperature_chaudiere\n",
+            ),
+            "starts_id must be the visslink sensor of the burner starts counter",
+        ),
+        (
+            lambda t: t.replace(
+                "    address: 0x08A7\n    data_type: uint32",
+                "    address: 0x08A7\n    data_type: uint16",
+            ),
+            "runtime_id must be the visslink sensor of the burner runtime counter",
+        ),
+        (
+            lambda t: t.replace("  runtime_id: fonctionnement_bruleur\n", ""),
+            "'average_runtime' needs 'runtime_id'",
+        ),
+        (
+            lambda t: t.replace("  boiler_temperature_id: temperature_chaudiere\n", ""),
+            "'start_temperature' needs 'boiler_temperature_id'",
+        ),
+    ],
+)
+def test_burner_cycles_rejects_wrong_sources(repo_root, tmp_path, transform, message):
+    result = _run_config(repo_root, tmp_path, transform, example=DIAGNOSTICS)
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, out
+    assert message in out, out
+
+
+def test_burner_cycles_reads_nothing(repo_root):
+    """Le composant n'émet aucune lecture ni écriture Optolink."""
+    src = "".join(
+        (repo_root / "components/visslink_burner" / name).read_text(encoding="utf-8")
+        for name in ("visslink_burner.h", "visslink_burner.cpp")
+    )
+    src += (repo_root / "components/visslink/burner_cycles.h").read_text(
+        encoding="utf-8"
+    )
+    for forbidden in (
+        "request_direct_read",
+        "submit_block_write",
+        "request_read",
+        "request_write",
+        "expedite",
+        "submit(",
+    ):
+        assert forbidden not in src, forbidden
+
+
+def test_setpoint_status_never_starts_unknown(repo_root):
+    header = (repo_root / "components/visslink/dhw_setpoint.h").read_text(
+        encoding="utf-8"
+    )
+    assert 'this->status_ = VL_TEXT("Aucune modification effectuée");' in header
+    assert "uint32_t version_{1};" in header
+
+
+def test_boost_duration_select_goes_through_the_component(repo_root):
+    """v0.8.1 : le choix de durée passe par le composant (raccourcie, ou
+    refusée et ramenée à la durée en cours pendant une opération)."""
+    init = (repo_root / "components/visslink_boost/__init__.py").read_text(
+        encoding="utf-8"
+    )
+    assert "cg.add(sel.set_parent(var))" in init
+    cpp = (repo_root / "components/visslink_boost/visslink_boost.cpp").read_text(
+        encoding="utf-8"
+    )
+    assert "void BoostDurationSelect::control(size_t index) {" in cpp
+    assert "this->parent_->duration_selected(index);" in cpp
+    assert "this->sequencer_.change_duration(minutes, now)" in cpp
+
+
+# --- v0.9 : Éco et Party (lecture et validation, aucune commande) ----------------
+
+ECO_PARTY_V09 = "examples/iot-viessmann-eco-party-v0.9.yaml"
+PARTY_SETPOINTS = (0x2308, 0x3308)
+
+
+def test_eco_party_v09_example_reads_without_commands(repo_root, tmp_path):
+    result = _run_config(repo_root, tmp_path, example=ECO_PARTY_V09)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    for address in ("0x2302", "0x2303", "0x3302", "0x3303", "0x2308", "0x3308"):
+        assert out.count(f"address: {address}\n") == 1, address
+    assert "name: Radiateurs - Consigne Party (lecture)" in out
+    assert "name: Plancher chauffant - Consigne Party (lecture)" in out
+    # Climate M2 inchangé : HEAT/OFF, sans preset Éco ni Party.
+    assert "preset" not in out.lower()
+
+
+def test_eco_party_v09_example_only_adds_party_setpoint_reads(repo_root):
+    base = _active_lines((repo_root / DIAGNOSTICS).read_text(encoding="utf-8"))
+    new = _active_lines((repo_root / ECO_PARTY_V09).read_text(encoding="utf-8"))
+    assert [line for line in base.splitlines() if line not in new.splitlines()] == []
+    added = [line for line in new.splitlines() if line not in base.splitlines()]
+    allowed = re.compile(
+        r"^\s*(- platform: visslink|visslink_id: viessmann|"
+        r'name: "(Radiateurs|Plancher chauffant) - Consigne Party \(lecture\)"|'
+        r"address: 0x(2308|3308)|data_type: uint8|update_interval: 5min|"
+        r'unit_of_measurement: "°C"|device_class: temperature|'
+        r"accuracy_decimals: 0)$"
+    )
+    assert all(allowed.match(line) for line in added), [
+        line for line in added if not allowed.match(line)
+    ]
+
+
+@pytest.mark.parametrize("address", PARTY_SETPOINTS)
+def test_party_setpoints_never_writable(repo_root, tmp_path, address):
+    """Consigne Party : ni number (liste blanche des consignes), ni select."""
+    for old, expected in (
+        ("address: 0x2306", "not in the VissLink write whitelist"),
+        ("address: 0x2301", "is not an operating mode register"),
+    ):
+        result = _run_config(
+            repo_root,
+            tmp_path,
+            lambda s, old=old: s.replace(old, f"address: 0x{address:04X}"),
+        )
+        out = result.stdout + result.stderr
+        assert result.returncode != 0, hex(address)
+        assert expected in out, out
+
+
+def test_climate_has_no_eco_party_preset(repo_root):
+    """Presets Éco/Party seulement après confirmation des commandes Optolink
+    sur la KW3 (docs/eco-party-v0.9.md) : aucun aujourd'hui."""
+    for path in (
+        "components/visslink/climate.py",
+        "components/visslink/visslink.cpp",
+        "components/visslink/visslink.h",
+        "components/visslink/circuit_climate.h",
+    ):
+        text = (repo_root / path).read_text(encoding="utf-8")
+        assert "preset" not in text.lower(), path
+
+
+def test_eco_party_registers_absent_from_cpp_whitelists(repo_root):
+    """Aucune liste blanche C++ (consignes, programmes, blocs) ne contient
+    Éco, Party ou les consignes Party."""
+    code = ""
+    for path in (
+        "components/visslink/write_guard.h",
+        "components/visslink/circulation_boost.h",
+        "components/visslink/schedule_editor.h",
+    ):
+        text = (repo_root / path).read_text(encoding="utf-8")
+        code += re.sub(r"//[^\n]*", "", text).upper()
+    for address in ("0x2302", "0x2303", "0x3302", "0x3303", "0x2308", "0x3308"):
+        assert address.upper() not in code, address

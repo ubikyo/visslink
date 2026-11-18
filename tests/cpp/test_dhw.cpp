@@ -255,7 +255,8 @@ TEST(dhw_writer_state_is_ram_only) {
   CHECK(!after.busy());
   CHECK(!after.expects_write(55));
   CHECK(!after.poll(10 * 60 * 1000));
-  CHECK(after.status().empty());
+  CHECK(after.status() == "Aucune modification effectuée");
+  CHECK(after.version() != 0u);  // publié au démarrage, jamais « inconnu »
 }
 
 TEST(dhw_arbiter_defers_dhw_behind_boost) {

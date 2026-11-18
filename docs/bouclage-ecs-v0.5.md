@@ -419,6 +419,43 @@ inscrite (récupération) » : sans relecture, l'état n'est pas connu.
 - **Affichage d'un refus :** il reste 30 s dans « État de l'opération », ou
   jusqu'au changement d'état suivant. Ensuite, l'état réel réapparaît.
 
+### Durée changée pendant une opération (v0.8.1)
+
+Défaut constaté : 10 min sélectionnées, puis « Programmation restaurée
+(vérifiée par relecture), après 30 min 07 s ». La minuterie utilise la durée
+lue dans le sélecteur **au moment de l'appui** sur « Démarrer ». 30 min 07 s
+correspond donc à une durée de 30 min au moment de l'appui : 30 min plus la
+relecture de vérification. Les nouvelles tentatives (2 min, 30 s) ne peuvent
+pas donner ce total. Jusqu'en v0.8, une durée choisie **après** l'appui était
+affichée par le sélecteur mais ignorée en silence. Un appui refusé parce
+qu'un bouclage tournait déjà n'affichait pas non plus la durée en cours.
+
+Depuis la v0.8.1 :
+
+- **Plus courte pendant l'opération** (préparation ou plage en cours) : elle
+  s'applique. La minuterie compte toujours depuis la confirmation de la plage.
+  Si la nouvelle durée est déjà écoulée, la restauration démarre aussitôt.
+- **Plus longue :** refusée (« durée en cours N min, jamais prolongée »). Le
+  sélecteur revient à la durée en cours.
+- **Restauration commencée** (ou récupération) : plus aucun changement. Le
+  sélecteur revient à la durée utilisée.
+- **Messages :** l'appui refusé indique la durée de l'opération en cours
+  (« opération déjà en cours (30 min, minuterie non prolongée) »). Le message
+  final indique la durée retenue : « … après 10 min 00 s (durée demandée :
+  10 min) ». Le journal indique `Circulation boost requested (N min, selected
+  option index i)`.
+- **Inchangé :** la plage inscrite (arrondie à la dizaine), la sauvegarde, la
+  relecture, la restauration vérifiée et le délai de 15 min entre deux
+  déclenchements.
+
+Tests : `boost_v081_ten_minutes_selected_restores_at_ten_not_thirty`,
+`boost_v081_reproduces_thirty_minutes_then_ten_selected_during_boost`,
+`boost_v081_shorter_selection_after_elapsed_restores_now`,
+`boost_v081_selection_during_preparation_is_used`,
+`boost_v081_longer_selection_never_extends`,
+`boost_v081_selection_when_idle_or_restoring`. Ce sont des tests en
+simulation, pas une validation sur la chaudière.
+
 ## 6. Coupures d'alimentation
 
 Test `boost_power_cut_after_every_action` : coupure après **chacune** des
