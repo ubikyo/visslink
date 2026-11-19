@@ -752,14 +752,13 @@ void VissLinkComponent::drop_expired_writes_(uint32_t now) {
 
 bool VissLinkComponent::start_write_(uint32_t now) {
   WriteArbiter::Request request;
-  if (!this->enable_writes_ || !this->writes_.next(now, this->link_ok_, &request, this->deferred_setpoints_()))
+  if (!this->writes_.next(now, this->link_ok_, &request, this->deferred_setpoints_()))
     return false;
   // Dernier contrôle avant émission : la demande a été validée au dépôt,
   // mais rien ne part sans un nouveau contrôle complet (adresse de la liste
   // blanche, longueur, bornes configurées et documentées).
   if (BlockClients::is_block_owner(request.owner)) {
-    // Bloc horaire (v0.5, v0.8) : autorisations, liste blanche du
-    // propriétaire, validité du bloc, verrou de l'autre client et attente
+    // Bloc horaire (v0.5, v0.8) : liste blanche du propriétaire, validité du bloc, verrou de l'autre client et attente
     // effective du client, revérifiés juste avant l'émission.
     if (request.length != KwProtocol::BLOCK_WRITE_LENGTH ||
         !this->block_write_allowed_(request.owner, request.address, request.data) ||
@@ -778,24 +777,21 @@ bool VissLinkComponent::start_write_(uint32_t now) {
     this->timing_.started = now;
     return true;
   }
-  // Programme : les autorisations de configuration sont revérifiées ici
-  // (M2 : enable_m2_mode_write).
+  // Programme : liste blanche des programmes et valeur 00/03/05.
   VissLinkRegister *reg = this->registers_[request.owner];
   const bool mode_ok = !is_mode_register(request.address) ||
-                       mode_write_permitted(request.address, this->enable_writes_, this->enable_mode_writes_,
-                                            this->enable_m2_mode_write_) == ModePermission::OK;
-  // v0.6/v0.7 : consigne : autorisation dédiée, et transaction en attente
-  // de exactement cette valeur. Toute adresse de consigne l'exige.
+                       check_mode_write(request.address, 1, request.value) == WriteCheck::OK;
+  // Consigne : transaction en attente de exactement cette valeur. Toute
+  // adresse de consigne l'exige.
   SetpointChannel *ch = this->setpoint_channel_(request.owner);
   const bool setpoint = find_writable(request.address) != nullptr;
   const bool setpoint_ok = !setpoint || (ch != nullptr && ch->writer.address() == request.address &&
-                                         this->setpoint_permitted_(request.address) &&
                                          ch->writer.expects_write(request.value));
-  // v0.9.1 : commande Éco/Party : enable_writes et allow_write de l'entité,
-  // transaction en attente de exactement cette valeur.
+  // v0.9.1 : commande Éco/Party : transaction en attente de exactement
+  // cette valeur, 00 ou 01.
   FlagChannel *fc = this->flag_channel_(request.owner);
   const bool flag = is_eco_party_flag_whitelisted(request.address);
-  const bool flag_ok = !flag || (fc != nullptr && fc->writer.address() == request.address && this->flag_permitted_(*fc) &&
+  const bool flag_ok = !flag || (fc != nullptr && fc->writer.address() == request.address &&
                                  fc->writer.expects_write(request.value) &&
                                  check_flag_write(request.address, 1, request.value) == WriteCheck::OK);
   if (reg->get_address() != request.address || !is_write_whitelisted(request.address) || !mode_ok || !setpoint_ok ||
@@ -828,7 +824,7 @@ void VissLinkComponent::preempt_unsent_read_(uint32_t now) {
   const bool direct_ready = this->direct_.pending && !this->direct_.in_flight && time_reached(now, this->direct_.due_ms);
   if (this->write_in_flight_ || this->direct_.in_flight || current == RegisterScheduler::NONE ||
       this->scheduler_.entry(current).urgent == RegisterScheduler::URGENT_VERIFY || !this->kw_.is_waiting_sync() ||
-      !((this->enable_writes_ && this->writes_.ready(now, this->link_ok_, this->deferred_setpoints_())) || direct_ready))
+      !(this->writes_.ready(now, this->link_ok_, this->deferred_setpoints_()) || direct_ready))
     return;
   if (this->kw_.cancel_before_send()) {
     this->scheduler_.release();
@@ -928,15 +924,14 @@ bool VissLinkComponent::block_write_allowed_(int owner, uint16_t address, const 
                                                          : false;
   const VissLinkBlockClient *client = this->block_clients_.get(owner);
   ScheduleSlots slots;
-  return this->schedule_writes_enabled() && whitelisted &&
+  return whitelisted &&
          decode_schedule_slots(data, SCHEDULE_BLOCK_LENGTH, &slots) == ScheduleError::NONE && client != nullptr &&
          !this->block_clients_.locked_by_other(owner, address) && client->expects_block_write(address, data);
 }
 
 bool VissLinkComponent::submit_block_write(uint16_t address, const uint8_t *data, uint32_t now, int owner) {
   if (!this->block_write_allowed_(owner, address, data)) {
-    ESP_LOGW(TAG, "0x%04X: schedule block write refused (%s)", address,
-             this->schedule_writes_enabled() ? "not allowed" : "enable_writes / enable_schedule_writes: false");
+    ESP_LOGW(TAG, "0x%04X: schedule block write refused (not allowed)", address);
     return false;
   }
   return this->writes_.submit_block(owner, address, data, now) == WriteArbiter::Submit::QUEUED;
@@ -1134,10 +1129,8 @@ void VissLinkComponent::submit_mode_write(VissLinkModeSelect *select, size_t ind
     if (reg != nullptr && this->writes_.has_request(this->index_of_(reg)))
       mode_busy = true;
   }
-  const ModePermission permission =
-      mode_write_permitted(address, this->enable_writes_, this->enable_mode_writes_, this->enable_m2_mode_write_);
-  if (permission != ModePermission::OK) {
-    refused = mode_permission_to_string(permission);
+  if (!is_mode_write_whitelisted(address)) {
+    refused = write_check_to_string(WriteCheck::NOT_WHITELISTED);
   } else if (index >= OPERATING_MODE_COUNT) {
     refused = write_check_to_string(WriteCheck::VALUE_NOT_ALLOWED);
   } else if (check_mode_write(address, select->get_length(), value) != WriteCheck::OK || owner == WriteArbiter::NONE) {
@@ -1182,23 +1175,10 @@ void VissLinkComponent::add_setpoint_number(VissLinkNumber *number) {
   this->setpoints_.emplace_back(number, number->get_address());
 }
 
-#ifdef USE_TEXT_SENSOR
-void VissLinkComponent::set_setpoint_status_sensor(VissLinkNumber *number, text_sensor::TextSensor *sensor) {
-  for (auto &ch : this->setpoints_) {
-    if (ch.reg == number)
-      ch.status = sensor;
-  }
-}
-#endif
-
 void VissLinkComponent::submit_setpoint_(SetpointChannel &ch, VissLinkNumber *number, float value) {
   const uint32_t now = millis();
   const uint16_t address = ch.writer.address();
   DhwContext ctx;
-  ctx.enable_writes = this->enable_writes_;
-  ctx.enable_dhw_setpoint_write = this->enable_dhw_setpoint_write_;
-  ctx.enable_heating_setpoint_writes = this->enable_heating_setpoint_writes_;
-  ctx.allow_party_write = ch.allow_write;
   ctx.link_ok = this->link_ok_;
   ctx.has_value = number->has_read_value() && ch.owner != WriteArbiter::NONE;
   ctx.config_min = number->traits.get_min_value();
@@ -1220,14 +1200,11 @@ void VissLinkComponent::submit_setpoint_(SetpointChannel &ch, VissLinkNumber *nu
       writers.push_back(&other.writer);
     setpoint_gate(writers, &ch.writer, now, &ctx);
   }
-  const char *flag = ch.writer.party()     ? "allow_write"
-                     : ch.writer.heating() ? "enable_heating_setpoint_writes"
-                                           : "enable_dhw_setpoint_write";
   ESP_LOGI(TAG, "0x%04X: setpoint change requested: %.1f (current %.0f)", address, value,
            number->has_read_value() ? number->state : NAN);
   switch (ch.writer.request(value, ctx, now)) {
     case DhwAction::PRE_READ:
-      ESP_LOGI(TAG, "0x%04X: permissions ok (enable_writes, %s), reading the current value first", address, flag);
+      ESP_LOGI(TAG, "0x%04X: reading the current value first", address);
       // Relecture prioritaire sur les lectures ordinaires, mais jamais
       // intercalée entre une écriture et sa vérification (URGENT_REFRESH) ;
       // si le registre est déjà en cours de lecture, c'est elle qui sert.
@@ -1279,14 +1256,8 @@ void VissLinkComponent::setpoint_publish_(SetpointChannel &ch) {
   if (ch.writer.version() == ch.published)
     return;
   ch.published = ch.writer.version();
-  ESP_LOGD(TAG, "0x%04X: setpoint status: %s", ch.writer.address(), ch.writer.status().c_str());
-#ifdef USE_TEXT_SENSOR
-  if (ch.status != nullptr) {
-    std::string text = ch.writer.status();
-    truncate_state(text);
-    ch.status->publish_state(text);
-  }
-#endif
+  // État de la commande : journal seulement (aucune entité Home Assistant).
+  ESP_LOGI(TAG, "0x%04X: setpoint: %s", ch.writer.address(), ch.writer.status().c_str());
 }
 
 VissLinkComponent::SetpointChannel *VissLinkComponent::setpoint_channel_(int index) {
@@ -1297,21 +1268,6 @@ VissLinkComponent::SetpointChannel *VissLinkComponent::setpoint_channel_(int ind
       return &ch;
   }
   return nullptr;
-}
-
-bool VissLinkComponent::setpoint_permitted_(uint16_t address) const {
-  if (is_party_setpoint_write_whitelisted(address)) {
-    // v0.9.1 : enable_writes ET allow_write de l'entité.
-    for (const auto &ch : this->setpoints_) {
-      if (ch.writer.address() == address)
-        return eco_party_write_permitted(address, this->enable_writes_, ch.allow_write) == EcoPartyPermission::OK;
-    }
-    return false;
-  }
-  if (is_dhw_setpoint_write_whitelisted(address))
-    return dhw_write_permitted(address, this->enable_writes_, this->enable_dhw_setpoint_write_) == DhwPermission::OK;
-  return heating_write_permitted(address, this->enable_writes_, this->enable_heating_setpoint_writes_) ==
-         HeatingPermission::OK;
 }
 
 bool VissLinkComponent::setpoint_pending(const VissLinkRegister *reg, uint8_t *target) const {
@@ -1339,33 +1295,15 @@ OwnerSet VissLinkComponent::deferred_setpoints_() const {
   return set;
 }
 
-#ifdef USE_NUMBER
-void VissLinkComponent::set_setpoint_allow_write(VissLinkNumber *number, bool allow) {
-  for (auto &ch : this->setpoints_) {
-    if (ch.reg == number)
-      ch.allow_write = allow;
-  }
-}
-#endif
-
 // ---------------------------------------------------------------------------
 // Commandes Éco / Party A1 et M2 (v0.9.1, expérimental)
 
 #ifdef USE_SWITCH
-void VissLinkComponent::add_flag_switch(VissLinkFlagSwitch *sw, bool allow_write) {
+void VissLinkComponent::add_flag_switch(VissLinkFlagSwitch *sw) {
   if (!is_eco_party_flag_whitelisted(sw->get_address()))
     return;
-  this->flags_.emplace_back(sw, sw->get_address(), allow_write);
+  this->flags_.emplace_back(sw, sw->get_address());
 }
-
-#ifdef USE_TEXT_SENSOR
-void VissLinkComponent::set_flag_status_sensor(VissLinkFlagSwitch *sw, text_sensor::TextSensor *sensor) {
-  for (auto &ch : this->flags_) {
-    if (ch.reg == sw)
-      ch.status = sensor;
-  }
-}
-#endif
 
 void VissLinkComponent::submit_flag_write(VissLinkFlagSwitch *sw, bool on) {
   const uint32_t now = millis();
@@ -1377,8 +1315,6 @@ void VissLinkComponent::submit_flag_write(VissLinkFlagSwitch *sw, bool on) {
     return;
   }
   FlagContext ctx;
-  ctx.enable_writes = this->enable_writes_;
-  ctx.allow_write = ch->allow_write;
   ctx.link_ok = this->link_ok_;
   ctx.has_value = sw->flag_raw() >= 0;
   {
@@ -1391,7 +1327,7 @@ void VissLinkComponent::submit_flag_write(VissLinkFlagSwitch *sw, bool on) {
   const uint16_t address = ch->writer.address();
   ESP_LOGI(TAG, "0x%04X: Eco/Party command requested: %s (current %d)", address, on ? "ON" : "OFF", sw->flag_raw());
   if (ch->writer.request(on, ctx, now) == DhwAction::PRE_READ) {
-    ESP_LOGI(TAG, "0x%04X: permissions ok (enable_writes, allow_write), reading the current state first", address);
+    ESP_LOGI(TAG, "0x%04X: reading the current state first", address);
     if (!this->scheduler_.expedite_block(ch->owner, 0, now))
       ESP_LOGD(TAG, "0x%04X: read already in progress, used as the current state", address);
   } else {
@@ -1447,14 +1383,8 @@ void VissLinkComponent::flag_publish_(FlagChannel &ch) {
   if (ch.writer.version() == ch.published)
     return;
   ch.published = ch.writer.version();
-  ESP_LOGD(TAG, "0x%04X: Eco/Party status: %s", ch.writer.address(), ch.writer.status().c_str());
-#ifdef USE_TEXT_SENSOR
-  if (ch.status != nullptr) {
-    std::string text = ch.writer.status();
-    truncate_state(text);
-    ch.status->publish_state(text);
-  }
-#endif
+  // État de la commande : journal seulement (aucune entité Home Assistant).
+  ESP_LOGI(TAG, "0x%04X: Eco/Party: %s", ch.writer.address(), ch.writer.status().c_str());
 }
 
 VissLinkComponent::FlagChannel *VissLinkComponent::flag_channel_(int index) {
@@ -1481,32 +1411,8 @@ int VissLinkComponent::flag_peer_of_(int index) const {
 
 void VissLinkComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "VissLink (Optolink KW):");
-  ESP_LOGCONFIG(TAG, "  Writes: %s", this->enable_writes_ ? "ENABLED (whitelisted setpoints only)" : "disabled (read-only)");
-  ESP_LOGCONFIG(TAG, "  Operating mode writes: %s",
-                this->enable_writes_ && this->enable_mode_writes_ ? "ENABLED (experimental)" : "disabled");
-  ESP_LOGCONFIG(TAG, "  Schedule block writes (circulation 0x2200-0x2237): %s",
-                this->schedule_writes_enabled() ? "ENABLED (experimental)" : "disabled");
-  ESP_LOGCONFIG(TAG, "  DHW setpoint write (0x6300, internal limits %u..%u): %s", DHW_WRITE_MIN, DHW_WRITE_MAX,
-                this->dhw_setpoint_writes_enabled() ? "ENABLED (experimental)" : "disabled");
-  ESP_LOGCONFIG(TAG, "  Heating setpoint writes (A1 0x2306/0x2307, M2 0x3306/0x3307): %s",
-                this->heating_setpoint_writes_enabled() ? "ENABLED (experimental, provisional limits)" : "disabled");
-  ESP_LOGCONFIG(TAG, "  M2 operating mode write (0x3301): %s",
-                mode_write_permitted(M2_MODE_REGISTER, this->enable_writes_, this->enable_mode_writes_,
-                                     this->enable_m2_mode_write_) == ModePermission::OK
-                    ? "ENABLED (experimental, undocumented)"
-                    : "disabled");
-  for (const auto &ch : this->setpoints_) {
-    if (ch.writer.party())
-      ESP_LOGCONFIG(TAG, "  Party setpoint write (0x%04X): %s", ch.writer.address(),
-                    this->setpoint_permitted_(ch.writer.address()) ? "ENABLED (experimental, not validated on KW3)"
-                    : !this->enable_writes_                        ? "disabled (enable_writes: false)"
-                                                                   : "disabled (allow_write: false)");
-  }
-  for (const auto &ch : this->flags_)
-    ESP_LOGCONFIG(TAG, "  Eco/Party write (0x%04X): %s", ch.writer.address(),
-                  this->flag_permitted_(ch)  ? "ENABLED (experimental, not validated on KW3)"
-                  : !this->enable_writes_ ? "disabled (enable_writes: false)"
-                                          : "disabled (allow_write: false)");
+  ESP_LOGCONFIG(TAG, "  Writes: whitelisted registers only (setpoints, operating modes, Eco/Party, schedules)");
+  ESP_LOGCONFIG(TAG, "  DHW setpoint internal limits: %u..%u", DHW_WRITE_MIN, DHW_WRITE_MAX);
   for (auto *reg : this->registers_)
     reg->dump_register_config();
 }
@@ -1626,9 +1532,8 @@ climate::ClimateTraits VissLinkCircuitClimate::traits() {
 }
 
 void VissLinkCircuitClimate::control(const climate::ClimateCall &call) {
-  // Aucun chemin propre : la consigne passe par la transaction de 0x3306
-  // (enable_heating_setpoint_writes), le mode par le sélecteur de M2
-  // (enable_mode_writes + enable_m2_mode_write). L'état publié reste lu.
+  // Aucun chemin propre : la consigne passe par la transaction de 0x3306,
+  // le mode par le sélecteur de M2. L'état publié reste lu.
   if (call.get_mode().has_value()) {
     const climate::ClimateMode requested = *call.get_mode();
     if (requested != climate::CLIMATE_MODE_HEAT && requested != climate::CLIMATE_MODE_OFF) {

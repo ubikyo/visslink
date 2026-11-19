@@ -6,9 +6,9 @@ ordre : « ECS seule » (00), « Chauffage + ECS » (03), « Arrêt » (05). L'�
 publié est toujours la dernière valeur RELUE ; une valeur lue inconnue rend
 l'état inconnu (aucune option n'est choisie arbitrairement).
 
-Écriture, refusée sinon (journal, et l'entité revient à la valeur lue) :
-  - A1 : `enable_writes: true` ET `enable_mode_writes: true` ;
-  - M2 : en plus `enable_m2_mode_write: true` (écriture non documentée).
+Écriture des seules valeurs 00, 03 et 05 ; toute autre demande est refusée
+(journal, et l'entité revient à la valeur lue). Écriture de M2 non
+documentée par vcontrold.
 Une commande ne touche qu'un registre ; A1 et M2 sont relus ensuite.
 `divergence` (facultatif) signale des programmes différents, sans jamais les
 corriger. Un programme en lecture seule stricte se déclare en `text_sensor`

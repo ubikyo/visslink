@@ -1,5 +1,11 @@
 # Étude : marche ponctuelle du bouclage ECS (Vitotronic 300 KW3)
 
+> **v1.0.0 :** document historique. Les options d'autorisation (`enable_*`,
+> `allow_write`, `validated_days`), les entités « État modification / commande »
+> et les exemples intermédiaires cités ici n'existent plus. État actuel :
+> `docs/v1.0.0.md` et `examples/iot-viessmann-v1.0.0.yaml`.
+
+
 > **Suite : implémentation expérimentale v0.5 (piste 2), désactivée par
 > défaut, décrite dans [`bouclage-ecs-v0.5.md`](bouclage-ecs-v0.5.md).**
 >

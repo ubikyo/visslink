@@ -9,36 +9,27 @@ import base64
 import os
 import re
 import subprocess
-from pathlib import Path
 
 import pytest
 
-EXAMPLE = "examples/iot-viessmann.yaml"
-# Autorisations d'écriture : actives par défaut, `false` pour désactiver.
-WRITE_FLAGS = (
+EXAMPLE = "examples/iot-viessmann-v1.0.0.yaml"
+GITHUB_SOURCE = "github://ubikyo/visslink@v1.0.0"
+# Options d'autorisation supprimées en v1.0.0 : toutes les commandes sont
+# directement utilisables (seules les protections techniques restent).
+REMOVED_OPTIONS = (
     "enable_writes",
     "enable_mode_writes",
     "enable_m2_mode_write",
     "enable_schedule_writes",
     "enable_dhw_setpoint_write",
     "enable_heating_setpoint_writes",
-)
-# Jours du bouclage : les sept par défaut.
-SEVEN_DAYS = (
-    "monday",
-    "tuesday",
-    "wednesday",
-    "thursday",
-    "friday",
-    "saturday",
-    "sunday",
+    "allow_write",
+    "validated_days",
 )
 # Exemples de la v0.1.0 et de la v0.2, tels que publiés : doivent rester
 # valides sans modification.
 EXAMPLE_V01 = "tests/fixtures/iot-viessmann-v0.1.yaml"
 EXAMPLE_V02 = "tests/fixtures/iot-viessmann-v0.2.yaml"
-# v0.2.2 : configuration de diagnostic (exemple + six registres TEST bruts).
-DIAGNOSTIC = "examples/iot-viessmann-diagnostic.yaml"
 # Exemple de production de la v0.2.2 (identique à la v0.2.1) et diagnostic,
 # tels que publiés.
 EXAMPLE_V022 = "tests/fixtures/iot-viessmann-v0.2.2.yaml"
@@ -61,24 +52,37 @@ def _secrets() -> str:
     )
 
 
-def _with_flags(**flags):
-    """Transformation : déclare explicitement des autorisations sous
-    `visslink:` (les exemples n'en déclarent plus : défaut true)."""
+def _localize(repo_root, text):
+    """Composants du dépôt au lieu de la version publiée ; fixtures : seule
+    migration v1.0.0, les options d'autorisation `enable_*` sont retirées
+    (comme la cible `compat` du Makefile)."""
+    text = text.replace(
+        f"  - source: {GITHUB_SOURCE}\n",
+        f"  - source:\n      type: local\n      path: {repo_root / 'components'}\n",
+    )
+    text = text.replace("path: ../components", f"path: {repo_root / 'components'}")
+    return re.sub(r"(?m)^  enable_[a-z0-9_]*: [^\n]*\n", "", text)
 
-    def transform(text):
-        lines = "".join(f"\n  {k}: {v}" for k, v in flags.items())
-        new, n = re.subn(
-            r"(\n  max_retries: [^\n]*)", lambda m: m.group(1) + lines, text, 1
-        )
-        assert n == 1
-        return new
 
-    return transform
+REMOVED_FLAGS_RE = re.compile(
+    r"enable_(writes|mode_writes|m2_mode_write|schedule_writes|dhw_setpoint_write|"
+    r"heating_setpoint_writes)"
+)
+
+
+def _without_editor(text):
+    """Retire l'éditeur des programmations et ses actions API (leurs lambdas
+    référencent `programmations`), pour tronquer l'exemple sans erreur d'ID."""
+    head, sep, tail = text.partition("\n  actions:\n")
+    assert sep
+    text = head + "\n" + tail[tail.index("\nota:\n") + 1 :]
+    head, sep, tail = text.partition("\nvisslink_schedule_editor:\n")
+    assert sep
+    return head + "\n" + tail[tail.index("\n# --- ") + 1 :]
 
 
 def _run_config(repo_root, tmp_path, transform=lambda s: s, example=EXAMPLE):
-    text = (repo_root / example).read_text(encoding="utf-8")
-    text = text.replace("path: ../components", f"path: {repo_root / 'components'}")
+    text = _localize(repo_root, (repo_root / example).read_text(encoding="utf-8"))
     text = transform(text)
     (tmp_path / "secrets.yaml").write_text(_secrets(), encoding="utf-8")
     config = tmp_path / "test.yaml"
@@ -177,8 +181,7 @@ INVALID_CASES = {
     "unknown_day_key": lambda s: s.replace(
         "address: 0x2000", 'address: 0x2000\n    lundi:\n      name: "Lundi"'
     ),
-    # v0.3 : consignes (number) et écritures.
-    "enable_writes_not_boolean": lambda s: _with_flags(enable_writes="maybe")(s),
+    # v0.3 : consignes (number).
     "number_address_not_whitelisted": lambda s: s.replace(
         "address: 0x2306", "address: 0x0846"
     ),
@@ -196,7 +199,7 @@ INVALID_CASES = {
         "min_value: 16", "min_value: 2", 1
     ),
     "number_max_above_documented": lambda s: s.replace(
-        "max_value: 24", "max_value: 38", 1
+        "max_value: 23", "max_value: 38", 1
     ),
     "dhw_max_above_documented": lambda s: s.replace("max_value: 60", "max_value: 61"),
     "dhw_min_below_documented": lambda s: s.replace("min_value: 40", "min_value: 9"),
@@ -209,7 +212,7 @@ INVALID_CASES = {
     "number_half_step": lambda s: s.replace("step: 1", "step: 0.5", 1),
     "number_step_two": lambda s: s.replace("step: 1", "step: 2", 1),
     "number_without_min_value": lambda s: s.replace("    min_value: 16\n", "", 1),
-    "number_without_max_value": lambda s: s.replace("    max_value: 24\n", "", 1),
+    "number_without_max_value": lambda s: s.replace("    max_value: 23\n", "", 1),
     "number_with_data_type": lambda s: s.replace(
         "address: 0x2306", "address: 0x2306\n    data_type: uint16"
     ),
@@ -220,22 +223,6 @@ INVALID_CASES = {
         "address: 0x2306", "address: 0x2306\n    initial_value: 20"
     ),
     # v0.3/v0.4 : modes de fonctionnement (deux select).
-    # Contradiction explicite : true sous un parent explicitement false.
-    "mode_writes_without_writes": lambda s: _with_flags(
-        enable_writes="false", enable_mode_writes="true"
-    )(s),
-    "mode_writes_not_boolean": lambda s: _with_flags(enable_mode_writes="perhaps")(s),
-    # v0.4 : M2 exige enable_writes ET enable_mode_writes.
-    "m2_write_alone": lambda s: _with_flags(
-        enable_writes="false", enable_mode_writes="false", enable_m2_mode_write="true"
-    )(s),
-    "m2_write_with_writes_only": lambda s: _with_flags(
-        enable_mode_writes="false", enable_m2_mode_write="true"
-    )(s),
-    "m2_write_with_mode_writes_only": lambda s: _with_flags(
-        enable_writes="false", enable_m2_mode_write="true"
-    )(s),
-    "m2_write_not_boolean": lambda s: _with_flags(enable_m2_mode_write="maybe")(s),
     "select_on_party_register": lambda s: s.replace(
         "address: 0x2301", "address: 0x2303"
     ),
@@ -253,15 +240,15 @@ INVALID_CASES = {
     "mode_register_also_sensor": lambda s: s.replace(
         "address: 0x0804", "address: 0x3301"
     ),
-    "mode_register_also_text_sensor": lambda s: (
-        s
-        + "\n  - platform: visslink\n    type: operating_mode\n"
-        + '    name: "M2 bis"\n    address: 0x3301\n'
+    "mode_register_also_text_sensor": lambda s: _add_text_sensor(
+        s,
+        "  - platform: visslink\n    type: operating_mode\n"
+        '    name: "M2 bis"\n    address: 0x3301\n',
     ),
-    "mode_text_on_setpoint": lambda s: (
-        s
-        + "\n  - platform: visslink\n    type: operating_mode\n"
-        + '    name: "X"\n    address: 0x3306\n'
+    "mode_text_on_setpoint": lambda s: _add_text_sensor(
+        s,
+        "  - platform: visslink\n    type: operating_mode\n"
+        '    name: "X"\n    address: 0x3306\n',
     ),
     "unknown_text_sensor_type": lambda s: _m2_as_text(s, type_="mode"),
     "mode_text_with_today": lambda s: _m2_as_text(
@@ -277,31 +264,39 @@ INVALID_CASES = {
         "    address: 0x3301\n",
         '    address: 0x3301\n    divergence:\n      name: "Autre"\n',
     ),
-    "divergence_without_m2": lambda s: _drop_first(
-        s,
-        "  - platform: visslink\n"
-        "    visslink_id: viessmann\n"
-        '    name: "Plancher chauffant - Mode actuel"\n'
-        "    address: 0x3301\n"
-        "    update_interval: 5min\n",
-    ),
+    "divergence_without_m2": lambda s: _drop_climate(_drop_first(s, _M2_SELECT)),
 }
 
 
 _M2_SELECT = (
     "  - platform: visslink\n"
     "    visslink_id: viessmann\n"
+    "    id: m2_mode\n"
     '    name: "Plancher chauffant - Mode actuel"\n'
     "    address: 0x3301\n"
     "    update_interval: 5min\n"
 )
 
 
+def _add_text_sensor(text, entry):
+    """Ajoute une entrée à la section text_sensor de l'exemple."""
+    assert text.count("\ntext_sensor:\n") == 1
+    return text.replace("\ntext_sensor:\n", "\ntext_sensor:\n" + entry, 1)
+
+
+def _drop_climate(text):
+    """Retire le climate M2 (il référence le select de M2)."""
+    head, sep, tail = text.partition("\nclimate:\n")
+    assert sep
+    return head + "\n" + tail[tail.index("\n# --- ") + 1 :]
+
+
 def _m2_as_text(text, type_="operating_mode", extra=""):
     """M2 déclaré en text_sensor (lecture seule) au lieu du select."""
-    return _drop_first(text, _M2_SELECT) + (
-        f"\n  - platform: visslink\n    type: {type_}\n"
-        f'    name: "M2"\n    address: 0x3301\n{extra}'
+    return _add_text_sensor(
+        _drop_climate(_drop_first(text, _M2_SELECT)),
+        f"  - platform: visslink\n    type: {type_}\n"
+        f'    name: "M2"\n    address: 0x3301\n{extra}',
     )
 
 
@@ -312,6 +307,8 @@ def _drop_first(text, fragment):
 
 @pytest.mark.parametrize("case", sorted(INVALID_CASES))
 def test_invalid_config_is_rejected(repo_root, tmp_path, case):
+    text = (repo_root / EXAMPLE).read_text(encoding="utf-8")
+    assert INVALID_CASES[case](text) != text, f"{case}: transformation sans effet"
     result = _run_config(repo_root, tmp_path, INVALID_CASES[case])
     assert result.returncode != 0, f"{case} should be rejected:\n{result.stdout}"
 
@@ -362,7 +359,7 @@ def test_example_declares_four_schedules(repo_root, tmp_path):
 
 def _minimal_schedule(text):
     """Remplace les programmations de l'exemple par une seule, minimale."""
-    head, _, _ = text.partition("\ntext_sensor:\n")
+    head, _, _ = _without_editor(text).partition("\ntext_sensor:\n")
     return (
         head
         + "\ntext_sensor:\n"
@@ -408,7 +405,9 @@ def test_schedule_last_valid_address(repo_root, tmp_path):
     result = _run_config(
         repo_root,
         tmp_path,
-        lambda s: s.replace("address: 0x2200", "address: 0xFFC8"),
+        lambda s: _drop_first(s, "    - programmation_bouclage\n").replace(
+            "address: 0x2200", "address: 0xFFC8"
+        ),
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
@@ -449,96 +448,13 @@ def test_data_type_is_case_insensitive(repo_root, tmp_path):
 
 # --- Registres expérimentaux ----------------------------------------------
 
-_COMMENTED = re.compile(r"^  # (- |  )", re.MULTILINE)
-_RAW_0846 = re.compile(
-    r'  # - platform: visslink\n  #   name: "Brut 0x0846[^\n]*\n(  #   [^\n]*\n)*'
-)
-
-
-def _enable_experimental(text):
-    """Décommente les entités des sections sensor/binary_sensor uniquement."""
-    head, sep, tail = text.partition("\nsensor:\n")
-    return head + sep + _COMMENTED.sub(r"  \1", tail)
-
-
-def test_example_keeps_experimental_registers_commented(repo_root):
-    text = (repo_root / EXAMPLE).read_text(encoding="utf-8")
-    active = [line for line in text.splitlines() if not line.lstrip().startswith("#")]
-    active = "\n".join(active)
-    for address in ("0x5502", "0x0846", "0x0845", "0x0883", "0x2906", "0x3906"):
-        assert f"address: {address}" not in active, address
-        assert f"address: {address}" in text, address
-
-
-def test_experimental_registers_are_valid_once_enabled(repo_root, tmp_path):
-    def transform(text):
-        text = _RAW_0846.sub("", text)  # étape 1 terminée : entrée brute retirée
-        return _enable_experimental(text)
-
-    assert "Brut 0x0846" not in transform(
-        (repo_root / EXAMPLE).read_text(encoding="utf-8")
-    )
-    result = _run_config(repo_root, tmp_path, transform)
-    out = result.stdout + result.stderr
-    assert result.returncode == 0, out
-    # `esphome config` affiche les adresses sans zéro de tête (0x846).
-    shown = {int(a, 16) for a in re.findall(r"address: (0x[0-9a-fA-F]+)", out)}
-    for address in (0x5502, 0x0846, 0x0845, 0x0883, 0x2906, 0x3906):
-        assert address in shown, hex(address)
-
-
-def test_raw_check_and_binary_on_same_register_is_rejected(repo_root, tmp_path):
-    # Vérification brute (uint8) et binary_sensor actifs ensemble : doublon.
-    result = _run_config(repo_root, tmp_path, _enable_experimental)
-    out = result.stdout + result.stderr
-    assert result.returncode != 0, out
-    assert "0x0846" in out, out
-
 
 # --- Configuration de diagnostic (v0.2.2) -------------------------------------
-
-EXPERIMENTAL = {
-    0x0846: "uint8",
-    0x0845: "uint8",
-    0x2906: "uint8",
-    0x3906: "uint8",
-    0x0883: "uint8",
-    0x5502: "int16",
-}
-_TEST_ENTRY = re.compile(
-    r'  - platform: visslink\n    name: "TEST [^\n]*\n(    [^\n]*\n)*'
-)
 
 
 def _active_lines(text):
     lines = (line for line in text.splitlines() if line.strip())
     return "\n".join(line for line in lines if not line.lstrip().startswith("#"))
-
-
-def test_diagnostic_config_reads_experimental_registers_raw(repo_root, tmp_path):
-    result = _run_config(repo_root, tmp_path, example=DIAGNOSTIC)
-    out = result.stdout + result.stderr
-    assert result.returncode == 0, out
-    entries = re.findall(
-        r"name: TEST [^\n]*\n((?:    [^\n]*\n)*)", out
-    )  # sortie de `esphome config` : une entrée par capteur TEST
-    assert len(entries) == len(EXPERIMENTAL), out
-    seen = {}
-    for entry in entries:
-        address = int(re.search(r"address: (0x[0-9a-fA-F]+)", entry).group(1), 16)
-        seen[address] = re.search(r"data_type: (\w+)", entry).group(1)
-        assert "entity_category: diagnostic" in entry, entry
-        assert "filters" not in entry and "unit_of_measurement" not in entry, entry
-    assert seen == EXPERIMENTAL
-
-
-def test_diagnostic_config_is_the_example_plus_test_sensors(repo_root):
-    # Même nœud, mêmes Wi-Fi / API / OTA / UART / registres que l'exemple
-    # v0.2.2 : seules les six entrées TEST (et les commentaires) diffèrent.
-    example = (repo_root / EXAMPLE_V022).read_text(encoding="utf-8")
-    diagnostic = (repo_root / DIAGNOSTIC).read_text(encoding="utf-8")
-    assert len(_TEST_ENTRY.findall(diagnostic)) == len(EXPERIMENTAL)
-    assert _active_lines(_TEST_ENTRY.sub("", diagnostic)) == _active_lines(example)
 
 
 # --- Écritures et consignes (v0.3) --------------------------------------------
@@ -550,49 +466,9 @@ WRITABLE = {
     0x3307: (3, 37),
     0x6300: (10, 60),
 }
-# v0.9.1 : liste blanche complète des consignes, avec les consignes Party
-# (absentes de l'exemple de production).
+# v0.9.1 : liste blanche complète des consignes, avec les consignes Party.
 PARTY_WRITABLE = {0x2308: (3, 37), 0x3308: (3, 37)}
 WRITABLE_ALL = {**WRITABLE, **PARTY_WRITABLE}
-
-
-def test_example_writes_enabled_by_default(repo_root, tmp_path):
-    """Aucune autorisation déclarée : les six sont actives, le bouclage les
-    sept jours ; les avertissements le rappellent à la compilation."""
-    text = _active_lines((repo_root / EXAMPLE).read_text(encoding="utf-8"))
-    assert "enable_" not in text
-    assert "validated_days" not in text
-    result = _run_config(repo_root, tmp_path)
-    out = result.stdout + result.stderr
-    assert result.returncode == 0, out
-    for flag in WRITE_FLAGS:
-        assert f"{flag}: true" in out, flag
-    for day in SEVEN_DAYS:
-        assert f"  - {day}\n" in out, day
-    assert "Optolink WRITES ENABLED" in out, out
-
-
-def test_enable_writes_false_disables_everything(repo_root, tmp_path):
-    """Compatibilité : enable_writes: false seul désactive les six
-    autorisations, sans erreur ni avertissement."""
-    result = _run_config(repo_root, tmp_path, _with_flags(enable_writes="false"))
-    out = result.stdout + result.stderr
-    assert result.returncode == 0, out
-    for flag in WRITE_FLAGS:
-        assert f"{flag}: false" in out, flag
-    assert "ENABLED" not in out
-
-
-@pytest.mark.parametrize("flag", WRITE_FLAGS[1:])
-def test_each_flag_false_disables_only_its_feature(repo_root, tmp_path, flag):
-    result = _run_config(repo_root, tmp_path, _with_flags(**{flag: "false"}))
-    out = result.stdout + result.stderr
-    assert result.returncode == 0, out
-    assert f"{flag}: false" in out, out
-    # Le programme de M2 suit celui des programmes ; rien d'autre ne change.
-    off = {flag} | ({"enable_m2_mode_write"} if flag == "enable_mode_writes" else set())
-    for other in WRITE_FLAGS:
-        assert f"{other}: {'false' if other in off else 'true'}" in out, other
 
 
 def test_example_setpoints_are_numbers(repo_root, tmp_path):
@@ -600,7 +476,7 @@ def test_example_setpoints_are_numbers(repo_root, tmp_path):
     out = result.stdout + result.stderr
     assert result.returncode == 0, out
     _, _, numbers = out.partition("\nnumber:\n")
-    numbers = numbers.partition("\nselect:\n")[0].partition("\ntext_sensor:\n")[0]
+    numbers = numbers.partition("\nselect:\n")[0]
     shown = {
         int(a, 16): (int(lo), int(hi))
         for a, lo, hi in re.findall(
@@ -608,22 +484,21 @@ def test_example_setpoints_are_numbers(repo_root, tmp_path):
             numbers,
         )
     }
-    assert set(shown) == set(WRITABLE), numbers
+    assert set(shown) == set(WRITABLE_ALL), numbers
     for address, (lo, hi) in shown.items():
-        assert WRITABLE[address][0] <= lo < hi <= WRITABLE[address][1]
-    assert numbers.count("update_interval: 5min") == 5, numbers
-    assert numbers.count("step: 1") == 5, numbers
-    # Les consignes ne sont plus déclarées en capteurs (adresse unique).
+        assert WRITABLE_ALL[address][0] <= lo < hi <= WRITABLE_ALL[address][1]
+    assert numbers.count("step: 1") == 7, numbers
+    # Les consignes ne sont pas déclarées en capteurs (adresse unique).
     sensors = _active_lines((repo_root / EXAMPLE).read_text(encoding="utf-8"))
     sensors = sensors.partition("\nsensor:")[2].partition("\nbinary_sensor:")[0]
-    for address in WRITABLE:
+    for address in WRITABLE_ALL:
         assert f"address: 0x{address:04X}" not in sensors
 
 
 def test_target_number_syntax_is_accepted(repo_root, tmp_path):
     # API cible de la v0.3, telle que spécifiée.
     def transform(text):
-        head, _, _ = text.partition("\nnumber:\n")
+        head, _, _ = _without_editor(text).partition("\nnumber:\n")
         return head + (
             "\nnumber:\n"
             "  - platform: visslink\n"
@@ -646,7 +521,7 @@ def test_documented_bounds_are_accepted(repo_root, tmp_path, address):
     lo, hi = WRITABLE_ALL[address]
 
     def transform(text):
-        head, _, _ = text.partition("\nnumber:\n")
+        head, _, _ = _without_editor(text).partition("\nnumber:\n")
         return head + (
             "\nnumber:\n"
             "  - platform: visslink\n"
@@ -684,17 +559,17 @@ def test_v022_configs_still_valid(repo_root, tmp_path, fixture):
     result = _run_config(repo_root, tmp_path, example=fixture)
     out = result.stdout + result.stderr
     assert result.returncode == 0, out
-    # Sans `enable_writes` : autorisé par défaut, mais la v0.2.2 n'a aucune
+    # v1.0.0 : plus aucune option d'autorisation ; la v0.2.2 n'a aucune
     # entité inscriptible (ni number ni select).
-    assert "enable_writes: true" in out, out
+    assert not REMOVED_FLAGS_RE.search(out), out
     assert "\nnumber:" not in (repo_root / fixture).read_text(encoding="utf-8")
 
 
-def test_cpp_writes_disabled_by_default_and_never_restored(repo_root):
-    # Côté C++, sans appel à set_enable_writes(), aucune écriture : le défaut
-    # du membre est false. La plateforme number ne restaure aucune valeur.
+def test_cpp_writes_only_whitelisted_and_never_restored(repo_root):
+    # Côté C++, aucun registre n'accepte d'écriture par défaut : seules les
+    # entités des listes blanches le permettent. La plateforme number ne
+    # restaure aucune valeur.
     header = (repo_root / "components/visslink/visslink.h").read_text(encoding="utf-8")
-    assert "bool enable_writes_{false};" in header
     assert "write_allowed(uint8_t /*value*/) const { return false; }" in header
     sources = header + (repo_root / "components/visslink/visslink.cpp").read_text(
         encoding="utf-8"
@@ -711,31 +586,6 @@ def test_cpp_writes_disabled_by_default_and_never_restored(repo_root):
 # --- Programmes de fonctionnement (v0.3, expérimental) -----------------------
 
 MODES = {0x00: "ECS seule", 0x03: "Chauffage + ECS", 0x05: "Arrêt"}
-
-
-def test_explicit_true_flags_still_accepted(repo_root, tmp_path):
-    """Compatibilité : les configurations qui déclarent les six autorisations
-    à true restent valides."""
-    result = _run_config(
-        repo_root, tmp_path, _with_flags(**{flag: "true" for flag in WRITE_FLAGS})
-    )
-    out = result.stdout + result.stderr
-    assert result.returncode == 0, out
-    for flag in WRITE_FLAGS:
-        assert f"{flag}: true" in out, flag
-
-
-def test_mode_writes_need_both_flags_and_warn(repo_root, tmp_path):
-    result = _run_config(
-        repo_root,
-        tmp_path,
-        lambda s: s.replace("enable_writes: false", "enable_writes: true").replace(
-            "enable_mode_writes: false", "enable_mode_writes: true"
-        ),
-    )
-    out = result.stdout + result.stderr
-    assert result.returncode == 0, out
-    assert "OPERATING MODE WRITES ENABLED" in out, out
 
 
 def test_example_mode_entities(repo_root, tmp_path):
@@ -755,46 +605,18 @@ def test_example_mode_entities(repo_root, tmp_path):
         assert out.count(f"address: {address}\n") == 1, address  # aucun doublon
 
 
-def test_explicit_false_flags_still_accepted(repo_root, tmp_path):
-    """Compatibilité : une configuration qui déclare les six autorisations à
-    false (exemples v0.3 à v0.7.1) reste valide et en lecture seule."""
-    result = _run_config(
-        repo_root, tmp_path, _with_flags(**{flag: "false" for flag in WRITE_FLAGS})
-    )
-    out = result.stdout + result.stderr
-    assert result.returncode == 0, out
-    for flag in WRITE_FLAGS:
-        assert f"{flag}: false" in out, flag
-    assert "ENABLED" not in out
-
-
-def test_all_three_write_flags_valid_with_warnings(repo_root, tmp_path):
-    def transform(s):
-        for flag in ("enable_writes", "enable_mode_writes", "enable_m2_mode_write"):
-            s = s.replace(f"{flag}: false", f"{flag}: true")
-        return s
-
-    result = _run_config(repo_root, tmp_path, transform)
-    out = result.stdout + result.stderr
-    assert result.returncode == 0, out
-    assert "M2 OPERATING MODE WRITE ENABLED" in out, out
-    assert "OPERATING MODE WRITES ENABLED" in out, out
-
-
 def test_mode_text_sensors_still_valid(repo_root, tmp_path):
     # Lecture seule stricte possible pour les deux circuits (comme en v0.3).
     def transform(text):
         head, _, tail = text.partition("\nselect:\n")
-        tail = tail.partition("\n# --- Programmations horaires")[2]
-        return (
-            head
-            + "\n# --- Programmations horaires"
-            + tail
-            + "\n  - platform: visslink\n    type: operating_mode\n"
-            + '    name: "A1"\n    address: 0x2301\n'
-            + '    divergence:\n      name: "Div"\n'
-            + "\n  - platform: visslink\n    type: operating_mode\n"
-            + '    name: "M2"\n    address: 0x3301\n'
+        tail = tail[tail.index("\n# --- ") + 1 :]
+        return _add_text_sensor(
+            _drop_climate(head + "\n" + tail),
+            "  - platform: visslink\n    type: operating_mode\n"
+            '    name: "A1"\n    address: 0x2301\n'
+            '    divergence:\n      name: "Div"\n'
+            "  - platform: visslink\n    type: operating_mode\n"
+            '    name: "M2"\n    address: 0x3301\n',
         )
 
     result = _run_config(repo_root, tmp_path, transform)
@@ -812,15 +634,15 @@ def test_mode_tables_match_cpp(repo_root):
 
     assert as_ints(values) == list(MODES)
     assert as_ints(readable) == [0x2301, 0x3301]
-    assert as_ints(writable) == [0x2301, 0x3301]  # M2 : troisième autorisation
-    assert "M2_MODE_REGISTER = 0x3301;" in cpp
+    assert as_ints(writable) == [0x2301, 0x3301]
+    assert "M2_MODE_REGISTER" not in cpp
     texts = re.findall(r'case 0x0([035]):\n\s+return "([^"]+)";', cpp)
     assert [(int(v), t) for v, t in texts] == list(MODES.items())
     assert 'return "Inconnu";' in cpp
     py = (repo_root / "components/visslink/__init__.py").read_text(encoding="utf-8")
     assert "MODE_REGISTERS = (0x2301, 0x3301)" in py
     assert "MODE_WRITE_WHITELIST = (0x2301, 0x3301)" in py
-    assert "M2_MODE_REGISTER = 0x3301" in py
+    assert "M2_MODE_REGISTER" not in py
     labels = re.findall(r'0x0([035]): "([^"]+)"', py)
     assert [(int(v), label) for v, label in labels] == list(MODES.items())
     for forbidden in ("Party", "Congé", "Ferien"):
@@ -834,8 +656,7 @@ def test_v03_config_still_valid(repo_root, tmp_path):
     assert result.returncode == 0, out
     text = (repo_root / EXAMPLE_V03).read_text(encoding="utf-8")
     assert text.startswith("# VissLink v0.3 ")
-    assert "enable_m2_mode_write" not in text
-    assert "enable_m2_mode_write: false" in out, out
+    assert not REMOVED_FLAGS_RE.search(out), out  # options retirées
     assert "type: operating_mode" in out
 
 
@@ -852,61 +673,10 @@ def test_v04_config_still_valid(repo_root, tmp_path):
     assert result.returncode == 0, out
     text = (repo_root / EXAMPLE_V04).read_text(encoding="utf-8")
     assert text.startswith("# VissLink v0.4 ")
-    for flag in ("enable_writes", "enable_mode_writes", "enable_m2_mode_write"):
-        assert f"{flag}: false" in out, flag
+    assert not REMOVED_FLAGS_RE.search(out), out  # options retirées
 
 
 # --- Diagnostic bouclage ECS (lecture seule) ----------------------------------
-
-DIAGNOSTIC_LOOP = "examples/iot-viessmann-diagnostic-bouclage.yaml"
-
-
-def test_loop_diagnostic_valid(repo_root, tmp_path):
-    result = _run_config(repo_root, tmp_path, example=DIAGNOSTIC_LOOP)
-    out = result.stdout + result.stderr
-    assert result.returncode == 0, out
-    for flag in ("enable_writes", "enable_mode_writes", "enable_m2_mode_write"):
-        assert f"{flag}: true" in out, flag  # défaut
-    # 0x0846 lu en octet brut, programmation du bouclage relue toutes les 10 min.
-    assert re.search(
-        r"name: TEST — Bouclage ECS brut\n(?:    [^\n]*\n)*?    address: 0x846\n", out
-    ), out
-    loop = out.partition("name: Bouclage ECS - Programmation\n")[2]
-    loop = loop.partition("\n  - platform:")[0]
-    assert "update_interval: 10min" in loop, loop
-    for day in (
-        "lundi",
-        "mardi",
-        "mercredi",
-        "jeudi",
-        "vendredi",
-        "samedi",
-        "dimanche",
-    ):
-        assert f"TEST — Bouclage {day}" in loop, day
-
-
-def test_loop_diagnostic_only_adds_read_entities(repo_root):
-    # Mêmes nœud, Wi-Fi, API, OTA, UART, autorisations et entités que
-    # l'exemple v0.4.1 dont il est issu : seuls s'ajoutent le capteur 0x0846,
-    # le détail des 7 jours et l'intervalle de 10 min du bouclage.
-    example = _active_lines((repo_root / EXAMPLE_V041).read_text(encoding="utf-8"))
-    diag = _active_lines((repo_root / DIAGNOSTIC_LOOP).read_text(encoding="utf-8"))
-    removed = [line for line in example.splitlines() if line not in diag.splitlines()]
-    # Autorisations à false de la v0.4.1 : retirées (défaut true).
-    assert removed == [
-        "  enable_writes: false",
-        "  enable_mode_writes: false",
-        "  enable_m2_mode_write: false",
-    ], removed
-    added = [line for line in diag.splitlines() if line not in example.splitlines()]
-    allowed = re.compile(
-        r"^\s+(- platform: visslink|name: \"TEST — Bouclage[^\"]*\"|address: 0x0846|"
-        r"data_type: uint8|update_interval: (60s|10min)|accuracy_decimals: 0|"
-        r"entity_category: diagnostic|(monday|tuesday|wednesday|thursday|friday|"
-        r"saturday|sunday):)$"
-    )
-    assert all(allowed.match(line) for line in added), added
 
 
 # --- v0.5 : bouclage ECS à la demande -----------------------------------------
@@ -921,56 +691,21 @@ def test_v041_config_still_valid(repo_root, tmp_path):
         .read_text(encoding="utf-8")
         .startswith("# VissLink v0.4.1 ")
     )
-    assert "enable_schedule_writes: false" in out, out
+    assert not REMOVED_FLAGS_RE.search(out), out
 
 
-def test_example_boost_present_all_days_by_default(repo_root, tmp_path):
-    text = _active_lines((repo_root / EXAMPLE).read_text(encoding="utf-8"))
-    assert "enable_schedule_writes" not in text
-    assert "validated_days" not in text
+def test_example_boost_available_every_day(repo_root, tmp_path):
     result = _run_config(repo_root, tmp_path)
     out = result.stdout + result.stderr
     assert result.returncode == 0, out
-    assert "visslink_boost:" in out
-    assert "  validated_days:\n" + "".join(f"    - {d}\n" for d in SEVEN_DAYS) in out, (
-        out
-    )
-    assert "SCHEDULE BLOCK WRITES ENABLED" in out
+    boost = out.partition("visslink_boost:")[2].partition("\ntext_sensor:")[0]
+    assert boost, out
+    assert "validated_days" not in boost
+    assert "ENABLED" not in out  # plus d'avertissement d'autorisation
     # Horloge lue en lecture seule, à 0x088E.
     assert re.search(
         r"name: Vitotronic - Horloge\n(?:    [^\n]*\n)*?    address: 0x88E\n", out
     ), out
-
-
-def test_boost_days_can_still_be_restricted(repo_root, tmp_path):
-    for days, expected in (("[]", "validated_days: []"), ("[sunday]", "  - sunday\n")):
-        result = _run_config(
-            repo_root,
-            tmp_path,
-            lambda s, d=days: s.replace(
-                "\n  time_id: ha_time\n",
-                f"\n  time_id: ha_time\n  validated_days: {d}\n",
-                1,
-            ),
-        )
-        out = result.stdout + result.stderr
-        assert result.returncode == 0, out
-        assert expected in out, out
-        assert "  - monday\n" not in out.partition("visslink_boost:")[2], out
-
-
-def test_schedule_writes_need_enable_writes(repo_root, tmp_path):
-    bad = _run_config(
-        repo_root,
-        tmp_path,
-        _with_flags(enable_writes="false", enable_schedule_writes="true"),
-    )
-    assert bad.returncode != 0, bad.stdout
-    off = _run_config(repo_root, tmp_path, _with_flags(enable_schedule_writes="false"))
-    out = off.stdout + off.stderr
-    assert off.returncode == 0, out
-    assert "enable_schedule_writes: false" in out, out
-    assert "SCHEDULE BLOCK WRITES ENABLED" not in out
 
 
 @pytest.mark.parametrize(
@@ -999,20 +734,6 @@ def test_boost_invalid_configs(repo_root, tmp_path, case):
     assert result.returncode != 0, result.stdout
 
 
-def test_boost_validated_days_accepted(repo_root, tmp_path):
-    result = _run_config(
-        repo_root,
-        tmp_path,
-        lambda s: s.replace(
-            "\n  time_id: ha_time\n",
-            "\n  time_id: ha_time\n  validated_days: [sunday, Monday]\n",
-            1,
-        ),
-    )
-    out = result.stdout + result.stderr
-    assert result.returncode == 0, out
-
-
 def test_boost_tables_match_cpp(repo_root):
     cpp = (repo_root / "components/visslink/circulation_boost.h").read_text(
         encoding="utf-8"
@@ -1034,11 +755,6 @@ def test_boost_tables_match_cpp(repo_root):
         assert "0x0846" not in code and "0x846" not in code, f
 
 
-def test_loop_diagnostic_still_valid_with_v05(repo_root, tmp_path):
-    result = _run_config(repo_root, tmp_path, example=DIAGNOSTIC_LOOP)
-    assert result.returncode == 0, result.stdout + result.stderr
-
-
 # --- v0.5 : états Éco et Party (lecture seule) --------------------------------
 
 ECO_PARTY = {
@@ -1047,20 +763,6 @@ ECO_PARTY = {
     0x3302: "Plancher chauffant - Éco",
     0x3303: "Plancher chauffant - Party",
 }
-
-
-def test_example_eco_party_binary_sensors(repo_root, tmp_path):
-    result = _run_config(repo_root, tmp_path)
-    out = result.stdout + result.stderr
-    assert result.returncode == 0, out
-    binaries = out.partition("\nbinary_sensor:\n")[2].partition("\nnumber:\n")[0]
-    for address, name in ECO_PARTY.items():
-        entry = re.search(rf"name: {re.escape(name)}\n((?:    [^\n]*\n)*)", binaries)
-        assert entry, name
-        assert f"address: 0x{address:X}\n" in entry.group(1), name
-        assert "update_interval: 60s" in entry.group(1), name  # v0.5.1 (30 s en v0.5)
-        # Une seule déclaration de chaque adresse, toutes plateformes confondues.
-        assert out.count(f"address: 0x{address:X}\n") == 1, hex(address)
 
 
 @pytest.mark.parametrize("address", sorted(ECO_PARTY))
@@ -1089,32 +791,6 @@ def test_eco_party_duplicate_rejected(repo_root, tmp_path):
 
 
 # --- Essai en lecture seule v0.5 ----------------------------------------------
-
-ESSAI_V05 = "examples/iot-viessmann-essai-lecture-v0.5.yaml"
-
-
-def test_read_trial_config_valid(repo_root, tmp_path):
-    result = _run_config(repo_root, tmp_path, example=ESSAI_V05)
-    out = result.stdout + result.stderr
-    assert result.returncode == 0, out
-    for address in ("0x88E", "0x846", "0x2302", "0x2303", "0x3302", "0x3303"):
-        assert out.count(f"address: {address}\n") == 1, address
-
-
-def test_read_only_trial_only_adds_read_entities(repo_root):
-    example = _active_lines((repo_root / EXAMPLE).read_text(encoding="utf-8"))
-    trial = _active_lines((repo_root / ESSAI_V05).read_text(encoding="utf-8"))
-    removed = [line for line in example.splitlines() if line not in trial.splitlines()]
-    assert removed == [], removed
-    added = [line for line in trial.splitlines() if line not in example.splitlines()]
-    allowed = re.compile(
-        r"^\s+(- platform: visslink|visslink_id: viessmann|"
-        r"name: \"TEST — Bouclage[^\"]*\"|address: 0x0846|"
-        r"data_type: uint8|update_interval: (60s|10min)|accuracy_decimals: 0|"
-        r"entity_category: diagnostic|(monday|tuesday|wednesday|thursday|friday|"
-        r"saturday|sunday):)$"
-    )
-    assert all(allowed.match(line) for line in added), added
 
 
 # --- v0.5.1 : valeurs « non disponibles » (invalid_values) ------------------
@@ -1197,29 +873,10 @@ def _interval_after(text, address):
     return match.group(1)
 
 
-@pytest.mark.parametrize("example", [EXAMPLE, ESSAI_V05])
-def test_eco_party_read_every_60s(repo_root, example):
-    text = (repo_root / example).read_text(encoding="utf-8")
+def test_eco_party_read_every_60s(repo_root):
+    text = (repo_root / EXAMPLE).read_text(encoding="utf-8")
     for address in _ECO_PARTY:
         assert _interval_after(text, address) == "60s", address
-
-
-@pytest.mark.parametrize("example", [EXAMPLE, ESSAI_V05])
-def test_flow_setpoints_commented_with_invalid_values(repo_root, example):
-    text = (repo_root / example).read_text(encoding="utf-8")
-    for address in ("0x2544", "0x3544"):
-        block = re.search(
-            rf"  # - platform: visslink\n(  #   [^\n]*\n)*?  #   address: {address}\n"
-            rf"(  #   [^\n]*\n)*?",
-            text,
-        )
-        assert block, address
-        start = block.start()
-        following = text[start : start + 400]
-        assert f"  #   address: {address}\n" in following
-        assert "  #   invalid_values: [0xFFFF]\n" in following
-        # Jamais actif par défaut.
-        assert f"    address: {address}\n" not in _active_lines(text)
 
 
 def test_no_write_path_for_loop_pump_0x0846(repo_root):
@@ -1237,48 +894,6 @@ def test_no_write_path_for_loop_pump_0x0846(repo_root):
 
 
 # --- v0.5.2 : configuration d'essai matériel du bouclage --------------------
-
-ESSAI_BOUCLAGE = "examples/iot-viessmann-essai-bouclage-v0.5.2.yaml"
-
-
-def test_loop_hardware_trial_valid_and_without_writes(repo_root, tmp_path):
-    result = _run_config(repo_root, tmp_path, example=ESSAI_BOUCLAGE)
-    out = result.stdout + result.stderr
-    assert result.returncode == 0, out
-    # 0x0846 déclaré une seule fois, en octet brut lu toutes les 15 s.
-    assert out.count("address: 0x846\n") == 1, out
-    assert re.search(
-        r"address: 0x846\n(?:    [^\n]*\n)*?    update_interval: 15s\n", out
-    ), out
-    assert "name: Bouclage ECS — Restauration en cours" in out, out
-
-
-def test_loop_hardware_trial_only_adds_read_entities(repo_root):
-    example = _active_lines((repo_root / EXAMPLE).read_text(encoding="utf-8"))
-    trial = _active_lines((repo_root / ESSAI_BOUCLAGE).read_text(encoding="utf-8"))
-    removed = [line for line in example.splitlines() if line not in trial.splitlines()]
-    assert removed == [], removed
-    added = [line for line in trial.splitlines() if line not in example.splitlines()]
-    allowed = re.compile(
-        r"^\s+(- platform: visslink|visslink_id: viessmann|"
-        r"name: \"TEST — Bouclage ECS brut\"|address: 0x0846|"
-        r"data_type: uint8|update_interval: 15s|accuracy_decimals: 0|"
-        r"entity_category: diagnostic|restoring:|"
-        r"name: \"Bouclage ECS — Restauration en cours\")$"
-    )
-    assert all(allowed.match(line) for line in added), added
-
-
-def test_production_keeps_loop_pump_at_60s(repo_root):
-    """Production : 0x0846 seulement en commentaire, à 60 s ; 15 s est
-    réservé à l'essai matériel."""
-    text = (repo_root / EXAMPLE).read_text(encoding="utf-8")
-    assert "0x0846" not in _active_lines(text)
-    intervals = re.findall(
-        r"address: 0x0846\n(?:  #   (?!- platform)[^\n]*\n)*?  #   update_interval: (\S+)",
-        text,
-    )
-    assert intervals and set(intervals) == {"60s"}, intervals
 
 
 def test_loop_pump_0x0846_never_writable_in_examples(repo_root):
@@ -1316,54 +931,17 @@ def test_boost_default_duration_is_10_min(repo_root):
 
 
 def test_boost_restoring_entity_is_optional(repo_root, tmp_path):
-    # La production n'a pas l'entité et reste valide (test_example_*) ; la
-    # retirer de l'essai matériel le laisse valide aussi.
+    # L'exemple la déclare ; la retirer le laisse valide.
     def drop(text):
         old = '  restoring:\n    name: "Bouclage ECS — Restauration en cours"\n'
         assert old in text
         return text.replace(old, "")
 
-    result = _run_config(repo_root, tmp_path, drop, example=ESSAI_BOUCLAGE)
+    result = _run_config(repo_root, tmp_path, drop)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
 # --- v0.6 : consigne d'eau chaude sanitaire ---------------------------------
-
-ESSAI_CONSIGNE_ECS = "examples/iot-viessmann-essai-consigne-ecs-v0.6.yaml"
-
-
-def test_dhw_setpoint_write_enabled_by_default_and_can_be_disabled(repo_root, tmp_path):
-    text = _active_lines((repo_root / EXAMPLE).read_text(encoding="utf-8"))
-    assert "enable_dhw_setpoint_write" not in text
-    result = _run_config(repo_root, tmp_path)
-    out = result.stdout + result.stderr
-    assert result.returncode == 0, out
-    assert "enable_dhw_setpoint_write: true" in out, out
-    assert "DHW SETPOINT WRITE ENABLED" in out
-    off = _run_config(
-        repo_root, tmp_path, _with_flags(enable_dhw_setpoint_write="false")
-    )
-    out = off.stdout + off.stderr
-    assert off.returncode == 0, out
-    assert "enable_dhw_setpoint_write: false" in out, out
-    assert "DHW SETPOINT WRITE ENABLED" not in out
-
-
-def test_dhw_setpoint_write_requires_enable_writes(repo_root, tmp_path):
-    bad = _run_config(
-        repo_root,
-        tmp_path,
-        _with_flags(enable_writes="false", enable_dhw_setpoint_write="true"),
-    )
-    assert bad.returncode != 0, bad.stdout
-    assert "enable_dhw_setpoint_write requires enable_writes: true" in (
-        bad.stdout + bad.stderr
-    )
-    # enable_writes: false seul : la consigne ECS suit, sans erreur.
-    off = _run_config(repo_root, tmp_path, _with_flags(enable_writes="false"))
-    out = off.stdout + off.stderr
-    assert off.returncode == 0, out
-    assert "enable_dhw_setpoint_write: false" in out, out
 
 
 def test_dhw_limits_and_whitelist_match_cpp(repo_root):
@@ -1387,110 +965,9 @@ def test_dhw_limits_and_whitelist_match_cpp(repo_root):
     assert WRITABLE[0x6300][0] <= low and high <= WRITABLE[0x6300][1]
 
 
-def test_number_status_for_every_setpoint(repo_root, tmp_path):
-    """v0.7 : texte d'état facultatif pour chaque consigne (ECS et chauffage)."""
-
-    def status_on(text):
-        for address in ("0x2306", "0x2307", "0x3306", "0x3307", "0x6300"):
-            old = f"    address: {address}\n"
-            assert old in text
-            text = text.replace(
-                old, old + f'    status:\n      name: "TEST état {address}"\n', 1
-            )
-        return text
-
-    result = _run_config(repo_root, tmp_path, status_on)
-    out = result.stdout + result.stderr
-    assert result.returncode == 0, out
-    assert out.count("name: TEST état 0x") == 5, out
-
-
-def test_dhw_trial_config_valid_and_without_writes(repo_root, tmp_path):
-    result = _run_config(repo_root, tmp_path, example=ESSAI_CONSIGNE_ECS)
-    out = result.stdout + result.stderr
-    assert result.returncode == 0, out
-    # 0x6300 lu une seule fois : le number, bornes 50..60, 60 s, avec son état.
-    assert out.count("address: 0x6300\n") == 1, out
-    match = re.search(r"name: ECS - Température de consigne\n((?:    [^\n]*\n)*)", out)
-    assert match, out
-    entry = match.group(1)
-    for line in (
-        "address: 0x6300",
-        "min_value: 50",
-        "max_value: 60",
-        "update_interval: 60s",
-    ):
-        assert f"    {line}\n" in entry, line
-    assert "name: ECS - État modification consigne" in out, out
-
-
-def test_dhw_trial_only_changes_the_dhw_number(repo_root):
-    example = _active_lines((repo_root / EXAMPLE).read_text(encoding="utf-8"))
-    trial = _active_lines((repo_root / ESSAI_CONSIGNE_ECS).read_text(encoding="utf-8"))
-    removed = [line for line in example.splitlines() if line not in trial.splitlines()]
-    assert removed == ['    name: "ECS - Consigne"', "    min_value: 40"], removed
-    added = [line for line in trial.splitlines() if line not in example.splitlines()]
-    assert added == [
-        '    name: "ECS - Température de consigne"',
-        "    min_value: 50",
-        # update_interval: 60s existe déjà ailleurs : vérifié par
-        # test_dhw_trial_config_valid_and_without_writes.
-        "    status:",
-        '      name: "ECS - État modification consigne"',
-    ], added
-
-
-@pytest.mark.parametrize(
-    "example",
-    sorted(
-        f"examples/{p.name}"
-        for p in (Path(__file__).resolve().parent.parent / "examples").glob("*.yaml")
-        if p.name != "secrets.yaml"
-    ),
-)
-def test_examples_declare_no_write_flags(repo_root, example):
-    """Configuration minimale : aucun exemple ne déclare les autorisations ni
-    les jours du bouclage (défauts : tout autorisé, sept jours)."""
-    text = _active_lines((repo_root / example).read_text(encoding="utf-8"))
-    for flag in WRITE_FLAGS:
-        assert f"{flag}:" not in text, (example, flag)
-    assert "validated_days" not in text, example
-
-
 # --- v0.7 : consignes de chauffage A1/M2 et climate du plancher M2 -----------
 
-ESSAI_CHAUFFAGE = "examples/iot-viessmann-essai-chauffage-v0.7.yaml"
 HEATING = {0x2306: (16, 23), 0x2307: (10, 20), 0x3306: (16, 22), 0x3307: (14, 20)}
-
-
-def test_heating_setpoint_writes_enabled_by_default_and_can_be_disabled(
-    repo_root, tmp_path
-):
-    result = _run_config(repo_root, tmp_path)
-    out = result.stdout + result.stderr
-    assert result.returncode == 0, out
-    assert "enable_heating_setpoint_writes: true" in out, out
-    assert "HEATING SETPOINT WRITES ENABLED" in out
-    off = _run_config(
-        repo_root, tmp_path, _with_flags(enable_heating_setpoint_writes="false")
-    )
-    out = off.stdout + off.stderr
-    assert off.returncode == 0, out
-    assert "enable_heating_setpoint_writes: false" in out, out
-    assert "HEATING SETPOINT WRITES ENABLED" not in out
-    assert "DHW SETPOINT WRITE ENABLED" in out  # isolée : l'ECS reste autorisée
-
-
-def test_heating_setpoint_writes_require_enable_writes(repo_root, tmp_path):
-    bad = _run_config(
-        repo_root,
-        tmp_path,
-        _with_flags(enable_writes="false", enable_heating_setpoint_writes="true"),
-    )
-    assert bad.returncode != 0, bad.stdout
-    assert "enable_heating_setpoint_writes requires enable_writes: true" in (
-        bad.stdout + bad.stderr
-    )
 
 
 def test_heating_limits_match_cpp(repo_root):
@@ -1518,52 +995,6 @@ def test_heating_limits_match_cpp(repo_root):
     assert HEATING[0x2307] != HEATING[0x3307]
     for address, (lo, hi) in HEATING.items():  # dans la plage documentée
         assert WRITABLE[address][0] <= lo < hi <= WRITABLE[address][1]
-
-
-def test_heating_trial_config_valid_and_without_writes(repo_root, tmp_path):
-    result = _run_config(repo_root, tmp_path, example=ESSAI_CHAUFFAGE)
-    out = result.stdout + result.stderr
-    assert result.returncode == 0, out
-    for address in ("0x2306", "0x2307", "0x3306", "0x3307", "0x898", "0x3906"):
-        assert out.count(f"address: {address}\n") == 1, address  # une seule lecture
-    assert "platform: visslink\n    name: Plancher chauffant\n" in out or (
-        "name: Plancher chauffant\n" in out
-    ), out
-    assert out.count("comfort_setpoint_id: m2_comfort_setpoint") == 1, out
-    for name in (
-        "Radiateurs - Consigne confort",
-        "Radiateurs - Consigne réduite",
-        "Plancher - Consigne confort",
-        "Plancher - Consigne réduite",
-    ):
-        assert f"name: {name}\n" in out, name  # noms de production conservés
-        assert f"name: {name} - État modification\n" in out, name
-
-
-def test_heating_trial_only_adds_reads_climate_and_status(repo_root):
-    example = _active_lines((repo_root / EXAMPLE).read_text(encoding="utf-8"))
-    trial = _active_lines((repo_root / ESSAI_CHAUFFAGE).read_text(encoding="utf-8"))
-    removed = [line for line in example.splitlines() if line not in trial.splitlines()]
-    # Bornes des number ramenées dans les limites internes ; rien d'autre.
-    assert removed == ["    max_value: 24"] * 2, removed  # A1 et M2 confort
-    added = [line for line in trial.splitlines() if line not in example.splitlines()]
-    allowed = re.compile(
-        r"^\s*(- platform: visslink|visslink_id: viessmann|climate:|"
-        r"id: (m2_room_temperature|m2_pump|m2_comfort_setpoint|m2_mode|"
-        r"bruleur_actif)|"
-        r'name: "(Plancher chauffant - Température ambiante \(Vitotrol\)|'
-        r"Plancher chauffant - Circulateur|Plancher chauffant|"
-        r"Plancher chauffant - État|"
-        r'(Radiateurs|Plancher) - Consigne (confort|réduite) - État modification)"|'
-        r"address: 0x(0898|3906)|data_type: int16|invalid_values: \[0xFFFF\]|"
-        r"min_value: (14|22|23)|max_value: (22|23)|"
-        r"status:|comfort_setpoint_id: m2_comfort_setpoint|mode_id: m2_mode|"
-        r"current_temperature_id: m2_room_temperature|pump_id: m2_pump|"
-        r"burner_id: bruleur_actif)$"
-    )
-    assert all(allowed.match(line) for line in added), [
-        line for line in added if not allowed.match(line)
-    ]
 
 
 def _climate_transform(**changes):
@@ -1627,7 +1058,7 @@ def test_climate_rejects_wrong_sources(repo_root, tmp_path, old, new, message):
         assert old in text
         return text.replace(old, new, 1)
 
-    result = _run_config(repo_root, tmp_path, transform, example=ESSAI_CHAUFFAGE)
+    result = _run_config(repo_root, tmp_path, transform, example=EXAMPLE)
     out = result.stdout + result.stderr
     assert result.returncode != 0, out
     assert message in out, out
@@ -1645,18 +1076,14 @@ def test_climate_optional_sources(repo_root, tmp_path):
             text = text.replace(line, "", 1)
         return text
 
-    result = _run_config(repo_root, tmp_path, transform, example=ESSAI_CHAUFFAGE)
+    result = _run_config(repo_root, tmp_path, transform, example=EXAMPLE)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-@pytest.mark.parametrize(
-    "example",
-    [ESSAI_CHAUFFAGE, "examples/iot-viessmann-ecritures-autorisees.yaml"],
-)
-def test_climate_m2_state_from_existing_reads(repo_root, tmp_path, example):
+def test_climate_m2_state_from_existing_reads(repo_root, tmp_path):
     """v0.7.3 : état du plancher à partir des lectures existantes (0x3301,
     0x3906, 0x0842), sans lecture supplémentaire."""
-    result = _run_config(repo_root, tmp_path, example=example)
+    result = _run_config(repo_root, tmp_path)
     out = result.stdout + result.stderr
     assert result.returncode == 0, out
     assert "burner_id: bruleur_actif" in out, out
@@ -1677,7 +1104,7 @@ def test_climate_burner_must_be_a_visslink_binary_sensor(repo_root, tmp_path):
             1,
         )
 
-    result = _run_config(repo_root, tmp_path, transform, example=ESSAI_CHAUFFAGE)
+    result = _run_config(repo_root, tmp_path, transform, example=EXAMPLE)
     assert result.returncode != 0, result.stdout + result.stderr
 
 
@@ -1695,68 +1122,13 @@ def test_climate_m2_state_documented(repo_root):
         assert text in doc, text
 
 
-def test_production_has_no_climate(repo_root):
-    """Le climate M2 n'existe que dans la configuration d'essai."""
-    text = _active_lines((repo_root / EXAMPLE).read_text(encoding="utf-8"))
-    assert "\nclimate:" not in text
-    assert "0x0898" not in text
-
-
 # --- v0.7.1 : configuration explicite « toutes écritures autorisées » --------
-
-ECRITURES = "examples/iot-viessmann-ecritures-autorisees.yaml"
-
-
-def test_all_writes_example_valid_with_six_flags_and_seven_days(repo_root, tmp_path):
-    text = _active_lines((repo_root / ECRITURES).read_text(encoding="utf-8"))
-    for flag in WRITE_FLAGS:
-        assert f"{flag}:" not in text, flag  # défaut : true
-    assert "validated_days" not in text  # défaut : les sept jours
-    result = _run_config(repo_root, tmp_path, example=ECRITURES)
-    out = result.stdout + result.stderr
-    assert result.returncode == 0, out
-    for flag in WRITE_FLAGS:
-        assert f"{flag}: true" in out, flag
-    assert "SCHEDULE BLOCK WRITES ENABLED" in out, out
-    assert "HEATING SETPOINT WRITES ENABLED" in out, out
-    for day in SEVEN_DAYS:
-        assert f"  - {day}\n" in out, day
-    # Trois affichages distincts du bouclage, et la pompe lue toutes les 15 s.
-    for name in (
-        "Bouclage ECS — Plage inscrite",
-        "Bouclage ECS — Temps restant",
-        "Bouclage ECS — Restauration en cours",
-        "Bouclage ECS — Pompe (état réel, 0x0846)",
-    ):
-        assert f"name: {name}\n" in out, name
-    assert out.count("address: 0x846\n") == 1, out
-    assert re.search(
-        r"address: 0x846\n(?:    [^\n]*\n)*?    update_interval: 15s\n", out
-    ), out
-
-
-def test_all_writes_example_only_changes_permissions_and_loop_display(repo_root):
-    """Mêmes entités, bornes et limites que l'essai v0.7 : seuls les
-    affichages du bouclage s'ajoutent."""
-    trial = _active_lines((repo_root / ESSAI_CHAUFFAGE).read_text(encoding="utf-8"))
-    full = _active_lines((repo_root / ECRITURES).read_text(encoding="utf-8"))
-    removed = [line for line in trial.splitlines() if line not in full.splitlines()]
-    assert removed == [], removed
-    added = [line for line in full.splitlines() if line not in trial.splitlines()]
-    allowed = re.compile(
-        r"^\s+(- platform: visslink|"
-        r"name: \"Bouclage ECS — (Pompe \(état réel, 0x0846\)|Plage inscrite|"
-        r"Temps restant|Restauration en cours)\"|"
-        r"address: 0x0846|update_interval: 15s|device_class: running|"
-        r"range:|remaining:|restoring:)$"
-    )
-    assert all(allowed.match(line) for line in added), added
 
 
 def test_boost_range_and_remaining_are_optional_display(repo_root, tmp_path):
-    # Production : sans ces entités, valide (test_example_config_is_valid).
-    # Le temps restant est en minutes, la plage un texte.
-    result = _run_config(repo_root, tmp_path, example=ECRITURES)
+    # Le temps restant est en minutes, la plage un texte ; tous deux
+    # facultatifs.
+    result = _run_config(repo_root, tmp_path)
     out = result.stdout + result.stderr
     assert result.returncode == 0, out
     assert re.search(
@@ -1771,7 +1143,6 @@ def test_boost_range_and_remaining_are_optional_display(repo_root, tmp_path):
 
 # --- v0.8 : éditeur des programmations ------------------------------------------
 
-PROGRAMMATIONS = "examples/iot-viessmann-programmations-v0.8.yaml"
 EDITOR_ACTIONS = (
     "visslink_schedule_read",
     "visslink_schedule_set",
@@ -1783,11 +1154,7 @@ EDITOR_ACTIONS = (
 
 
 def test_schedule_editor_example_valid(repo_root, tmp_path):
-    text = _active_lines((repo_root / PROGRAMMATIONS).read_text(encoding="utf-8"))
-    for flag in WRITE_FLAGS:
-        assert f"{flag}:" not in text, flag  # défaut : true, jamais réintroduit
-    assert "validated_days" not in text
-    result = _run_config(repo_root, tmp_path, example=PROGRAMMATIONS)
+    result = _run_config(repo_root, tmp_path)
     out = result.stdout + result.stderr
     assert result.returncode == 0, out
     for action in EDITOR_ACTIONS:
@@ -1798,30 +1165,6 @@ def test_schedule_editor_example_valid(repo_root, tmp_path):
     # Une seule lecture de chaque programmation (aucune lecture en plus).
     for address in ("0x2000", "0x3000", "0x2100", "0x2200"):
         assert out.count(f"address: {address}\n") == 1, address
-    assert "SCHEDULE BLOCK WRITES ENABLED" in out
-
-
-def test_schedule_editor_example_only_adds_the_editor(repo_root):
-    """Base : l'exemple « toutes écritures autorisées » ; seuls l'éditeur, ses
-    actions et les identifiants des programmations sont ajoutés."""
-    base = _active_lines((repo_root / ECRITURES).read_text(encoding="utf-8"))
-    new = _active_lines((repo_root / PROGRAMMATIONS).read_text(encoding="utf-8"))
-    removed = [line for line in base.splitlines() if line not in new.splitlines()]
-    assert removed == ["    components: [visslink, visslink_boost]"], removed
-    added = [line for line in new.splitlines() if line not in base.splitlines()]
-    allowed = re.compile(
-        r"^\s*(components: \[visslink, visslink_boost, visslink_schedule_editor\]|"
-        r"actions:|- action: visslink_schedule_[a-z]+|variables:|"
-        r"(circuit|days|ranges|expected): string|source: int|then:|- api\.respond:|"
-        r"data: !lambda .*|success: !lambda .*|error_message: !lambda .*|"
-        r"id: programmation_(a1|m2|ecs|bouclage)|visslink_schedule_editor:|"
-        r"id: programmations|visslink_id: viessmann|schedules:|"
-        r"- programmation_(a1|m2|ecs|bouclage)|status:|"
-        r'name: "Programmations - État de l\'édition")$'
-    )
-    assert all(allowed.match(line) for line in added), [
-        line for line in added if not allowed.match(line)
-    ]
 
 
 @pytest.mark.parametrize(
@@ -1848,7 +1191,7 @@ def test_schedule_editor_example_only_adds_the_editor(repo_root):
 def test_schedule_editor_rejects_wrong_schedules(
     repo_root, tmp_path, transform, message
 ):
-    result = _run_config(repo_root, tmp_path, transform, example=PROGRAMMATIONS)
+    result = _run_config(repo_root, tmp_path, transform)
     out = result.stdout + result.stderr
     assert result.returncode != 0, out
     assert message in out, out
@@ -1876,34 +1219,19 @@ def test_schedule_editor_circuits_match_cpp(repo_root):
 
 
 def test_schedule_editor_has_no_permission_options(repo_root):
-    """Autorisé par défaut depuis la v0.7.2 : aucune option enable_* ni
-    validated_days dans le composant de l'éditeur."""
+    """v1.0.0 : aucune option d'autorisation dans le composant de l'éditeur."""
     init = (repo_root / "components/visslink_schedule_editor/__init__.py").read_text(
         encoding="utf-8"
     )
-    assert "cv.Optional(CONF_ENABLE" not in init
-    assert "validated_days" not in init.split('"""', 2)[2]
-
-
-def test_production_example_unchanged_by_the_editor(repo_root):
-    text = _active_lines((repo_root / EXAMPLE).read_text(encoding="utf-8"))
-    assert "visslink_schedule_editor" not in text
-    assert "actions:" not in text
+    assert "enable_" not in init.lower()
+    assert "validated_days" not in init
 
 
 # --- v0.8.1 : diagnostics et cycles du brûleur -----------------------------------
 
-DIAGNOSTICS = "examples/iot-viessmann-diagnostics-v0.8.1.yaml"
 
-
-def test_diagnostics_example_valid_without_extra_burner_reads(repo_root, tmp_path):
-    text = (repo_root / DIAGNOSTICS).read_text(encoding="utf-8")
-    assert "A38F" not in text.upper()  # puissance brute : toujours FF FF
-    active = _active_lines(text)
-    for flag in WRITE_FLAGS:
-        assert f"{flag}:" not in active, flag
-    assert "validated_days" not in active
-    result = _run_config(repo_root, tmp_path, example=DIAGNOSTICS)
+def test_example_burner_cycles_without_extra_reads(repo_root, tmp_path):
+    result = _run_config(repo_root, tmp_path)
     out = result.stdout + result.stderr
     assert result.returncode == 0, out
     # Registres réutilisés : chacun lu une seule fois, par son entité.
@@ -1929,38 +1257,12 @@ def test_diagnostics_example_valid_without_extra_burner_reads(repo_root, tmp_pat
         assert f"name: {name}\n" in out, name
 
 
-def test_diagnostics_example_only_adds_diagnostics(repo_root):
-    """Base : l'exemple v0.8 ; seuls les diagnostics v0.8.1 sont ajoutés."""
-    base = _active_lines((repo_root / PROGRAMMATIONS).read_text(encoding="utf-8"))
-    new = _active_lines((repo_root / DIAGNOSTICS).read_text(encoding="utf-8"))
-    removed = [line for line in base.splitlines() if line not in new.splitlines()]
-    assert removed == [
-        "    components: [visslink, visslink_boost, visslink_schedule_editor]"
-    ], removed
-    added = [line for line in new.splitlines() if line not in base.splitlines()]
-    allowed = re.compile(
-        r"^\s*(components: \[visslink, visslink_boost, visslink_schedule_editor, "
-        r"visslink_burner\]|"
-        r"id: (temperature_chaudiere|demarrages_bruleur|fonctionnement_bruleur)|"
-        r"- platform: (visslink|wifi_signal|uptime|wifi_info)|"
-        r'name: "(Consigne chaudière calculée|VissLink - [^"]+|Brûleur - [^"]+)"|'
-        r"address: 0x5502|update_interval: (2min|60s)|entity_category: diagnostic|"
-        r"(ip_address|ssid):|visslink_burner:|"
-        r"(burner|starts|runtime|boiler_temperature)_id: [a-z_]+|"
-        r"(starts_24h|starts_per_hour|average_runtime|last_cycle|last_stop|"
-        r"start_temperature|stop_temperature|status):)$"
-    )
-    assert all(allowed.match(line) for line in added), [
-        line for line in added if not allowed.match(line)
-    ]
-
-
 @pytest.mark.parametrize(
     "transform, message",
     [
         (
             lambda t: t.replace(
-                "  burner_id: bruleur_actif\n", "  burner_id: m2_pump\n"
+                "\n  burner_id: bruleur_actif\n", "\n  burner_id: m2_pump\n"
             ),
             "burner_id must be the visslink binary_sensor of the burner (0x0842)",
         ),
@@ -1989,7 +1291,9 @@ def test_diagnostics_example_only_adds_diagnostics(repo_root):
     ],
 )
 def test_burner_cycles_rejects_wrong_sources(repo_root, tmp_path, transform, message):
-    result = _run_config(repo_root, tmp_path, transform, example=DIAGNOSTICS)
+    text = (repo_root / EXAMPLE).read_text(encoding="utf-8")
+    assert transform(text) != text
+    result = _run_config(repo_root, tmp_path, transform)
     out = result.stdout + result.stderr
     assert result.returncode != 0, out
     assert message in out, out
@@ -2015,14 +1319,6 @@ def test_burner_cycles_reads_nothing(repo_root):
         assert forbidden not in src, forbidden
 
 
-def test_setpoint_status_never_starts_unknown(repo_root):
-    header = (repo_root / "components/visslink/dhw_setpoint.h").read_text(
-        encoding="utf-8"
-    )
-    assert 'this->status_ = VL_TEXT("Aucune modification effectuée");' in header
-    assert "uint32_t version_{1};" in header
-
-
 def test_boost_duration_select_goes_through_the_component(repo_root):
     """v0.8.1 : le choix de durée passe par le composant (raccourcie, ou
     refusée et ramenée à la durée en cours pendant une opération)."""
@@ -2038,39 +1334,9 @@ def test_boost_duration_select_goes_through_the_component(repo_root):
     assert "this->sequencer_.change_duration(minutes, now)" in cpp
 
 
-# --- v0.9 : Éco et Party (lecture et validation, aucune commande) ----------------
+# --- Éco et Party ----------------------------------------------------------------
 
-ECO_PARTY_V09 = "examples/iot-viessmann-eco-party-v0.9.yaml"
 PARTY_SETPOINTS = (0x2308, 0x3308)
-
-
-def test_eco_party_v09_example_reads_without_commands(repo_root, tmp_path):
-    result = _run_config(repo_root, tmp_path, example=ECO_PARTY_V09)
-    out = result.stdout + result.stderr
-    assert result.returncode == 0, out
-    for address in ("0x2302", "0x2303", "0x3302", "0x3303", "0x2308", "0x3308"):
-        assert out.count(f"address: {address}\n") == 1, address
-    assert "name: Radiateurs - Consigne Party (lecture)" in out
-    assert "name: Plancher chauffant - Consigne Party (lecture)" in out
-    # Climate M2 inchangé : HEAT/OFF, sans preset Éco ni Party.
-    assert "preset" not in out.lower()
-
-
-def test_eco_party_v09_example_only_adds_party_setpoint_reads(repo_root):
-    base = _active_lines((repo_root / DIAGNOSTICS).read_text(encoding="utf-8"))
-    new = _active_lines((repo_root / ECO_PARTY_V09).read_text(encoding="utf-8"))
-    assert [line for line in base.splitlines() if line not in new.splitlines()] == []
-    added = [line for line in new.splitlines() if line not in base.splitlines()]
-    allowed = re.compile(
-        r"^\s*(- platform: visslink|visslink_id: viessmann|"
-        r'name: "(Radiateurs|Plancher chauffant) - Consigne Party \(lecture\)"|'
-        r"address: 0x(2308|3308)|data_type: uint8|update_interval: 5min|"
-        r'unit_of_measurement: "°C"|device_class: temperature|'
-        r"accuracy_decimals: 0)$"
-    )
-    assert all(allowed.match(line) for line in added), [
-        line for line in added if not allowed.match(line)
-    ]
 
 
 @pytest.mark.parametrize("address", PARTY_SETPOINTS)
@@ -2088,8 +1354,7 @@ def test_party_setpoints_never_operating_modes(repo_root, tmp_path, address):
 
 
 def test_climate_has_no_eco_party_preset(repo_root):
-    """Presets Éco/Party seulement après confirmation des commandes Optolink
-    sur la KW3 (docs/eco-party-v0.9.md) : aucun aujourd'hui."""
+    """Climate M2 conservé tel quel : HEAT/OFF, sans preset Éco/Party."""
     for path in (
         "components/visslink/climate.py",
         "components/visslink/visslink.cpp",
@@ -2129,9 +1394,8 @@ def test_eco_party_registers_absent_from_other_cpp_whitelists(repo_root):
             assert address.upper() not in body, (table, address)
 
 
-# --- v0.9.1 : pilotage Éco / Party ---------------------------------------------
+# --- Pilotage Éco / Party -------------------------------------------------------
 
-ECO_PARTY_V091 = "examples/iot-viessmann-eco-party-v0.9.1.yaml"
 ECO_PARTY_FLAGS = {
     0x2302: ("A1", "Eco"),
     0x2303: ("A1", "Party"),
@@ -2151,68 +1415,12 @@ def _switch(address, extra=""):
     )
 
 
-def _without_v091_switches(text):
-    """Exemple v0.9.1 sans sa section switch (pour en injecter une autre)."""
-    head, _, rest = text.partition("\nswitch:\n")
-    return head + "\nnumber:\n" + rest.partition("\nnumber:\n")[2]
-
-
-def test_eco_party_v091_example_valid_step1(repo_root, tmp_path):
-    result = _run_config(repo_root, tmp_path, example=ECO_PARTY_V091)
-    out = result.stdout + result.stderr
-    assert result.returncode == 0, out
-    # Chaque registre une seule fois, toutes plateformes confondues.
-    for address in ("0x2302", "0x2303", "0x3302", "0x3303", "0x2308", "0x3308"):
-        assert out.count(f"address: {address}\n") == 1, address
-    switches = out.partition("\nswitch:\n")[2].partition("\nnumber:\n")[0]
-    entries = (
-        switches.split("\n- ")
-        if switches.startswith("- ")
-        else switches.split("\n  - ")
-    )
-    for address in ECO_PARTY_FLAGS:
-        entry = [e for e in entries if f"address: 0x{address:X}\n" in e]
-        assert len(entry) == 1, hex(address)
-        assert "restore_mode: DISABLED" in entry[0], hex(address)
-        assert "allow_write: false" in entry[0], hex(address)
-        assert "update_interval: 60s" in entry[0], hex(address)
-    # Étape 1 : seule la consigne Party A1 est inscriptible.
-    text = _active_lines((repo_root / ECO_PARTY_V091).read_text(encoding="utf-8"))
-    assert text.count("allow_write: true") == 1
-    assert text.count("allow_write: false") == 5
-    block = text.partition("address: 0x2308")[2].partition("- platform")[0]
-    assert "allow_write: true" in block
-    # Ni les autorisations générales, ni preset, ni validated_days.
-    for flag in WRITE_FLAGS:
-        assert f"{flag}:" not in text, flag
-    assert "validated_days" not in text
-    assert "preset" not in out.lower()
-
-
-def test_eco_party_v091_example_only_changes_eco_party_entities(repo_root):
-    """Par rapport à la v0.9 : seules les entités Éco/Party changent de
-    plateforme (binary_sensor -> switch, sensor -> number)."""
-    base = _active_lines((repo_root / ECO_PARTY_V09).read_text(encoding="utf-8"))
-    new = _active_lines((repo_root / ECO_PARTY_V091).read_text(encoding="utf-8"))
-    removed = [line for line in base.splitlines() if line not in new.splitlines()]
-    allowed_removed = re.compile(
-        r'^\s*name: "(Radiateurs|Plancher chauffant) - Consigne Party \(lecture\)"$'
-        r"|^\s*(data_type: uint8|device_class: temperature|accuracy_decimals: 0)$"
-    )
-    assert all(allowed_removed.match(line) for line in removed), removed
-    added = [line for line in new.splitlines() if line not in base.splitlines()]
-    allowed_added = re.compile(
-        r"^(switch:|\s*(- platform: visslink|visslink_id: viessmann|"
-        r'name: "(Radiateurs|Plancher|Plancher chauffant) - (Consigne Party|Éco|Party)'
-        r'( - État (modification|commande))?"|'
-        r"address: 0x(2302|2303|3302|3303|2308|3308)|"
-        r"min_value: 16|max_value: (22|23)|step: 1|update_interval: (60s|5min)|"
-        r'unit_of_measurement: "°C"|mode: box|icon: mdi:(leaf|party-popper)|'
-        r"allow_write: (true|false)( +#.*)?|status:))$"
-    )
-    assert all(allowed_added.match(line) for line in added), [
-        line for line in added if not allowed_added.match(line)
-    ]
+def _with_switch(text, block):
+    """Remplace la section switch de l'exemple par `block`."""
+    head, sep, rest = text.partition("\nswitch:\n")
+    assert sep
+    tail = rest[rest.index("\n# --- ") :]
+    return head + block + tail
 
 
 @pytest.mark.parametrize("address", sorted(ECO_PARTY_FLAGS))
@@ -2220,13 +1428,11 @@ def test_eco_party_switch_accepted_only_on_the_four_commands(
     repo_root, tmp_path, address
 ):
     def transform(text):
-        text = _without_v091_switches(text)
-        return text + _switch(address)
+        return _with_switch(text, _switch(address))
 
-    result = _run_config(repo_root, tmp_path, transform, example=ECO_PARTY_V091)
+    result = _run_config(repo_root, tmp_path, transform)
     out = result.stdout + result.stderr
     assert result.returncode == 0, out
-    assert "allow_write: true" in out  # défaut : inscriptible
     assert "restore_mode: DISABLED" in out
 
 
@@ -2235,9 +1441,9 @@ def test_eco_party_switch_accepted_only_on_the_four_commands(
 )
 def test_eco_party_switch_rejects_other_registers(repo_root, tmp_path, address):
     def transform(text):
-        return _without_v091_switches(text) + _switch(address)
+        return _with_switch(text, _switch(address))
 
-    result = _run_config(repo_root, tmp_path, transform, example=ECO_PARTY_V091)
+    result = _run_config(repo_root, tmp_path, transform)
     out = result.stdout + result.stderr
     assert result.returncode != 0, hex(address)
     assert "is not an Eco/Party command" in out, out
@@ -2253,9 +1459,9 @@ def test_eco_party_switch_rejects_other_registers(repo_root, tmp_path, address):
 )
 def test_eco_party_switch_never_commands_at_boot(repo_root, tmp_path, extra, expected):
     def transform(text):
-        return _without_v091_switches(text) + _switch(0x2303, extra)
+        return _with_switch(text, _switch(0x2303, extra))
 
-    result = _run_config(repo_root, tmp_path, transform, example=ECO_PARTY_V091)
+    result = _run_config(repo_root, tmp_path, transform)
     out = result.stdout + result.stderr
     assert result.returncode != 0, extra
     assert expected in out, out
@@ -2275,24 +1481,10 @@ def test_eco_party_switch_and_binary_sensor_cannot_share_an_address(
             1,
         )
 
-    result = _run_config(repo_root, tmp_path, transform, example=ECO_PARTY_V091)
+    result = _run_config(repo_root, tmp_path, transform)
     out = result.stdout + result.stderr
     assert result.returncode != 0
     assert "declared by several visslink entities" in out, out
-
-
-def test_allow_write_only_for_party_setpoints(repo_root, tmp_path):
-    result = _run_config(
-        repo_root,
-        tmp_path,
-        lambda s: s.replace(
-            "    address: 0x2306\n", "    address: 0x2306\n    allow_write: false\n", 1
-        ),
-        example=ECO_PARTY_V091,
-    )
-    out = result.stdout + result.stderr
-    assert result.returncode != 0
-    assert "allow_write is only available for the Party setpoints" in out, out
 
 
 def test_python_and_cpp_eco_party_tables_match(repo_root):
@@ -2356,7 +1548,7 @@ def test_party_setpoint_number_bounds(repo_root, tmp_path, address):
             1,
         )
 
-    result = _run_config(repo_root, tmp_path, transform, example=ECO_PARTY_V091)
+    result = _run_config(repo_root, tmp_path, transform)
     out = result.stdout + result.stderr
     assert result.returncode != 0
     assert "min_value must be at least 3" in out, out
@@ -2377,3 +1569,232 @@ def test_eco_party_v091_cpp_never_writes_comfort_reduced_or_at_boot(repo_root):
     eco = (repo_root / "components/visslink/eco_party.h").read_text(encoding="utf-8")
     for address in ("0x2306", "0x2307", "0x3306", "0x3307"):
         assert address not in eco
+
+
+# --- v1.0.0 : configuration définitive ----------------------------------------
+
+V1_NAMES = {
+    "Bouclage ECS - Pompe bouclage": 0x0846,
+    "Radiateurs - Éco": 0x2302,
+    "Radiateurs - Party": 0x2303,
+    "Radiateurs - Consigne Party": 0x2308,
+    "Plancher chauffant - Éco": 0x3302,
+    "Plancher chauffant - Party": 0x3303,
+    "Plancher chauffant - Consigne Party": 0x3308,
+}
+HEATING_CURVES = (0x2304, 0x2305, 0x3304, 0x3305)
+
+
+def _section(out, name):
+    """Section de premier niveau de la sortie de `esphome config`."""
+    body = out.partition(f"\n{name}:\n")[2]
+    match = re.search(r"\n[a-z_]+:", body)
+    return body[: match.start()] if match else body
+
+
+def _entries(section):
+    """Entrées `- ...` d'une section de la sortie de `esphome config`."""
+    return [e for e in re.split(r"\n(?=  - )", section) if e.strip()]
+
+
+def test_v1_example_valid_and_each_address_once(repo_root, tmp_path):
+    result = _run_config(repo_root, tmp_path)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "Configuration is valid" in out
+    addresses = re.findall(r"^    address: (0x[0-9A-Fa-f]+)$", out, re.MULTILINE)
+    assert addresses, out
+    assert len(addresses) == len(set(addresses)), sorted(addresses)
+
+
+def test_v1_example_has_no_authorization_option(repo_root):
+    """Ni dans les entités actives ni dans les commentaires."""
+    text = (repo_root / EXAMPLE).read_text(encoding="utf-8")
+    for option in REMOVED_OPTIONS:
+        assert option not in text, option
+    assert "enable_" not in text
+    assert "allow_party_write" not in text
+    # Capteurs expérimentaux abandonnés : aucun, même commenté.
+    for address in ("A38F", "0x2544", "0x3544", "0x0845", "0x0883", "0x2906"):
+        assert address.upper() not in text.upper(), address
+    assert not re.search(r"^\s*# - platform", text, re.MULTILINE)
+
+
+def test_v1_example_references_the_release(repo_root):
+    text = (repo_root / EXAMPLE).read_text(encoding="utf-8")
+    sources = re.findall(r"- source: (\S+)", text)
+    assert sources == [GITHUB_SOURCE], sources
+    assert (
+        "components: [visslink, visslink_boost, visslink_schedule_editor, "
+        "visslink_burner]" in text
+    )
+
+
+@pytest.mark.parametrize(
+    "case, transform",
+    [
+        (
+            "enable_writes",
+            lambda s: s.replace(
+                "  max_retries: 2", "  max_retries: 2\n  enable_writes: true", 1
+            ),
+        ),
+        (
+            "enable_schedule_writes",
+            lambda s: s.replace(
+                "  max_retries: 2",
+                "  max_retries: 2\n  enable_schedule_writes: true",
+                1,
+            ),
+        ),
+        (
+            "validated_days",
+            lambda s: s.replace(
+                "\n  time_id: ha_time\n",
+                "\n  time_id: ha_time\n  validated_days: [monday]\n",
+                1,
+            ),
+        ),
+        (
+            "allow_write_number",
+            lambda s: s.replace(
+                "    address: 0x2308\n",
+                "    address: 0x2308\n    allow_write: true\n",
+                1,
+            ),
+        ),
+        (
+            "allow_write_switch",
+            lambda s: s.replace(
+                "    address: 0x2303\n",
+                "    address: 0x2303\n    allow_write: true\n",
+                1,
+            ),
+        ),
+        (
+            "status_on_number",
+            lambda s: s.replace(
+                "    address: 0x2306\n",
+                '    address: 0x2306\n    status:\n      name: "État"\n',
+                1,
+            ),
+        ),
+        (
+            "status_on_switch",
+            lambda s: s.replace(
+                "    address: 0x2302\n",
+                '    address: 0x2302\n    status:\n      name: "État"\n',
+                1,
+            ),
+        ),
+    ],
+)
+def test_v1_removed_options_are_rejected(repo_root, tmp_path, case, transform):
+    text = (repo_root / EXAMPLE).read_text(encoding="utf-8")
+    assert transform(text) != text, case
+    result = _run_config(repo_root, tmp_path, transform)
+    assert result.returncode != 0, f"{case} should be rejected"
+
+
+def test_v1_no_diagnostic_entities(repo_root, tmp_path):
+    """Les entités VissLink, le réseau et l'uptime sont dans « Capteurs » ;
+    seul le bouton « Oublier la sauvegarde » reste en « Configuration »."""
+    result = _run_config(repo_root, tmp_path)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "entity_category: diagnostic" not in out, out
+    assert out.count("entity_category: config") == 1, out
+    forget = out.partition("  forget:\n")[2].partition("\n  ")[0]
+    assert "Oublier la sauvegarde" in forget
+    for name in (
+        "VissLink - Signal Wi-Fi",
+        "VissLink - Uptime",
+        "VissLink - Adresse IP",
+        "VissLink - Réseau Wi-Fi",
+    ):
+        entry = out.partition(f"name: {name}\n")[2][:400]
+        assert "entity_category: ''" in entry, name
+
+
+def test_v1_required_names_and_party_sliders(repo_root, tmp_path):
+    result = _run_config(repo_root, tmp_path)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    for name, address in V1_NAMES.items():
+        match = re.search(
+            rf"name: {re.escape(name)}\n(?:    [^\n]*\n)*?    address: 0x{address:X}\n",
+            out,
+        )
+        assert match, name
+    numbers = _entries(_section(out, "number"))
+    party = {}
+    for entry in numbers:
+        address = re.search(r"address: (0x[0-9A-Fa-f]+)", entry)
+        if address and int(address.group(1), 16) in (0x2308, 0x3308):
+            party[int(address.group(1), 16)] = entry
+    assert set(party) == {0x2308, 0x3308}
+    for address, (lo, hi) in {0x2308: (16, 23), 0x3308: (16, 22)}.items():
+        entry = party[address]
+        assert "mode: SLIDER" in entry, entry
+        assert f"min_value: {lo}\n" in entry and f"max_value: {hi}\n" in entry, entry
+    switches = _entries(_section(out, "switch"))
+    assert len(switches) == 4, switches
+    for entry in switches:
+        assert "restore_mode: DISABLED" in entry, entry
+
+
+def test_v1_example_contents(repo_root, tmp_path):
+    result = _run_config(repo_root, tmp_path)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "  name: iot-viessmann\n" in out
+    uart = _section(out, "uart")
+    for line in ("baud_rate: 4800", "parity: EVEN", "stop_bits: 2", "data_bits: 8"):
+        assert line in uart, line
+    for component in (
+        "visslink",
+        "visslink_boost",
+        "visslink_schedule_editor",
+        "visslink_burner",
+        "climate",
+    ):
+        assert f"\n{component}:\n" in out, component
+    for action in EDITOR_ACTIONS:
+        assert f"action: {action}\n" in out, action
+    # Courbes de chauffe : lecture seule (sensor), jamais une commande.
+    sensors = _section(out, "sensor")
+    for address in HEATING_CURVES:
+        assert f"    address: 0x{address:X}\n" in sensors, hex(address)
+        for section in ("number", "select", "switch"):
+            assert f"address: 0x{address:X}\n" not in _section(out, section)
+
+
+def test_v1_no_authorization_code_left(repo_root):
+    forbidden = (
+        "enable_writes",
+        "enable_mode_writes",
+        "enable_m2_mode_write",
+        "enable_schedule_writes",
+        "enable_dhw_setpoint_write",
+        "enable_heating_setpoint_writes",
+        "allow_write",
+        "allow_party_write",
+        "validated_days",
+        "Permission",
+        "writes_enabled",
+        "schedule_writes_enabled",
+    )
+    paths = [
+        p
+        for p in sorted((repo_root / "components").rglob("*"))
+        if p.suffix in (".py", ".h", ".cpp") and "__pycache__" not in p.parts
+    ] + [
+        p
+        for p in sorted((repo_root / "lovelace").rglob("*"))
+        if p.suffix in (".js", ".html")
+    ]
+    assert paths
+    for path in paths:
+        text = path.read_text(encoding="utf-8")
+        for word in forbidden:
+            assert word not in text, f"{path.relative_to(repo_root)}: {word}"

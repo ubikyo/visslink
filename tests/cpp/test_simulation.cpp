@@ -70,9 +70,6 @@ struct Bench {
   uint32_t stagger_ms{2000};  ///< VissLinkComponent::STARTUP_STAGGER_MS
 
   // v0.3 : écritures (même logique que VissLinkComponent).
-  bool enable_writes{false};
-  bool enable_mode_writes{false};
-  bool enable_m2_mode_write{false};
   // v0.4.1 (false = comportement v0.4, pour comparaison) :
   bool preempt_unsent_reads{true};  ///< une commande prend la place d'une lecture pas encore émise
   bool strict_read_back{true};      ///< aucune lecture ordinaire pendant les relectures
@@ -81,7 +78,6 @@ struct Bench {
   std::vector<WriteTiming> timings;
 
   // v0.5 : blocs horaires du bouclage (même logique que VissLinkComponent).
-  bool enable_schedule_writes{false};
   struct DirectRead {
     bool pending{false}, in_flight{false};
     uint16_t address{0};
@@ -109,7 +105,6 @@ struct Bench {
   std::vector<KwResult> block_write_results;
   int block_refused_at_send{0};
 
-  bool schedule_writes_enabled() const { return enable_writes && enable_schedule_writes; }
   bool writes_idle() const { return writes.pending_count() == 0 && !writes.active(); }
   static bool is_block_owner(int owner) { return BlockClients::is_block_owner(owner); }
   bool block_write_allowed(uint16_t address, const uint8_t *data, int owner = WriteArbiter::BOOST_OWNER) const {
@@ -120,7 +115,7 @@ struct Bench {
     const bool expected = owner == WriteArbiter::BOOST_OWNER
                               ? (expects_block_write && expects_block_write(address, data))
                               : (editor != nullptr && editor->expects_block_write(address, data));
-    return schedule_writes_enabled() && whitelisted &&
+    return whitelisted &&
            decode_schedule_slots(data, SCHEDULE_BLOCK_LENGTH, &slots) == ScheduleError::NONE &&
            !locked_by_other(owner, address) && expected;
   }
@@ -196,21 +191,13 @@ struct Bench {
 
   // v0.6/v0.7 : consignes ECS et chauffage, une transaction par registre
   // (même logique que VissLinkComponent::SetpointChannel).
-  bool enable_dhw_setpoint_write{false};
-  bool enable_heating_setpoint_writes{false};
   SetpointWriter dhw;                    ///< consigne ECS (0x6300)
   int dhw_owner{WriteArbiter::NONE};
   std::map<size_t, SetpointWriter> heat;  ///< consignes de chauffage (v0.9.1 : et Party), par index
-  // v0.9.1 : allow_write des consignes Party et des commandes Éco/Party
-  // (VissLinkComponent::SetpointChannel / FlagChannel).
-  std::map<size_t, bool> allow;
+  // v0.9.1 : commandes Éco/Party (VissLinkComponent::FlagChannel).
   std::map<size_t, FlagWriter> flags;  ///< commandes Éco/Party, par index
   std::map<size_t, int> flag_state;    ///< état publié du switch (0/1, -1 = aucun)
   std::vector<DhwAction> flag_actions;
-  bool allowed(size_t index) const {
-    auto it = allow.find(index);
-    return it != allow.end() && it->second;
-  }
   FlagWriter *flag_for(int index) {
     if (index == WriteArbiter::NONE)
       return nullptr;
@@ -244,8 +231,6 @@ struct Bench {
     if (w == nullptr)
       return "not a flag";
     FlagContext ctx;
-    ctx.enable_writes = enable_writes;
-    ctx.allow_write = allowed(index);
     ctx.link_ok = link_ok;
     auto st = flag_state.find(index);
     ctx.has_value = st != flag_state.end() && st->second >= 0;
@@ -275,19 +260,6 @@ struct Bench {
       return &dhw;
     auto it = heat.find(static_cast<size_t>(index));
     return it == heat.end() ? nullptr : &it->second;
-  }
-  /// VissLinkComponent::setpoint_permitted_.
-  bool setpoint_permitted(uint16_t address) const {
-    if (is_party_setpoint_write_whitelisted(address)) {
-      for (const auto &kv : heat) {
-        if (kv.second.address() == address)
-          return eco_party_write_permitted(address, enable_writes, allowed(kv.first)) == EcoPartyPermission::OK;
-      }
-      return false;
-    }
-    if (is_dhw_setpoint_write_whitelisted(address))
-      return dhw_write_permitted(address, enable_writes, enable_dhw_setpoint_write) == DhwPermission::OK;
-    return heating_write_permitted(address, enable_writes, enable_heating_setpoint_writes) == HeatingPermission::OK;
   }
   /// VissLinkComponent::deferred_setpoints_.
   OwnerSet deferred_setpoints() const {
@@ -408,21 +380,17 @@ struct Bench {
       dhw_owner = static_cast<int>(regs.size() - 1);
     else if (is_heating_setpoint_write_whitelisted(address) || is_party_setpoint_write_whitelisted(address))
       heat.emplace(regs.size() - 1, SetpointWriter(address));
-    if (is_party_setpoint_write_whitelisted(address))
-      allow[regs.size() - 1] = true;  // allow_write par défaut
     return regs.size() - 1;
   }
   /// v0.9.1 : switch Éco/Party (VissLinkComponent::add_flag_switch).
-  size_t add_flag(uint16_t address, uint32_t interval_ms, uint32_t now, bool allow_write = true) {
+  size_t add_flag(uint16_t address, uint32_t interval_ms, uint32_t now) {
     Reg r{address, DataType::UINT8, false, 1};
     r.flag = true;
     regs.push_back(r);
     params.push_back({interval_ms, 1});
     scheduler.add(interval_ms, now + stagger_ms * (regs.size() - 1));
-    if (is_eco_party_flag_whitelisted(address)) {
+    if (is_eco_party_flag_whitelisted(address))
       flags.emplace(regs.size() - 1, FlagWriter(address));
-      allow[regs.size() - 1] = allow_write;
-    }
     return regs.size() - 1;
   }
   size_t add_mode(uint16_t address, uint32_t interval_ms, uint32_t now) {
@@ -463,18 +431,8 @@ struct Bench {
     bool busy = false;
     for (size_t i = 0; i < regs.size(); i++)
       busy |= regs[i].mode && writes.has_request(static_cast<int>(i));
-    switch (mode_write_permitted(r.address, enable_writes, enable_mode_writes, enable_m2_mode_write)) {
-      case ModePermission::OK:
-        break;
-      case ModePermission::WRITES_DISABLED:
-        return "disabled";
-      case ModePermission::MODE_WRITES_DISABLED:
-        return "mode disabled";
-      case ModePermission::M2_WRITE_DISABLED:
-        return "m2 disabled";
-      case ModePermission::NOT_WHITELISTED:
-        return "read-only";
-    }
+    if (!is_mode_write_whitelisted(r.address))
+      return "read-only";
     if (option >= OPERATING_MODE_COUNT)
       return write_check_to_string(WriteCheck::VALUE_NOT_ALLOWED);
     if (check_mode_write(r.address, 1, value) != WriteCheck::OK)
@@ -515,10 +473,6 @@ struct Bench {
     if (SetpointWriter *w = writer_for(static_cast<int>(index))) {
       // VissLinkComponent::submit_setpoint_ (v0.6/v0.7).
       DhwContext ctx;
-      ctx.enable_writes = enable_writes;
-      ctx.enable_dhw_setpoint_write = enable_dhw_setpoint_write;
-      ctx.enable_heating_setpoint_writes = enable_heating_setpoint_writes;
-      ctx.allow_party_write = allowed(index);
       ctx.link_ok = link_ok;
       ctx.has_value = has_read_value(index);
       ctx.config_min = r.min;
@@ -544,8 +498,6 @@ struct Bench {
     }
     uint8_t byte = 0;
     const WriteCheck check = check_write_value(r.address, 1, value, r.min, r.max, &byte);
-    if (!enable_writes)
-      return "disabled";
     if (check != WriteCheck::OK)
       return write_check_to_string(check);
     if (!has_read_value(index))
@@ -566,7 +518,7 @@ struct Bench {
   }
   /// Redémarrage de l'ESP : tout l'état en RAM est perdu (protocole,
   /// ordonnanceur, demandes d'écriture, états publiés). La configuration
-  /// (registres, enable_writes) est inchangée ; la chaudière et la ligne aussi.
+  /// (registres) est inchangée ; la chaudière et la ligne aussi.
   void reboot(uint32_t now) {
     kw = KwProtocol();
     const uint32_t delay = scheduler.block_delay();
@@ -795,7 +747,7 @@ struct Bench {
     const bool direct_ready = direct.pending && !direct.in_flight && time_reached(now, direct.due_ms);
     if (preempt_unsent_reads && !write_in_flight && !direct.in_flight && kw.is_waiting_sync() &&
         scheduler.current() != RegisterScheduler::NONE && scheduler.entry(scheduler.current()).urgent != RegisterScheduler::URGENT_VERIFY &&
-        ((enable_writes && writes.ready(now, link_ok, deferred_setpoints())) || direct_ready) && kw.cancel_before_send()) {
+        (writes.ready(now, link_ok, deferred_setpoints()) || direct_ready) && kw.cancel_before_send()) {
       scheduler.release();
       preemptions++;
     }
@@ -811,7 +763,7 @@ struct Bench {
           notify_block_write(w.owner, w.address, false, false, now);
       }
       bool started = false;
-      if (enable_writes && writes.next(now, link_ok, &w, deferred_setpoints())) {
+      if (writes.next(now, link_ok, &w, deferred_setpoints())) {
         if (is_block_owner(w.owner)) {
           // VissLinkComponent::start_write_, bloc horaire : contrôles revérifiés.
           if (w.length == 8 && block_write_allowed(w.address, w.data, w.owner) &&
@@ -830,20 +782,15 @@ struct Bench {
           uint8_t encoded = 0;
           SetpointWriter *sw = writer_for(w.owner);
           const bool setpoint_ok = find_writable(w.address) == nullptr ||
-                                   (sw != nullptr && sw->address() == w.address && setpoint_permitted(w.address) &&
-                                    sw->expects_write(w.value));
+                                   (sw != nullptr && sw->address() == w.address && sw->expects_write(w.value));
           const bool number_ok = r.number && find_writable(w.address) != nullptr && setpoint_ok &&
                                  check_write_value(w.address, 1, w.value, r.min, r.max, &encoded) == WriteCheck::OK &&
                                  encoded == w.value;
           const bool mode_ok =
-              r.mode && is_mode_register(w.address) && check_mode_write(w.address, 1, w.value) == WriteCheck::OK &&
-              mode_write_permitted(w.address, enable_writes, enable_mode_writes, enable_m2_mode_write) ==
-                  ModePermission::OK;
+              r.mode && is_mode_register(w.address) && check_mode_write(w.address, 1, w.value) == WriteCheck::OK;
           // v0.9.1 : commande Éco/Party (VissLinkComponent::start_write_).
           FlagWriter *fw = flag_for(w.owner);
           const bool flag_ok = r.flag && fw != nullptr && fw->address() == w.address &&
-                               eco_party_write_permitted(w.address, enable_writes, allowed(w.owner)) ==
-                                   EcoPartyPermission::OK &&
                                fw->expects_write(w.value) && check_flag_write(w.address, 1, w.value) == WriteCheck::OK;
           const bool allowed_now =
               r.address == w.address && is_write_whitelisted(w.address) && (number_ok || mode_ok || flag_ok);
@@ -1571,15 +1518,12 @@ TEST(sim_v022_diagnostic_groups_of_two_at_4s) {
 namespace {
 
 /// Exemple v0.3 : températures, compteurs, brûleur, 5 consignes en `number`
-/// (5 min), 4 programmations. Écritures activées sauf mention contraire.
+/// (5 min), 4 programmations.
 struct V03 {
   size_t outdoor, burner, a1_comfort, a1_reduced, m2_comfort, m2_reduced, dhw;
   std::unique_ptr<Circuits> circuits;
 
-  explicit V03(Bench &b, bool schedules = true, bool writes = true) {
-    b.enable_writes = writes;
-    // v0.7 : les consignes de chauffage ont leur propre autorisation.
-    b.enable_heating_setpoint_writes = writes;
+  explicit V03(Bench &b, bool schedules = true) {
     auto &r = b.boiler.registers;
     r[0x0842] = {0x01};
     r[0x2306] = {20};
@@ -1658,29 +1602,8 @@ TEST(sim_v03_readback_is_the_next_transaction) {
   }
 }
 
-TEST(sim_v03_disabled_never_writes) {
-  // Écritures désactivées (défaut) : aucune trame F4, quelles que soient
-  // les demandes ; l'état reste la valeur lue.
-  Bench b;
-  V03 v(b, true, false);
-  b.run(0, BOOT);
-  int refused = 0;
-  for (uint32_t t = BOOT; t < H; t += 5 * S) {
-    for (size_t n : v.numbers()) {
-      const std::string r = b.request(n, b.regs[n].min + 1, t);
-      refused += r == "disabled" || r == "refused: writes are disabled (enable_writes: false)";
-    }
-    b.run(t, 5 * S);
-  }
-  CHECK(refused > 3000);
-  CHECK_EQ(b.boiler.write_frames, 0);
-  CHECK_EQ(b.boiler_value(0x2306), 20);
-  CHECK_EQ(b.number_state[v.a1_comfort], 20);
-  CHECK(b.write_results.empty());
-}
-
 TEST(sim_v03_no_write_without_request) {
-  // Écritures activées, aucune demande : jamais d'écriture, ni au démarrage,
+  // Aucune demande : jamais d'écriture, ni au démarrage,
   // ni après une coupure de la liaison, ni après un redémarrage.
   Bench b;
   V03 v(b);
@@ -1787,7 +1710,6 @@ TEST(sim_v03_several_entities_serialized_and_spaced) {
   b.run(0, BOOT);
   const int target[] = {22, 18, 22, 19, 55};  // v0.7 : M2 confort <= 22
   const auto numbers = v.numbers();
-  b.enable_dhw_setpoint_write = true;  // v0.6 : la consigne ECS a sa propre autorisation
   // v0.7 : une modification de consigne à la fois, 15 s entre deux consignes
   // (garde commune) : les autres demandes simultanées sont refusées.
   CHECK(b.request(numbers[0], target[0], BOOT) == "pre-read");
@@ -1833,7 +1755,7 @@ TEST(sim_v03_write_spam_keeps_periodic_reads) {
     ref.run(0, BOOT);
     b.run(0, BOOT);
     // v0.6 : même rotation sur les cinq consignes, mais l'ECS est refusée
-    // (enable_dhw_setpoint_write: false, et 40..42 hors limites internes) :
+    // (40..42 hors limites internes 50..60) :
     // seules les quatre consignes d'ambiance sont écrites. La charge propre
     // à l'ECS (relecture préalable) est mesurée par sim_v06_dhw_*.
     const auto numbers = v.numbers();
@@ -1925,7 +1847,6 @@ TEST(sim_v041_link_loss_with_preempted_read_sends_nothing) {
   // commande encore déposée directement.
   Bench b;
   V03 v(b, false);
-  b.enable_mode_writes = true;
   b.boiler.registers[0x2301] = {0x03};
   b.boiler.writable.insert(0x2301);
   const size_t a1 = b.add_mode(0x2301, 5 * MIN, 0);
@@ -2095,13 +2016,11 @@ namespace {
 
 /// Consignes (sans programmations horaires) + programmes A1 et M2, lus à
 /// 03 (Chauffage + ECS). Chaudière simulée : 0x2301 et 0x3301 acceptent
-/// l'écriture, pour qu'une trame M2 non autorisée se voie (registre modifié).
+/// l'écriture, pour qu'une trame M2 inattendue se voie (registre modifié).
 struct Modes {
   V03 base;
   size_t a1, m2;
-  Modes(Bench &b, bool mode_writes = true, bool m2_write = false, bool schedules = false) : base(b, schedules) {
-    b.enable_mode_writes = mode_writes;
-    b.enable_m2_mode_write = m2_write;
+  explicit Modes(Bench &b, bool schedules = false) : base(b, schedules) {
     b.boiler.registers[0x2301] = {0x03};
     b.boiler.registers[0x3301] = {0x03};
     b.boiler.writable.insert(0x2301);
@@ -2139,23 +2058,6 @@ TEST(sim_v03_mode_values_read_strictly) {
     b.run(0, BOOT);
     CHECK_EQ(b.mode_of(m.a1), raw_expected.second);  // valeur hors 00/03/05 : inconnue
     CHECK_EQ(b.mode_of(m.m2), 0x03);
-  }
-}
-
-TEST(sim_v03_mode_writes_disabled_by_default) {
-  for (int config = 0; config < 2; config++) {
-    Bench b;
-    Modes m(b, config == 1);  // 0 : rien d'activé ; 1 : enable_mode_writes sans enable_writes
-    b.enable_writes = false;
-    b.run(0, BOOT);
-    for (size_t option : {ECS_ONLY, OFF, HEATING_ECS})
-      CHECK(b.request_mode(m.a1, option, BOOT) == "disabled");
-    b.enable_writes = true;  // consignes autorisées, programmes non
-    b.enable_mode_writes = false;
-    CHECK(b.request_mode(m.a1, OFF, BOOT) == "mode disabled");
-    b.run(BOOT, 30 * MIN);
-    CHECK_EQ(b.boiler.write_frames, 0);
-    CHECK_EQ(b.mode_of(m.a1), 0x03);
   }
 }
 
@@ -2251,29 +2153,19 @@ TEST(sim_v03_mode_timeout_never_resent) {
   }
 }
 
-TEST(sim_v04_mode_values_refused_and_m2_needs_third_permission) {
+TEST(sim_v04_mode_values_refused) {
   Bench b;
-  Modes m(b);  // enable_writes + enable_mode_writes, sans enable_m2_mode_write
+  Modes m(b);
   CHECK(b.request_mode(m.a1, OFF, 0) == "not read");
   b.run(0, BOOT);
-  for (size_t option : {ECS_ONLY, HEATING_ECS, OFF})
-    CHECK(b.request_mode(m.m2, option, BOOT) == "m2 disabled");  // 0x3301 : troisième autorisation
   for (size_t option : {size_t(3), size_t(4), size_t(255)}) {
     CHECK(b.request_mode(m.a1, option, BOOT) == "operating mode value not allowed (only 00, 03, 05)");
-    CHECK(b.request_mode(m.m2, option, BOOT) == "m2 disabled");  // l'autorisation passe avant tout
+    CHECK(b.request_mode(m.m2, option, BOOT) == "operating mode value not allowed (only 00, 03, 05)");
   }
   CHECK(b.request_mode(m.a1, HEATING_ECS, BOOT) == "unchanged");
+  CHECK(b.request_mode(m.m2, HEATING_ECS, BOOT) == "unchanged");
   b.run(BOOT, 10 * MIN);
   CHECK_EQ(b.boiler.write_frames, 0);
-
-  Bench c;
-  Modes n(c, true, true);  // trois autorisations
-  c.run(0, BOOT);
-  for (size_t option : {size_t(3), size_t(4), size_t(255)})
-    CHECK(c.request_mode(n.m2, option, BOOT) == "operating mode value not allowed (only 00, 03, 05)");
-  CHECK(c.request_mode(n.m2, HEATING_ECS, BOOT) == "unchanged");
-  c.run(BOOT, 10 * MIN);
-  CHECK_EQ(c.boiler.write_frames, 0);
 }
 
 TEST(sim_v03_mode_one_command_at_a_time) {
@@ -2307,13 +2199,13 @@ TEST(sim_v03_mode_no_write_without_request_reboot_or_reconnect) {
   CHECK_EQ(b.mode_of(m.a1), 0x03);
 }
 
-// --- v0.4 : programme de M2 (0x3301), troisième autorisation -----------------
+// --- v0.4 : programme de M2 (0x3301) -----------------------------------------
 
-TEST(sim_v04_m2_write_with_three_permissions) {
+TEST(sim_v04_m2_write_confirmed_and_both_read_back) {
   // M2 03 -> 00 puis retour : relecture de M2 ET de A1 après chaque
   // commande, divergence affichée, A1 jamais écrit.
   Bench b;
-  Modes m(b, true, true);
+  Modes m(b);
   b.run(0, BOOT);
   CHECK(b.request_mode(m.m2, ECS_ONLY, BOOT) == "queued");
   CHECK_EQ(b.mode_of(m.m2), 0x03);  // rien n'est publié avant la relecture
@@ -2332,41 +2224,19 @@ TEST(sim_v04_m2_write_with_three_permissions) {
   CHECK(b.failures.empty());
 }
 
-TEST(sim_v04_m2_permission_matrix) {
-  // Les 8 combinaisons des trois options : M2 n'est écrit que si les trois
-  // sont vraies ; A1 si les deux premières le sont.
-  for (int mask = 0; mask < 8; mask++) {
-    const bool writes = mask & 1, modes = mask & 2, m2 = mask & 4;
-    Bench b;
-    Modes m(b, modes, m2);
-    b.enable_writes = writes;
-    b.run(0, BOOT);
-    b.request_mode(m.m2, OFF, BOOT);
-    b.run(BOOT, MIN);
-    b.request_mode(m.a1, ECS_ONLY, BOOT + MIN);
-    b.run(BOOT + MIN, MIN);
-    CHECK_EQ(b.boiler.write_frames_by_address[0x3301], writes && modes && m2 ? 1 : 0);
-    CHECK_EQ(b.boiler.write_frames_by_address[0x2301], writes && modes ? 1 : 0);
-    CHECK_EQ(b.boiler_value(0x3301), writes && modes && m2 ? 0x05 : 0x03);
-  }
-}
-
-TEST(sim_v04_m2_never_written_without_third_permission_after_reboot_reconnect) {
+TEST(sim_v04_m2_never_written_without_request_after_reboot_reconnect) {
   Bench b;
-  Modes m(b);  // enable_m2_mode_write: false
+  Modes m(b);
   b.run(0, BOOT);
   uint32_t t = BOOT;
   for (int cycle = 0; cycle < 3; cycle++) {
-    CHECK(b.request_mode(m.m2, cycle == 1 ? OFF : ECS_ONLY, t) == "m2 disabled");
     b.boiler.connected = false;  // coupure de la liaison
     b.run(t, 2 * MIN);
     b.boiler.connected = true;  // reconnexion
     b.run(t + 2 * MIN, 5 * MIN);
-    CHECK(b.request_mode(m.m2, OFF, t + 7 * MIN) == "m2 disabled");
     b.reboot(t + 7 * MIN);  // redémarrage de l'ESP
     b.boiler_only(t + 7 * MIN, 3 * S);
     b.run(t + 7 * MIN + 3 * S, 5 * MIN);
-    CHECK(b.request_mode(m.m2, OFF, t + 12 * MIN + 3 * S) == "m2 disabled");
     t += 13 * MIN;
     b.run(t - 57 * S, 57 * S);
   }
@@ -2377,59 +2247,42 @@ TEST(sim_v04_m2_never_written_without_third_permission_after_reboot_reconnect) {
 }
 
 TEST(sim_v04_m2_never_written_after_a1_timeout_or_concurrently) {
+  // Une commande M2 pendant celle de A1 est refusée (une écriture de
+  // programme à la fois), pas mise en file ; l'écriture A1 n'est jamais
+  // réémise, quel que soit le défaut.
   for (auto fault : {SimBoiler::WriteFault::NO_REPLY_LOST, SimBoiler::WriteFault::NO_REPLY_APPLIED,
                      SimBoiler::WriteFault::NACK_SYNC}) {
     Bench b;
-    Modes m(b);  // enable_m2_mode_write: false
+    Modes m(b);
     b.boiler.write_faults[0x2301] = fault;
     b.run(0, BOOT);
     CHECK(b.request_mode(m.a1, OFF, BOOT) == "queued");
-    CHECK(b.request_mode(m.m2, OFF, BOOT) == "m2 disabled");  // concurrente : refusée d'abord par l'autorisation
-    for (uint32_t t = BOOT; t < BOOT + MIN; t += 1 * S) {
-      CHECK(b.request_mode(m.m2, ECS_ONLY, t) == "m2 disabled");  // pendant l'écriture A1 et ses relectures
-      b.run(t, 1 * S);
-    }
-    b.run(BOOT + MIN, 30 * MIN);
+    CHECK(b.request_mode(m.m2, OFF, BOOT) == "busy");
+    b.run(BOOT, 5 * S);
+    CHECK(b.request_mode(m.m2, OFF, BOOT + 5 * S) == "busy");
+    b.run(BOOT + 5 * S, 30 * MIN);
     CHECK_EQ(b.boiler.write_frames, 1);  // la seule écriture A1, jamais réémise
     CHECK_EQ(b.boiler.write_frames_by_address[0x3301], 0);
     CHECK_EQ(b.boiler_value(0x3301), 0x03);
   }
-  // Avec la troisième autorisation : une commande M2 pendant celle de A1 est
-  // refusée (une écriture de programme à la fois), pas mise en file.
-  Bench c;
-  Modes n(c, true, true);
-  c.run(0, BOOT);
-  CHECK(c.request_mode(n.a1, OFF, BOOT) == "queued");
-  CHECK(c.request_mode(n.m2, OFF, BOOT) == "busy");
-  c.run(BOOT, 5 * S);
-  CHECK(c.request_mode(n.m2, OFF, BOOT + 5 * S) == "busy");
-  c.run(BOOT + 5 * S, MIN);
-  CHECK_EQ(c.boiler.write_frames, 1);
-  CHECK_EQ(c.boiler.write_frames_by_address[0x3301], 0);
 }
 
-TEST(sim_v04_m2_send_time_check_blocks_bypassed_requests) {
-  // Défense en profondeur : une demande M2 déposée directement dans
-  // l'arbitre (sans passer par le contrôle de dépôt) est refusée juste avant
-  // l'émission tant que enable_m2_mode_write est faux.
+TEST(sim_v04_mode_send_time_check_blocks_bypassed_requests) {
+  // Défense en profondeur : une demande déposée directement dans l'arbitre
+  // (sans passer par le contrôle de dépôt) est refusée juste avant
+  // l'émission si la valeur n'est pas 00/03/05 ou si l'adresse ne correspond
+  // pas au registre.
   Bench b;
   Modes m(b);
   b.run(0, BOOT);
-  b.writes.submit(static_cast<int>(m.m2), 0x3301, 0x05, BOOT);
+  b.writes.submit(static_cast<int>(m.m2), 0x3301, 0x01, BOOT);
   b.run(BOOT, MIN);
   CHECK_EQ(b.refused_at_send, 1);
+  b.writes.submit(static_cast<int>(m.a1), 0x3301, 0x05, BOOT + MIN);
+  b.run(BOOT + MIN, MIN);
+  CHECK_EQ(b.refused_at_send, 2);
   CHECK_EQ(b.boiler.write_frames, 0);
-  // Autorisée au dépôt puis retirée avant l'émission : refusée aussi.
-  Bench c;
-  Modes n(c, true, true);
-  c.run(0, BOOT);
-  CHECK(c.request_mode(n.a1, OFF, BOOT) == "queued");
-  c.run(BOOT, MIN);
-  c.writes.submit(static_cast<int>(n.m2), 0x3301, 0x05, BOOT + MIN);
-  c.enable_m2_mode_write = false;
-  c.run(BOOT + MIN, MIN);
-  CHECK_EQ(c.refused_at_send, 1);
-  CHECK_EQ(c.boiler.write_frames_by_address[0x3301], 0);
+  CHECK_EQ(b.boiler_value(0x3301), 0x03);
 }
 
 // --- v0.4.1 : réactivité des commandes manuelles ------------------------------
@@ -2477,8 +2330,8 @@ TEST(sim_v041_command_latency_under_load) {
     Bench old_b, b;
     old_b.boiler.post_response_delay_ms = b.boiler.post_response_delay_ms = post;
     old_b.preempt_unsent_reads = old_b.strict_read_back = false;  // comportement v0.4
-    Modes old_m(old_b, true, false, true);
-    Modes m(b, true, false, true);
+    Modes old_m(old_b, true);
+    Modes m(b, true);
     run_a1_commands(old_b, old_m);
     run_a1_commands(b, m);
     const Latency before = latency(old_b), after = latency(b);
@@ -2513,7 +2366,7 @@ TEST(sim_v041_command_during_schedule_reading) {
   // commande passe devant tous les blocs restants.
   Bench b;
   b.boiler.post_response_delay_ms = 3000;
-  Modes m(b, true, false, true);
+  Modes m(b, true);
   b.run(0, 75 * S);  // A1 et M2 lus, programmations en cours de lecture
   CHECK(b.mode_of(m.a1) == 0x03);
   CHECK(b.successes[m.base.circuits->a1] < 7);
@@ -2532,7 +2385,7 @@ TEST(sim_v041_written_register_read_back_first) {
   // Commande M2 : M2 (le registre écrit, index plus grand) est relu avant
   // A1 ; son état est publié une synchro plus tôt.
   Bench b;
-  Modes m(b, true, true);
+  Modes m(b);
   b.run(0, BOOT);
   CHECK(b.request_mode(m.m2, ECS_ONLY, BOOT) == "queued");
   b.run(BOOT, MIN);
@@ -2637,8 +2490,7 @@ struct BoostGlue {
     return n;
   }
 
-  BoostGlue(Bench &bench, uint8_t validated_mask) : b(bench) {
-    config.validated_days_mask = validated_mask;
+  explicit BoostGlue(Bench &bench) : b(bench) {
     boot();
   }
   void boot() {
@@ -2661,8 +2513,6 @@ struct BoostGlue {
   }
   /// VissLinkBoost::press(START).
   std::string start(uint16_t duration, const HaTime &ha, uint32_t now) {
-    if (!b.schedule_writes_enabled())
-      return "disabled";
     if (!b.link_ok)
       return "link";
     if (!b.writes_idle() && seq.idle())
@@ -2674,8 +2524,6 @@ struct BoostGlue {
     return r == BoostStart::ACCEPTED ? "accepted" : r == BoostStart::RECOVERY_PENDING ? "recovery" : "refused";
   }
   bool restore(uint32_t now) {
-    if (!b.schedule_writes_enabled())
-      return false;
     const bool ok = seq.request_restore(now);
     dispatch(now);
     return ok;
@@ -2764,9 +2612,7 @@ const std::vector<uint8_t> LOOP_SUNDAY_BOOST = {0x31, 0x43, 0x70, 0x72, 0xAC, 0x
 struct BoostBench {
   Modes modes;
   BoostGlue glue;
-  BoostBench(Bench &b, bool schedule_writes = true)
-      : modes(b, true, false, true), glue(b, 1u << 6) {
-    b.enable_schedule_writes = schedule_writes;
+  explicit BoostBench(Bench &b) : modes(b, true), glue(b) {
     for (uint8_t d = 0; d < SCHEDULE_DAYS; d++)
       b.boiler.writable.insert(schedule_day_address(LOOP, d));
     set_vito_clock(b.boiler, 0);
@@ -2820,23 +2666,11 @@ TEST(sim_v05_boost_end_to_end) {
   CHECK(b.successes[x.modes.base.burner] >= 50);
 }
 
-TEST(sim_v05_boost_disabled_by_default) {
-  for (int config = 0; config < 2; config++) {
-    Bench b;
-    BoostBench x(b, false);  // enable_schedule_writes: false
-    b.enable_writes = config == 1;
-    run_boost(b, x.glue, 0, BOOT);
-    CHECK(x.glue.start(10, ha_now(BOOT), BOOT) == "disabled");
-    CHECK(!x.glue.restore(BOOT));
-    run_boost(b, x.glue, BOOT, H);
-    CHECK_EQ(b.boiler.write_frames, 0);
-    CHECK(b.boiler.registers[0x2230] == LOOP_SUNDAY);
-  }
-  // Le séquenceur lui-même ne peut rien faire passer sans l'autorisation :
-  // une écriture de bloc est refusée au dépôt et à l'émission.
+TEST(sim_v05_boost_block_write_needs_the_sequencer) {
+  // Une écriture de bloc que le séquenceur n'attend pas est refusée au dépôt
+  // et à l'émission.
   Bench b;
-  BoostBench x(b, false);
-  b.enable_writes = true;
+  BoostBench x(b);
   run_boost(b, x.glue, 0, BOOT);
   const uint8_t block[8] = {0x31, 0x43, 0x70, 0x72, 0xAC, 0xAD, 0xFF, 0xFF};
   CHECK(!b.submit_block_write(0x2230, block, BOOT));
@@ -2844,6 +2678,7 @@ TEST(sim_v05_boost_disabled_by_default) {
   run_boost(b, x.glue, BOOT, MIN);
   CHECK_EQ(b.block_refused_at_send, 1);
   CHECK_EQ(b.boiler.write_frames, 0);
+  CHECK(b.boiler.registers[0x2230] == LOOP_SUNDAY);
 }
 
 TEST(sim_v05_only_loop_blocks_can_be_written) {
@@ -3099,19 +2934,7 @@ TEST(sim_v071_boost_10_min_in_a_30_min_range_restored_after_10_min) {
   CHECK(b.failures.empty());
 }
 
-TEST(sim_v05_boost_refused_on_unvalidated_day_or_bad_clock) {
-  {  // Jour non validé : aucune sauvegarde, aucune écriture.
-    Bench b;
-    BoostBench x(b);
-    x.glue.config.validated_days_mask = 1u << 0;  // lundi seulement
-    x.glue.boot();
-    run_boost(b, x.glue, 0, BOOT);
-    x.glue.start(10, ha_now(BOOT), BOOT);
-    run_boost(b, x.glue, BOOT, MIN);
-    CHECK(x.glue.seq.idle());
-    CHECK_EQ(x.glue.saves, 0);
-    CHECK_EQ(b.boiler.write_frames, 0);
-  }
+TEST(sim_v05_boost_refused_on_bad_clock) {
   {  // Horloge Home Assistant décalée d'une heure (changement d'heure ?) : refus.
     Bench b;
     BoostBench x(b);
@@ -3356,7 +3179,7 @@ TEST(sim_v051_block_refresh_after_panel_change) {
 TEST(sim_v051_refresh_never_inside_write_read_back) {
   Bench b;
   b.boiler.post_response_delay_ms = 3000;
-  Modes m(b, true, false, true);
+  Modes m(b, true);
   b.today = 6;
   b.run(0, BOOT + 5 * MIN);
   CHECK(b.request_mode(m.a1, OFF, BOOT + 5 * MIN) == "queued");
@@ -3641,9 +3464,8 @@ TEST(sim_v051_boost_refresh_waits_for_a1_command) {
 
 TEST(sim_v051_boost_without_loop_schedule_reads_nothing_more) {
   Bench b;
-  Modes m(b, true, false, false);  // aucune programmation déclarée
-  BoostGlue g(b, 1u << 6);
-  b.enable_schedule_writes = true;
+  Modes m(b, false);  // aucune programmation déclarée
+  BoostGlue g(b);
   b.boiler.writable.insert(0x2230);
   b.boiler.registers[0x2230] = LOOP_SUNDAY;
   set_vito_clock(b.boiler, 0);
@@ -3872,9 +3694,7 @@ namespace {
 /// Production v0.6 : consignes v0.3 (ECS 40..60, lue toutes les 5 min).
 struct Dhw {
   V03 v;
-  Dhw(Bench &b, bool writes = true, bool dhw_write = true) : v(b, false, writes) {
-    b.enable_dhw_setpoint_write = dhw_write;
-  }
+  explicit Dhw(Bench &b) : v(b, false) {}
   size_t number() const { return v.dhw; }
 };
 
@@ -3911,30 +3731,16 @@ bool read_back_follows_each_write(const SimBoiler &boiler) {
 
 }  // namespace
 
-TEST(sim_v06_dhw_read_and_refused_without_both_permissions) {
-  struct Case {
-    bool writes, dhw, others;
-    const char *reason;
-  };
-  for (const Case &c : {Case{false, false, false, "refused: writes are disabled (enable_writes: false)"},
-                        Case{true, false, false,
-                             "refused: DHW setpoint write is disabled (enable_dhw_setpoint_write: false)"},
-                        // Les autres autorisations ne permettent jamais 0x6300.
-                        Case{true, false, true,
-                             "refused: DHW setpoint write is disabled (enable_dhw_setpoint_write: false)"}}) {
-    Bench b;
-    Dhw d(b, c.writes, c.dhw);
-    b.enable_mode_writes = b.enable_m2_mode_write = b.enable_schedule_writes = c.others;
-    b.run(0, BOOT);
-    CHECK_EQ(b.number_state[d.number()], 50);  // lecture valide de 0x6300
-    CHECK(b.request(d.number(), 55, BOOT) == c.reason);
-    b.run(BOOT, 10 * MIN);
-    CHECK_EQ(b.boiler.write_frames, 0);
-    CHECK_EQ(writes_to(b.boiler, 0x6300), 0);
-    CHECK_EQ(b.boiler_value(0x6300), 50);
-    CHECK_EQ(b.number_state[d.number()], 50);
-    CHECK(!b.dhw.busy());
-  }
+TEST(sim_v06_dhw_read_without_request_writes_nothing) {
+  Bench b;
+  Dhw d(b);
+  b.run(0, BOOT);
+  CHECK_EQ(b.number_state[d.number()], 50);  // lecture valide de 0x6300
+  b.run(BOOT, 10 * MIN);
+  CHECK_EQ(b.boiler.write_frames, 0);
+  CHECK_EQ(writes_to(b.boiler, 0x6300), 0);
+  CHECK_EQ(b.boiler_value(0x6300), 50);
+  CHECK(!b.dhw.busy());
 }
 
 TEST(sim_v06_dhw_write_confirmed_after_fresh_read) {
@@ -4122,7 +3928,6 @@ TEST(sim_v06_dhw_waits_for_circulation_restore) {
     Bench b;
     BoostBench x(b);
     const size_t dhw = x.modes.base.dhw;
-    b.enable_dhw_setpoint_write = true;
     if (priority)
       b.restore_priority = [&x] { return boost_restore_priority(x.glue.seq); };
     b.restore_observer = [&x] { return boost_restore_priority(x.glue.seq); };
@@ -4173,7 +3978,6 @@ TEST(sim_v06_dhw_realistic_use_keeps_periodic_reads) {
     ref.boiler.post_response_delay_ms = b.boiler.post_response_delay_ms = post;
     V03 r(ref);
     V03 v(b);
-    b.enable_dhw_setpoint_write = true;
     ref.run(0, BOOT);
     b.run(0, BOOT);
     const uint32_t end = 6 * H + 30 * MIN;
@@ -4203,8 +4007,7 @@ namespace {
 struct Heat {
   V03 v;
   size_t a1_mode, m2_mode, room, pump;
-  Heat(Bench &b, bool writes = true, bool heating = true) : v(b, false, writes) {
-    b.enable_heating_setpoint_writes = heating;
+  explicit Heat(Bench &b) : v(b, false) {
     b.boiler.registers[0x2301] = {0x03};
     b.boiler.registers[0x3301] = {0x03};
     b.boiler.registers[0x0898] = {0xCC, 0x00};  // 20,4 °C
@@ -4300,32 +4103,18 @@ constexpr uint16_t HEATING_ADDRESSES[] = {0x2306, 0x2307, 0x3306, 0x3307};
 
 }  // namespace
 
-TEST(sim_v07_heating_setpoints_read_and_refused_without_permission) {
-  struct Case {
-    bool writes, heating, others;
-    const char *reason;
-  };
-  for (const Case &c : {Case{false, false, false, "refused: writes are disabled (enable_writes: false)"},
-                        Case{true, false, false,
-                             "refused: heating setpoint writes are disabled (enable_heating_setpoint_writes: false)"},
-                        // ECS, programmes, M2, programmations : aucune ne la permet.
-                        Case{true, false, true,
-                             "refused: heating setpoint writes are disabled (enable_heating_setpoint_writes: false)"}}) {
-    Bench b;
-    Heat h(b, c.writes, c.heating);
-    b.enable_dhw_setpoint_write = b.enable_mode_writes = b.enable_m2_mode_write = b.enable_schedule_writes = c.others;
-    b.run(0, BOOT);
-    const size_t numbers[] = {h.v.a1_comfort, h.v.a1_reduced, h.v.m2_comfort, h.v.m2_reduced};
-    const int read[] = {20, 16, 21, 17};
-    for (size_t i = 0; i < 4; i++) {
-      CHECK_EQ(b.number_state[numbers[i]], read[i]);  // lecture de chaque consigne
-      CHECK(b.request(numbers[i], read[i] + 1 > 20 ? read[i] - 1 : read[i] + 1, BOOT) == c.reason);
-    }
-    b.run(BOOT, 10 * MIN);
-    CHECK_EQ(b.boiler.write_frames, 0);
-    for (uint16_t a : HEATING_ADDRESSES)
-      CHECK_EQ(writes_to(b.boiler, a), 0);
-  }
+TEST(sim_v07_heating_setpoints_read_without_request_write_nothing) {
+  Bench b;
+  Heat h(b);
+  b.run(0, BOOT);
+  const size_t numbers[] = {h.v.a1_comfort, h.v.a1_reduced, h.v.m2_comfort, h.v.m2_reduced};
+  const int read[] = {20, 16, 21, 17};
+  for (size_t i = 0; i < 4; i++)
+    CHECK_EQ(b.number_state[numbers[i]], read[i]);  // lecture de chaque consigne
+  b.run(BOOT, 10 * MIN);
+  CHECK_EQ(b.boiler.write_frames, 0);
+  for (uint16_t a : HEATING_ADDRESSES)
+    CHECK_EQ(writes_to(b.boiler, a), 0);
 }
 
 TEST(sim_v07_each_heating_setpoint_written_and_confirmed) {
@@ -4478,7 +4267,6 @@ TEST(sim_v07_heating_link_loss_and_reboot_write_nothing_more) {
 TEST(sim_v07_heating_and_dhw_one_change_at_a_time) {
   Bench b;
   Heat h(b);
-  b.enable_dhw_setpoint_write = true;
   b.run(0, BOOT);
   CHECK(b.request(h.v.dhw, 55, BOOT) == "pre-read");
   CHECK(b.request(h.v.a1_comfort, 21, BOOT) == "refused: another setpoint change is in progress");
@@ -4538,8 +4326,7 @@ TEST(sim_v07_heating_waits_for_circulation_restore) {
 
 TEST(sim_v07_climate_follows_the_vitotronic_and_never_commands_by_itself) {
   Bench b;
-  Heat h(b, true, true);
-  b.enable_mode_writes = b.enable_m2_mode_write = true;  // tout autorisé, aucune commande
+  Heat h(b);  // aucune commande
   ClimateGlue c(b, h);
   c.run(0, BOOT);
   CHECK(c.state.ready);
@@ -4580,7 +4367,7 @@ TEST(sim_v07_climate_follows_the_vitotronic_and_never_commands_by_itself) {
 
 TEST(sim_v073_climate_m2_heating_inertia_stopped_and_stale_readings) {
   Bench b;
-  Heat h(b, false, false);
+  Heat h(b);
   ClimateGlue c(b, h);
   c.run(0, BOOT);
   // Programme 03, circulateur 01, brûleur 01 : Chauffe.
@@ -4645,7 +4432,7 @@ TEST(sim_v073_climate_m2_heating_inertia_stopped_and_stale_readings) {
 
 TEST(sim_v073_climate_without_burner_never_reports_heating) {
   Bench b;
-  Heat h(b, false, false);
+  Heat h(b);
   ClimateGlue c(b, h);
   c.with_burner = false;  // ancienne configuration, sans burner_id
   c.run(0, BOOT);
@@ -4659,21 +4446,17 @@ TEST(sim_v073_climate_without_burner_never_reports_heating) {
 
 TEST(sim_v07_climate_commands_use_the_secured_paths) {
   Bench b;
-  Heat h(b, false, false);  // tout désactivé (défaut)
+  Heat h(b);
   ClimateGlue c(b, h);
   c.run(0, BOOT);
-  CHECK(c.set_temperature(20, BOOT) == "refused: writes are disabled (enable_writes: false)");
-  CHECK(c.set_hvac(false, BOOT) == "disabled");
   c.run(BOOT, 2 * MIN);
-  CHECK_EQ(b.boiler.write_frames, 0);
-  CHECK_EQ(c.state.target, 21.0f);  // l'état lu, jamais la demande
-  // Écritures + consignes de chauffage : la consigne passe, le mode non.
-  b.enable_writes = b.enable_heating_setpoint_writes = true;
+  CHECK_EQ(b.boiler.write_frames, 0);  // aucune commande sans demande
+  CHECK_EQ(c.state.target, 21.0f);  // l'état lu
   uint32_t t = BOOT + 2 * MIN;
   CHECK(c.set_temperature(20, t) == "pre-read");
+  CHECK_EQ(c.state.target, 21.0f);  // l'état lu, jamais la demande
   // Home Assistant / VTherm répète la même demande : jamais doublée.
   CHECK(c.set_temperature(20, t + 500) == "pending");
-  CHECK(c.set_hvac(false, t) == "mode disabled");
   c.run(t, MIN);
   t += MIN;
   CHECK_EQ(b.boiler_value(0x3306), 20);
@@ -4683,8 +4466,7 @@ TEST(sim_v07_climate_commands_use_the_secured_paths) {
   CHECK(c.set_temperature(20, t) == "unchanged");  // déjà la valeur lue : rien
   c.run(t, 10 * S);
   CHECK_EQ(b.boiler.requests_by_address[0x3306], reads);
-  // Programmes autorisés (A1/M2) : HEAT/OFF -> 03/00, jamais 05.
-  b.enable_mode_writes = b.enable_m2_mode_write = true;
+  // Programme de M2 : HEAT/OFF -> 03/00, jamais 05.
   t += 10 * S;
   CHECK(c.set_hvac(false, t) == "queued");
   c.run(t, MIN);
@@ -4749,8 +4531,6 @@ struct EditorGlue : BlockClient {
   bool submit(EditKind kind, const char *circuit, const std::string &days, const std::string &ranges, int source,
               const std::string &expected, uint32_t now) {
     last_error.clear();
-    if (!b.schedule_writes_enabled())
-      return refuse("disabled");
     if (!b.link_ok)
       return refuse("link");
     const uint8_t c = editor_circuit_from_key(circuit);
@@ -4843,7 +4623,6 @@ struct EditBench {
   EditorGlue ed;
   explicit EditBench(Bench &b)
       : act(b, 0), circuits(b, 0), ed(b, circuits.a1, circuits.m2, circuits.dhw, circuits.loop) {
-    b.enable_writes = b.enable_schedule_writes = true;
     for (uint16_t monday : EDITOR_CIRCUIT_ADDRESSES)
       for (uint8_t d = 0; d < SCHEDULE_DAYS; d++)
         b.boiler.writable.insert(schedule_day_address(monday, d));
@@ -5043,7 +4822,7 @@ TEST(sim_v08_esp_reboot_checks_the_last_write_without_writing) {
 TEST(sim_v08_editor_and_boost_exclude_each_other) {
   Bench b;
   EditBench x(b);
-  BoostGlue boost(b, 0x7F);
+  BoostGlue boost(b);
   run_edit(b, x.ed, 0, READ_ALL, &boost);
   uint32_t t = READ_ALL;
   // Bouclage temporaire (dimanche, 0x2230) : toute modification refusée
@@ -5106,14 +4885,10 @@ TEST(sim_v08_manual_refresh_reads_seven_blocks_spaced) {
   CHECK(!x.ed.refresh("zz", READ_ALL));
 }
 
-TEST(sim_v08_editor_disabled_or_refused_without_link) {
+TEST(sim_v08_editor_refused_without_link) {
   Bench b;
   EditBench x(b);
   run_edit(b, x.ed, 0, READ_ALL);
-  b.enable_schedule_writes = false;
-  CHECK(!x.ed.submit(EditKind::SET, "a1", "0", "06:00-21:00", -1, "", READ_ALL));
-  CHECK(x.ed.last_error == "disabled");
-  b.enable_schedule_writes = true;
   b.boiler.connected = false;
   run_edit(b, x.ed, READ_ALL, MIN);
   CHECK(!x.ed.submit(EditKind::SET, "a1", "0", "06:00-21:00", -1, "", READ_ALL + MIN));
@@ -5126,13 +4901,11 @@ TEST(sim_v08_editor_disabled_or_refused_without_link) {
   CHECK(!b.block_write_allowed(0x2301, block, WriteArbiter::EDITOR_OWNER));  // pas un bloc
 }
 
-TEST(sim_v09_party_setpoints_read_only_with_eco_party) {
+TEST(sim_v09_party_setpoints_read_as_sensors_without_commands) {
   // v0.9 : consignes Party A1/M2 (0x2308, 0x3308) lues en uint8 à 5 min, à
-  // côté des états Éco/Party à 60 s, écritures autorisées par ailleurs. Les
-  // valeurs lues sont publiées ; aucune trame d'écriture n'est émise, ni
-  // vers ces registres ni ailleurs (aucune commande Éco/Party n'existe).
+  // côté des états Éco/Party à 60 s. Les valeurs lues sont publiées ; sans
+  // demande, aucune trame d'écriture n'est émise.
   Bench b;
-  b.enable_writes = true;
   V05Config c(b, false);
   b.boiler.registers[0x2308] = {21};
   b.boiler.registers[0x3308] = {20};
@@ -5165,15 +4938,12 @@ namespace {
 
 /// Exemple v0.9.1 (examples/iot-viessmann-eco-party-v0.9.1.yaml), réduit à ce
 /// qui partage la ligne : 4 commandes Éco/Party à 60 s, 2 consignes Party à
-/// 5 min, consignes confort/réduite, brûleur à 30 s. `allowed` : adresses
-/// dont l'entité a allow_write: true.
+/// 5 min, consignes confort/réduite, brûleur à 30 s.
 struct EcoParty {
   size_t burner{0}, a1_eco{0}, a1_party{0}, m2_eco{0}, m2_party{0}, a1_party_temp{0}, m2_party_temp{0};
   std::vector<size_t> comfort_reduced;
 
-  EcoParty(Bench &b, std::set<uint16_t> allowed) {
-    b.enable_writes = true;
-    b.enable_heating_setpoint_writes = true;
+  explicit EcoParty(Bench &b) {
     auto &r = b.boiler.registers;
     r[0x0842] = {0x01};
     for (uint16_t a : {0x2302, 0x2303, 0x3302, 0x3303})
@@ -5188,20 +4958,16 @@ struct EcoParty {
     b.add(0x0800, 60 * S, 0);
     b.add(0x0802, 60 * S, 0);
     burner = b.add_binary(0x0842, 30 * S, 0);
-    a1_eco = b.add_flag(0x2302, 60 * S, 0, allowed.count(0x2302) != 0);
-    a1_party = b.add_flag(0x2303, 60 * S, 0, allowed.count(0x2303) != 0);
-    m2_eco = b.add_flag(0x3302, 60 * S, 0, allowed.count(0x3302) != 0);
-    m2_party = b.add_flag(0x3303, 60 * S, 0, allowed.count(0x3303) != 0);
+    a1_eco = b.add_flag(0x2302, 60 * S, 0);
+    a1_party = b.add_flag(0x2303, 60 * S, 0);
+    m2_eco = b.add_flag(0x3302, 60 * S, 0);
+    m2_party = b.add_flag(0x3303, 60 * S, 0);
     a1_party_temp = b.add_number(0x2308, 16, 23, 5 * MIN, 0);
     m2_party_temp = b.add_number(0x3308, 16, 22, 5 * MIN, 0);
-    b.allow[a1_party_temp] = allowed.count(0x2308) != 0;
-    b.allow[m2_party_temp] = allowed.count(0x3308) != 0;
     comfort_reduced = {b.add_number(0x2306, 16, 24, 5 * MIN, 0), b.add_number(0x2307, 10, 20, 5 * MIN, 0),
                        b.add_number(0x3306, 16, 24, 5 * MIN, 0), b.add_number(0x3307, 10, 20, 5 * MIN, 0)};
   }
 };
-
-const std::set<uint16_t> ALL_ECO_PARTY = {0x2302, 0x2303, 0x3302, 0x3303, 0x2308, 0x3308};
 
 int comfort_reduced_writes(const SimBoiler &boiler) {
   int n = 0;
@@ -5212,21 +4978,17 @@ int comfort_reduced_writes(const SimBoiler &boiler) {
 
 }  // namespace
 
-TEST(sim_v091_progressive_validation_step1_party_setpoint_a1_only) {
-  // Étape 1 de la procédure : seule la consigne Party A1 a allow_write: true.
+TEST(sim_v091_party_setpoint_a1_alone_touches_only_0x2308) {
+  // Une seule commande : consigne Party A1. Hors limites internes : refusé.
   Bench b;
-  EcoParty e(b, {0x2308});
+  EcoParty e(b);
   b.run(0, BOOT);
   CHECK_EQ(b.flag_state[e.a1_party], 0);
   CHECK_EQ(b.number_state[e.a1_party_temp], 21);
   CHECK_EQ(b.number_state[e.m2_party_temp], 20);
-  const std::string refused = "refused: write disabled for this entity (allow_write: false)";
-  CHECK(b.request_flag(e.a1_party, true, BOOT) == refused);
-  CHECK(b.request_flag(e.a1_eco, true, BOOT) == refused);
-  CHECK(b.request_flag(e.m2_party, true, BOOT) == refused);
-  CHECK(b.request_flag(e.m2_eco, true, BOOT) == refused);
-  CHECK(b.request(e.m2_party_temp, 21, BOOT) == refused);
-  CHECK(b.flags.at(e.a1_party).status() == "Refusé : écriture désactivée pour cette commande (allow_write: false)");
+  CHECK(b.request(e.m2_party_temp, 23, BOOT) ==
+        "refused: value outside the configured range");
+  CHECK(b.writer_for(static_cast<int>(e.m2_party_temp))->status() == "Refusé : valeur 23.0 °C hors limites (16-22 °C)");
   CHECK(b.request(e.a1_party_temp, 22, BOOT) == "pre-read");
   const uint32_t done = run_until(b, BOOT, MIN, [&] { return !b.writer_for(static_cast<int>(e.a1_party_temp))->busy(); });
   b.run(done, 10 * MIN);
@@ -5244,7 +5006,7 @@ TEST(sim_v091_progressive_validation_step1_party_setpoint_a1_only) {
 
 TEST(sim_v091_each_function_written_and_confirmed_in_procedure_order) {
   Bench b;
-  EcoParty e(b, ALL_ECO_PARTY);
+  EcoParty e(b);
   b.run(0, BOOT);
   uint32_t t = BOOT;
   struct Step {
@@ -5301,35 +5063,31 @@ TEST(sim_v091_each_function_written_and_confirmed_in_procedure_order) {
   CHECK(b.failures.empty());
 }
 
-TEST(sim_v091_no_write_without_request_permission_or_after_reboot) {
-  for (bool writes : {true, false}) {
-    Bench b;
-    EcoParty e(b, ALL_ECO_PARTY);
-    b.enable_writes = writes;
-    b.run(0, 2 * H);  // aucune demande : rien n'est écrit, même au démarrage
-    CHECK_EQ(b.boiler.write_frames, 0);
-    if (!writes) {
-      CHECK(b.request_flag(e.a1_party, true, 2 * H) == "refused: writes are disabled (enable_writes: false)");
-      CHECK(b.request(e.a1_party_temp, 22, 2 * H) == "refused: writes are disabled (enable_writes: false)");
-      b.run(2 * H, 10 * MIN);
-      CHECK_EQ(b.boiler.write_frames, 0);
-      continue;
-    }
-    // Demande puis redémarrage avant l'émission : rien ne subsiste.
-    CHECK(b.request_flag(e.m2_party, true, 2 * H) == "pre-read");
-    b.reboot(2 * H + 5);
-    b.run(2 * H + 5, H);
-    CHECK_EQ(b.boiler.write_frames, 0);
-    CHECK_EQ(b.boiler_value(0x3303), 0);
-    CHECK(b.flags.at(e.m2_party).status() == "Aucune modification effectuée");
-  }
+TEST(sim_v091_no_write_without_request_or_after_reboot) {
+  Bench b;
+  EcoParty e(b);
+  b.run(0, 2 * H);  // aucune demande : rien n'est écrit, même au démarrage
+  CHECK_EQ(b.boiler.write_frames, 0);
+  // Demande puis redémarrage avant l'émission : rien ne subsiste.
+  CHECK(b.request_flag(e.m2_party, true, 2 * H) == "pre-read");
+  b.reboot(2 * H + 5);
+  b.run(2 * H + 5, H);
+  CHECK_EQ(b.boiler.write_frames, 0);
+  CHECK_EQ(b.boiler_value(0x3303), 0);
+  CHECK(b.flags.at(e.m2_party).status() == "Aucune modification effectuée");
+  // Adresse hors de la liste Éco/Party, déposée directement : refusée à
+  // l'émission.
+  b.writes.submit(static_cast<int>(e.m2_party), 0x3303, 0x05, 3 * H + 5);
+  b.run(3 * H + 5, MIN);
+  CHECK_EQ(b.refused_at_send, 1);
+  CHECK_EQ(b.boiler.write_frames, 0);
 }
 
 TEST(sim_v091_ignored_write_reported_once_never_retried) {
   // M2 avec Vitotrol : hypothèse d'une écriture accusée mais non appliquée
   // (« Fernbedienung », notice KW3 p. 43). Échec affiché, aucun nouvel essai.
   Bench b;
-  EcoParty e(b, ALL_ECO_PARTY);
+  EcoParty e(b);
   b.boiler.write_faults[0x3303] = SimBoiler::WriteFault::ACK_IGNORED;
   b.boiler.write_faults[0x3308] = SimBoiler::WriteFault::NACK_OTHER;
   b.run(0, BOOT);
@@ -5353,7 +5111,7 @@ TEST(sim_v091_eco_and_party_together_follow_the_boiler) {
   // coupe Éco quand Party est activé. VissLink ne suppose rien : il relit
   // Éco après la commande Party et l'affiche, sans le réécrire.
   Bench b;
-  EcoParty e(b, ALL_ECO_PARTY);
+  EcoParty e(b);
   b.boiler.registers[0x2302] = {0x01};  // Éco A1 actif
   b.boiler.on_applied = [&](uint16_t a) {
     if (a == 0x2303 && b.boiler.registers[0x2303][0] == 1)
@@ -5372,7 +5130,7 @@ TEST(sim_v091_eco_and_party_together_follow_the_boiler) {
 
 TEST(sim_v091_sync_with_panel_vitotrol_and_automatic_end) {
   Bench b;
-  EcoParty e(b, ALL_ECO_PARTY);
+  EcoParty e(b);
   b.run(0, BOOT);
   // Party M2 activé à la Vitotrol, consigne Party A1 changée au panneau.
   b.boiler.registers[0x3303] = {0x01};
@@ -5403,7 +5161,7 @@ TEST(sim_v091_commands_keep_periodic_reads) {
   // Usage réaliste sur 2 h : une commande toutes les 10 min. Le brûleur
   // (30 s) garde sa cadence ; une seule commande Éco/Party à la fois.
   Bench b;
-  EcoParty e(b, ALL_ECO_PARTY);
+  EcoParty e(b);
   b.run(0, BOOT);
   const size_t order[] = {e.a1_party, e.a1_eco, e.m2_party, e.m2_eco};
   int requested = 0;

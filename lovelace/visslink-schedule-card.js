@@ -348,7 +348,7 @@ class VissLinkScheduleCard extends HTMLElement {
     }
 
     const day = data && data.days ? data.days[this._day] : undefined;
-    const editable = day && day.known && !day.locked && data.writes_enabled;
+    const editable = day && day.known && !day.locked;
     const ranges = this._draft !== null ? this._draft : this._dayRanges(this._day);
     const validation = this._draft !== null ? vlValidate(this._draft) : "";
     const editor = !day
@@ -403,7 +403,6 @@ class VissLinkScheduleCard extends HTMLElement {
       ? `<button class="link" data-act="undo">Annuler la dernière modification (${VL_DAYS_SHORT[data.undo.day]})</button>`
       : "";
     const warnings = [];
-    if (data && data.writes_enabled === false) warnings.push("Écritures de programmation désactivées sur l'ESP (lecture seule).");
     if (data && data.link_ok === false) warnings.push("Liaison Optolink non synchronisée.");
 
     this.shadowRoot.innerHTML = `<style>${VL_STYLE}</style>

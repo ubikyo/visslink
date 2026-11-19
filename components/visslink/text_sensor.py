@@ -160,9 +160,7 @@ def _validate_clock(config):
 
 # Horloge de la Vitotronic, lecture seule (v0.5).
 CLOCK_SCHEMA = cv.All(
-    text_sensor.text_sensor_schema(
-        VissLinkClockText, icon=ICON_CLOCK, entity_category="diagnostic"
-    )
+    text_sensor.text_sensor_schema(VissLinkClockText, icon=ICON_CLOCK)
     .extend(REGISTER_SCHEMA)
     .extend(
         {

@@ -1,5 +1,11 @@
 # VissLink et Versatile Thermostat (v0.7)
 
+> **v1.0.0 :** document historique. Les options d'autorisation (`enable_*`,
+> `allow_write`, `validated_days`), les entités « État modification / commande »
+> et les exemples intermédiaires cités ici n'existent plus. État actuel :
+> `docs/v1.0.0.md` et `examples/iot-viessmann-v1.0.0.yaml`.
+
+
 Ce document décrit comment les entités VissLink des circuits A1 (radiateurs)
 et M2 (plancher chauffant) peuvent cohabiter avec les thermostats
 Versatile Thermostat (VTherm) existants. **Il ne modifie aucun VTherm

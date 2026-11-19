@@ -23,8 +23,8 @@ Action Home Assistant : `heating` seulement en Chauffe, `idle` en Inertie
 Sans `burner_id`, l'action n'est jamais `heating`. Aucune lecture Optolink
 supplémentaire : seules les entités existantes sont utilisées.
 
-Les commandes suivent les chemins des entités : enable_heating_setpoint_writes
-pour la consigne, enable_mode_writes + enable_m2_mode_write pour le mode.
+Les commandes suivent les chemins des entités : transaction de la consigne
+confort 0x3306, sélecteur de programme de M2.
 Ce n'est pas un thermostat de pièce : voir docs/versatile-thermostat-v0.7.md.
 """
 

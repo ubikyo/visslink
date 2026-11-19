@@ -245,8 +245,8 @@ static_assert(BLOCK_OWNER_EDITOR == WriteArbiter::EDITOR_OWNER, "block owners");
 /// Consigne réglable (v0.3) : registre uint8 de la liste blanche, lu
 /// périodiquement comme un capteur. L'état publié provient toujours d'une
 /// lecture, jamais de la valeur demandée. Une demande n'aboutit à une
-/// écriture que si `enable_writes: true` et si toutes les protections
-/// passent (cf. VissLinkComponent::submit_write).
+/// écriture que si toutes les protections passent (cf.
+/// VissLinkComponent::submit_write).
 class VissLinkNumber : public number::Number, public VissLinkRegister {
  public:
   void set_parent(VissLinkComponent *parent) { this->parent_ = parent; }
@@ -310,10 +310,8 @@ class VissLinkClockText : public text_sensor::TextSensor, public VissLinkRegiste
 /// Programme de fonctionnement modifiable (v0.4, expérimental) : 0x2301 (A1)
 /// ou 0x3301 (M2). Options : ECS seule (00), Chauffage + ECS (03), Arrêt
 /// (05). Toute autre valeur lue rend l'état inconnu, avec un avertissement.
-/// L'état publié provient toujours d'une lecture. Écriture : A1 exige
-/// `enable_writes` ET `enable_mode_writes` ; M2 exige en plus
-/// `enable_m2_mode_write` (mode_write_permitted, vérifié à la demande et
-/// juste avant l'émission).
+/// L'état publié provient toujours d'une lecture. Écriture : valeur 00/03/05
+/// de MODE_WRITE_WHITELIST, vérifiée à la demande et juste avant l'émission.
 class VissLinkModeSelect : public select::Select, public VissLinkRegister {
  public:
   void set_parent(VissLinkComponent *parent) { this->parent_ = parent; }
@@ -341,9 +339,9 @@ class VissLinkModeSelect : public select::Select, public VissLinkRegister {
 /// 0x2303 (A1), 0x3302, 0x3303 (M2). 00 = off, 01 = on ; toute autre valeur
 /// lue n'est pas interprétée (l'état publié reste le dernier état valide,
 /// avertissement). L'état publié provient toujours d'une lecture, jamais de
-/// la commande. Écriture : enable_writes ET `allow_write` de l'entité
-/// (eco_party_write_permitted, vérifié à la demande et juste avant
-/// l'émission) ; jamais au démarrage (restore_mode DISABLED imposé).
+/// la commande. Écriture : 00/01 sur ECO_PARTY_FLAGS seulement, vérifié à la
+/// demande et juste avant l'émission ; jamais au démarrage (restore_mode
+/// DISABLED imposé).
 class VissLinkFlagSwitch : public switch_::Switch, public VissLinkRegister {
  public:
   void set_parent(VissLinkComponent *parent) { this->parent_ = parent; }
@@ -386,48 +384,13 @@ class VissLinkComponent : public Component, public uart::UARTDevice {
   void set_sync_timeout(uint32_t ms) { this->kw_.set_sync_timeout(ms); }
   void set_response_timeout(uint32_t ms) { this->kw_.set_response_timeout(ms); }
   void set_max_retries(uint8_t retries) { this->scheduler_.set_max_retries(retries); }
-  /// Écritures Optolink (v0.3) : false par défaut, n'est activé que par
-  /// `enable_writes: true` dans le YAML.
-  void set_enable_writes(bool enable) { this->enable_writes_ = enable; }
-
-  /// Écriture des programmes de fonctionnement (v0.3, expérimental) : false
-  /// par défaut, exige aussi enable_writes.
-  void set_enable_mode_writes(bool enable) { this->enable_mode_writes_ = enable; }
-  /// Écriture du programme de M2 (0x3301, v0.4, non documentée) : false par
-  /// défaut, exige aussi enable_writes et enable_mode_writes.
-  void set_enable_m2_mode_write(bool enable) { this->enable_m2_mode_write_ = enable; }
-  /// Écriture des blocs horaires du bouclage (v0.5, expérimental) : false par
-  /// défaut, exige aussi enable_writes.
-  void set_enable_schedule_writes(bool enable) { this->enable_schedule_writes_ = enable; }
-  /// Écriture de la consigne ECS (0x6300, v0.6, expérimental) : false par
-  /// défaut, exige aussi enable_writes. Aucune autre autorisation ne la permet.
-  void set_enable_dhw_setpoint_write(bool enable) { this->enable_dhw_setpoint_write_ = enable; }
-  bool dhw_setpoint_writes_enabled() const { return this->enable_writes_ && this->enable_dhw_setpoint_write_; }
-  /// Écriture des consignes de chauffage A1/M2 (0x2306, 0x2307, 0x3306,
-  /// 0x3307, v0.7, expérimental) : false par défaut, exige aussi
-  /// enable_writes. Aucune autre autorisation ne la permet.
-  void set_enable_heating_setpoint_writes(bool enable) { this->enable_heating_setpoint_writes_ = enable; }
-  bool heating_setpoint_writes_enabled() const {
-    return this->enable_writes_ && this->enable_heating_setpoint_writes_;
-  }
 #ifdef USE_NUMBER
-  /// Consigne (ECS ou chauffage) gérée par sa transaction dédiée (v0.6/v0.7).
+  /// Consigne (ECS, chauffage ou Party) gérée par sa transaction dédiée.
   void add_setpoint_number(VissLinkNumber *number);
-#ifdef USE_TEXT_SENSOR
-  /// Texte facultatif d'état des modifications de cette consigne.
-  void set_setpoint_status_sensor(VissLinkNumber *number, text_sensor::TextSensor *sensor);
-#endif
-#endif
-#ifdef USE_NUMBER
-  /// v0.9.1 : consigne Party, option `allow_write` de l'entité.
-  void set_setpoint_allow_write(VissLinkNumber *number, bool allow);
 #endif
 #ifdef USE_SWITCH
-  /// v0.9.1 : commande Éco/Party et son option `allow_write`.
-  void add_flag_switch(VissLinkFlagSwitch *sw, bool allow_write);
-#ifdef USE_TEXT_SENSOR
-  void set_flag_status_sensor(VissLinkFlagSwitch *sw, text_sensor::TextSensor *sensor);
-#endif
+  /// v0.9.1 : commande Éco/Party.
+  void add_flag_switch(VissLinkFlagSwitch *sw);
   /// Demande venant de Home Assistant (VissLinkFlagSwitch::write_state).
   void submit_flag_write(VissLinkFlagSwitch *sw, bool on);
 #endif
@@ -449,7 +412,6 @@ class VissLinkComponent : public Component, public uart::UARTDevice {
   /// d'une programmation, espacés de BLOCK_DELAY_MS). Sans effet si un cycle
   /// est déjà en cours.
   bool request_register_cycle(const VissLinkRegister *reg);
-  bool schedule_writes_enabled() const { return this->enable_writes_ && this->enable_schedule_writes_; }
   bool link_ok() const { return this->link_ok_; }
   /// Aucune écriture en attente ni en cours (consignes, programmes, blocs).
   bool writes_idle() const { return this->writes_.pending_count() == 0 && !this->writes_.active(); }
@@ -517,40 +479,27 @@ class VissLinkComponent : public Component, public uart::UARTDevice {
     VissLinkRegister *reg;
     int owner{WriteArbiter::NONE};
     SetpointWriter writer;
-    uint32_t published{0};  ///< version du texte publiée
-    bool allow_write{true};  ///< v0.9.1 : consigne Party, option de l'entité
-#ifdef USE_TEXT_SENSOR
-    text_sensor::TextSensor *status{nullptr};
-#endif
+    uint32_t published{1};  ///< version de l'état journalisée (1 : état initial, non journalisé)
   };
   // v0.9.1 : commandes Éco/Party, une transaction par registre.
   struct FlagChannel {
-    FlagChannel(VissLinkRegister *r, uint16_t address, bool allow) : reg(r), writer(address), allow_write(allow) {}
+    FlagChannel(VissLinkRegister *r, uint16_t address) : reg(r), writer(address) {}
     VissLinkRegister *reg;
     int owner{WriteArbiter::NONE};
     FlagWriter writer;
-    bool allow_write;
-    uint32_t published{0};
-#ifdef USE_TEXT_SENSOR
-    text_sensor::TextSensor *status{nullptr};
-#endif
+    uint32_t published{1};  ///< version de l'état journalisée (1 : état initial, non journalisé)
   };
   void flag_on_read_(FlagChannel &ch, bool ok, uint8_t value, bool verify, bool after_peer_write, uint32_t now);
   void flag_publish_(FlagChannel &ch);
   FlagChannel *flag_channel_(int index);
   /// Commande Éco/Party de l'autre fonction du même circuit, ou NONE.
   int flag_peer_of_(int index) const;
-  bool flag_permitted_(const FlagChannel &ch) const {
-    return eco_party_write_permitted(ch.writer.address(), this->enable_writes_, ch.allow_write) ==
-           EcoPartyPermission::OK;
-  }
 #ifdef USE_NUMBER
   void submit_setpoint_(SetpointChannel &ch, VissLinkNumber *number, float value);
 #endif
   void setpoint_on_read_(SetpointChannel &ch, bool ok, uint8_t value, bool verify, uint32_t now);
   void setpoint_publish_(SetpointChannel &ch);
   SetpointChannel *setpoint_channel_(int index);
-  bool setpoint_permitted_(uint16_t address) const;
   /// Consignes dont l'écriture attend (restauration du bouclage en cours).
   OwnerSet deferred_setpoints_() const;
 
@@ -558,12 +507,6 @@ class VissLinkComponent : public Component, public uart::UARTDevice {
   RegisterScheduler scheduler_;
   std::vector<VissLinkRegister *> registers_;  ///< même index que l'ordonnanceur
   bool link_ok_{false};
-  bool enable_writes_{false};
-  bool enable_mode_writes_{false};
-  bool enable_m2_mode_write_{false};
-  bool enable_schedule_writes_{false};
-  bool enable_dhw_setpoint_write_{false};
-  bool enable_heating_setpoint_writes_{false};
   std::vector<SetpointChannel> setpoints_;  ///< consignes déclarées (au plus 7)
   std::vector<FlagChannel> flags_;          ///< v0.9.1 : commandes Éco/Party (au plus 4)
   BlockClients block_clients_;

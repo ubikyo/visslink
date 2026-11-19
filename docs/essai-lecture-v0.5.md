@@ -1,5 +1,11 @@
 # Essai en lecture seule — VissLink v0.5
 
+> **v1.0.0 :** document historique. Les options d'autorisation (`enable_*`,
+> `allow_write`, `validated_days`), les entités « État modification / commande »
+> et les exemples intermédiaires cités ici n'existent plus. État actuel :
+> `docs/v1.0.0.md` et `examples/iot-viessmann-v1.0.0.yaml`.
+
+
 Configuration :
 [`examples/iot-viessmann-essai-lecture-v0.5.yaml`](../examples/iot-viessmann-essai-lecture-v0.5.yaml).
 

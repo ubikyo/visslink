@@ -1,0 +1,589 @@
+# VissLink v1.0.0 — configuration ESPHome définitive
+#
+# Installation : Vitocrossal 300 CU03 (brûleur VGM I-2), Vitotronic 300 KW3
+# (209C), A1 radiateurs, M2 plancher chauffant avec Vitotrol 200, ECS
+# Vitocell 300-V, Wemos D1 Mini (ESP8266), Home Assistant.
+#
+# Toutes les commandes sont directement utilisables : aucune option
+# d'autorisation. Seules les protections techniques s'appliquent : adresses
+# des listes blanches, plages de valeurs, une écriture à la fois, accusé,
+# relecture de confirmation, restauration du bouclage. L'état affiché est
+# toujours la valeur LUE dans la Vitotronic : une modification faite au
+# panneau ou à la Vitotrol apparaît à la lecture suivante et n'est jamais
+# écrasée. Le résultat de chaque commande est écrit dans le journal ESPHome
+# (aucune entité d'état par commande).
+#
+# Les identifiants sont lus dans secrets.yaml (non versionné), voir
+# secrets.yaml.example. Flasher ce fichier REMPLACE le firmware en place.
+
+esphome:
+  name: iot-viessmann
+  friendly_name: Chaudière Viessmann
+
+esp8266:
+  board: d1_mini
+
+external_components:
+  - source: github://ubikyo/visslink@v1.0.0
+    components: [visslink, visslink_boost, visslink_schedule_editor, visslink_burner]
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "iot-viessmann Fallback"
+    password: !secret fallback_ap_password
+
+captive_portal:
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+  # Actions de l'éditeur des programmations (carte Lovelace, scripts).
+  # Dans Home Assistant : esphome.iot_viessmann_visslink_schedule_read, etc.
+  # circuit : a1, m2, ecs ou bouclage ; days : "0,1,2" (0 = lundi ...
+  # 6 = dimanche) ou "*" (les sept) ; ranges : "06:00-08:30,17:00-22:00" ("" = aucune plage) ;
+  # expected : champ `expected` renvoyé par visslink_schedule_read (bloc
+  # affiché), ou "" pour la dernière lecture de l'ESP.
+  actions:
+    - action: visslink_schedule_read
+      variables:
+        circuit: string
+      then:
+        - api.respond:
+            data: !lambda "id(programmations).read(circuit, root);"
+    - action: visslink_schedule_set
+      variables:
+        circuit: string
+        days: string
+        ranges: string
+        expected: string
+      then:
+        - api.respond:
+            success: !lambda "return id(programmations).set_days(circuit, days, ranges, expected);"
+            error_message: !lambda "return id(programmations).last_error();"
+    - action: visslink_schedule_copy
+      variables:
+        circuit: string
+        source: int
+        days: string
+        expected: string
+      then:
+        - api.respond:
+            success: !lambda "return id(programmations).copy_day(circuit, source, days, expected);"
+            error_message: !lambda "return id(programmations).last_error();"
+    - action: visslink_schedule_clear
+      variables:
+        circuit: string
+        days: string
+        expected: string
+      then:
+        - api.respond:
+            success: !lambda "return id(programmations).clear_days(circuit, days, expected);"
+            error_message: !lambda "return id(programmations).last_error();"
+    - action: visslink_schedule_refresh
+      variables:
+        circuit: string
+      then:
+        - api.respond:
+            success: !lambda "return id(programmations).refresh(circuit);"
+            error_message: !lambda "return id(programmations).last_error();"
+    - action: visslink_schedule_undo
+      then:
+        - api.respond:
+            success: !lambda "return id(programmations).undo();"
+            error_message: !lambda "return id(programmations).last_error();"
+
+ota:
+  - platform: esphome
+    # Chiffrement OTA avec la clé de l'API (recommandé par ESPHome 2026.10).
+    encryption: {}
+
+# L'UART matériel (GPIO1/GPIO3) est réservé à l'Optolink :
+# les journaux passent uniquement par l'API / le réseau.
+logger:
+  level: DEBUG
+  baud_rate: 0
+
+# Optolink : 4800 bauds, 8 bits, parité paire, 2 bits de stop (8E2).
+uart:
+  id: optolink_uart
+  tx_pin: GPIO1
+  rx_pin: GPIO3
+  baud_rate: 4800
+  data_bits: 8
+  parity: EVEN
+  stop_bits: 2
+
+# Heure locale fournie par Home Assistant : jour courant et plage active des
+# programmations, bouclage à la demande.
+time:
+  - platform: homeassistant
+    id: ha_time
+
+visslink:
+  id: viessmann
+  uart_id: optolink_uart
+  sync_timeout: 10s       # attente maximale du caractère de synchro 0x05
+  response_timeout: 1s    # attente maximale de la réponse après la requête
+  max_retries: 2          # nouvelles tentatives avant d'abandonner le cycle
+
+sensor:
+  # --- Températures (int16, dixièmes de degré) ------------------------------
+  - platform: visslink
+    name: "Température extérieure"
+    address: 0x0800
+    data_type: int16
+    update_interval: 60s
+    unit_of_measurement: "°C"
+    device_class: temperature
+    filters:
+      - multiply: 0.1
+
+  - platform: visslink
+    id: temperature_chaudiere
+    name: "Température chaudière"
+    address: 0x0802
+    data_type: int16
+    update_interval: 60s
+    unit_of_measurement: "°C"
+    device_class: temperature
+    filters:
+      - multiply: 0.1
+
+  - platform: visslink
+    name: "Température ECS"
+    address: 0x0804
+    data_type: int16
+    update_interval: 60s
+    unit_of_measurement: "°C"
+    device_class: temperature
+    filters:
+      - multiply: 0.1
+
+  - platform: visslink
+    name: "Température départ M2"
+    address: 0x3900
+    data_type: int16
+    update_interval: 60s
+    unit_of_measurement: "°C"
+    device_class: temperature
+    filters:
+      - multiply: 0.1
+
+  # Ambiance mesurée par la Vitotrol 200 du plancher (source d'ambiance du
+  # climate M2 ; FF FF = indisponible).
+  - platform: visslink
+    visslink_id: viessmann
+    id: m2_room_temperature
+    name: "Plancher chauffant - Température ambiante (Vitotrol)"
+    address: 0x0898
+    data_type: int16
+    invalid_values: [0xFFFF]
+    update_interval: 60s
+    unit_of_measurement: "°C"
+    device_class: temperature
+    filters:
+      - multiply: 0.1
+
+  # Consigne chaudière calculée par la régulation (lecture seule).
+  - platform: visslink
+    name: "Consigne chaudière calculée"
+    address: 0x5502
+    data_type: int16
+    update_interval: 2min
+    unit_of_measurement: "°C"
+    device_class: temperature
+    filters:
+      - multiply: 0.1
+
+  # --- Courbes de chauffe (lecture seule) -----------------------------------
+  # vcontrold (Vitotronic KW) : pente = 1 octet / 10 (getNeigungM1/M2),
+  # parallèle = 1 octet signé, en K (getNiveauM1/M2). Jamais écrites.
+  - platform: visslink
+    name: "Radiateurs - Pente courbe de chauffe"
+    address: 0x2305
+    data_type: uint8
+    update_interval: 1h
+    accuracy_decimals: 1
+    icon: mdi:chart-line
+    filters:
+      - multiply: 0.1
+
+  - platform: visslink
+    name: "Radiateurs - Parallèle courbe de chauffe"
+    address: 0x2304
+    data_type: uint8
+    update_interval: 1h
+    unit_of_measurement: "K"
+    accuracy_decimals: 0
+    icon: mdi:chart-line-variant
+    filters:
+      - lambda: "return x > 127 ? x - 256 : x;"
+
+  - platform: visslink
+    name: "Plancher chauffant - Pente courbe de chauffe"
+    address: 0x3305
+    data_type: uint8
+    update_interval: 1h
+    accuracy_decimals: 1
+    icon: mdi:chart-line
+    filters:
+      - multiply: 0.1
+
+  - platform: visslink
+    name: "Plancher chauffant - Parallèle courbe de chauffe"
+    address: 0x3304
+    data_type: uint8
+    update_interval: 1h
+    unit_of_measurement: "K"
+    accuracy_decimals: 0
+    icon: mdi:chart-line-variant
+    filters:
+      - lambda: "return x > 127 ? x - 256 : x;"
+
+  # --- Brûleur (compteurs uint32) -------------------------------------------
+  - platform: visslink
+    id: demarrages_bruleur
+    name: "Démarrages brûleur"
+    address: 0x088A
+    data_type: uint32
+    update_interval: 1h
+    state_class: total_increasing
+    accuracy_decimals: 0
+
+  - platform: visslink
+    id: fonctionnement_bruleur
+    name: "Heures de fonctionnement brûleur"
+    address: 0x08A7
+    data_type: uint32          # secondes
+    update_interval: 1h
+    unit_of_measurement: "h"
+    device_class: duration
+    state_class: total_increasing
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.00027777778  # s -> h
+
+  # --- Réseau et uptime de l'ESP (aucune lecture Optolink) -------------------
+  # Classés dans « Capteurs » (ESPHome les met sinon en « Diagnostic »).
+  - platform: wifi_signal
+    name: "VissLink - Signal Wi-Fi"
+    update_interval: 60s
+    entity_category: ""
+  - platform: uptime
+    name: "VissLink - Uptime"
+    entity_category: ""
+
+binary_sensor:
+  # 0x00 = arrêt, 0x01 = marche ; toute autre valeur : inconnu + avertissement.
+  - platform: visslink
+    id: bruleur_actif
+    name: "Brûleur actif"
+    address: 0x0842
+    update_interval: 30s
+    device_class: running
+
+  # État réel de la pompe de bouclage ECS (sortie de la régulation). Jamais
+  # écrit : le bouclage à la demande agit sur la programmation.
+  - platform: visslink
+    name: "Bouclage ECS - Pompe bouclage"
+    address: 0x0846
+    update_interval: 15s
+    device_class: running
+
+  # Circulateur du plancher M2 (état du climate, affichage seulement).
+  - platform: visslink
+    visslink_id: viessmann
+    id: m2_pump
+    name: "Plancher chauffant - Circulateur"
+    address: 0x3906
+    update_interval: 60s
+    device_class: running
+
+# --- Éco et Party A1 / M2 -----------------------------------------------------
+# 00 = inactif, 01 = actif. L'état affiché est l'état LU (60 s, et juste après
+# chaque commande, avec l'autre fonction du même circuit). Jamais de commande
+# au démarrage. Fins automatiques de la régulation : Éco au prochain passage
+# en réduit, Party au prochain passage en normal.
+switch:
+  - platform: visslink
+    visslink_id: viessmann
+    name: "Radiateurs - Éco"
+    address: 0x2302
+    update_interval: 60s
+    icon: mdi:leaf
+
+  - platform: visslink
+    visslink_id: viessmann
+    name: "Radiateurs - Party"
+    address: 0x2303
+    update_interval: 60s
+    icon: mdi:party-popper
+
+  - platform: visslink
+    visslink_id: viessmann
+    name: "Plancher chauffant - Éco"
+    address: 0x3302
+    update_interval: 60s
+    icon: mdi:leaf
+
+  - platform: visslink
+    visslink_id: viessmann
+    name: "Plancher chauffant - Party"
+    address: 0x3303
+    update_interval: 60s
+    icon: mdi:party-popper
+
+# --- Consignes (uint8, degrés entiers) ---------------------------------------
+# Toujours la valeur LUE (et relue juste après une écriture). Chaque
+# modification : relecture préalable, écriture, relecture de confirmation.
+number:
+  - platform: visslink
+    visslink_id: viessmann
+    name: "Radiateurs - Consigne confort"
+    address: 0x2306
+    min_value: 16
+    max_value: 23
+    step: 1
+    update_interval: 60s
+    unit_of_measurement: "°C"
+    mode: box
+
+  - platform: visslink
+    visslink_id: viessmann
+    name: "Radiateurs - Consigne réduite"
+    address: 0x2307
+    min_value: 10
+    max_value: 20
+    step: 1
+    update_interval: 60s
+    unit_of_measurement: "°C"
+    mode: box
+
+  - platform: visslink
+    visslink_id: viessmann
+    id: m2_comfort_setpoint
+    name: "Plancher - Consigne confort"
+    address: 0x3306
+    min_value: 16
+    max_value: 22
+    step: 1
+    update_interval: 60s
+    unit_of_measurement: "°C"
+    mode: box
+
+  - platform: visslink
+    visslink_id: viessmann
+    name: "Plancher - Consigne réduite"
+    address: 0x3307
+    min_value: 14
+    max_value: 20
+    step: 1
+    update_interval: 60s
+    unit_of_measurement: "°C"
+    mode: box
+
+  - platform: visslink
+    visslink_id: viessmann
+    name: "ECS - Consigne"
+    address: 0x6300
+    min_value: 40
+    max_value: 60
+    step: 1
+    unit_of_measurement: "°C"
+    mode: box
+
+  # Consignes Party : sans lien avec les consignes confort/réduite.
+  - platform: visslink
+    visslink_id: viessmann
+    name: "Radiateurs - Consigne Party"
+    address: 0x2308
+    min_value: 16
+    max_value: 23
+    step: 1
+    update_interval: 5min
+    unit_of_measurement: "°C"
+    mode: slider
+    icon: mdi:party-popper
+
+  - platform: visslink
+    visslink_id: viessmann
+    name: "Plancher chauffant - Consigne Party"
+    address: 0x3308
+    min_value: 16
+    max_value: 22
+    step: 1
+    update_interval: 5min
+    unit_of_measurement: "°C"
+    mode: slider
+    icon: mdi:party-popper
+
+# --- Modes de fonctionnement ---------------------------------------------------
+# 00 = ECS seule, 03 = Chauffage + ECS, 05 = Arrêt ; toute autre valeur :
+# inconnu. Après chaque commande, A1 et M2 sont relus ; `divergence` signale
+# des modes différents, jamais corrigés automatiquement.
+select:
+  - platform: visslink
+    visslink_id: viessmann
+    name: "Radiateurs - Mode actuel"
+    address: 0x2301
+    update_interval: 5min
+    divergence:
+      name: "Modes A1 et M2 différents"
+
+  - platform: visslink
+    visslink_id: viessmann
+    id: m2_mode
+    name: "Plancher chauffant - Mode actuel"
+    address: 0x3301
+    update_interval: 5min
+
+# --- Climate du plancher M2 ------------------------------------------------------
+# Cible = consigne confort de M2 (0x3306) ; ambiance = Vitotrol ; HEAT =
+# programme 03, OFF = 00 (ECS seule). État : Chauffe / Inertie / Arrêt.
+climate:
+  - platform: visslink
+    visslink_id: viessmann
+    name: "Plancher chauffant"
+    comfort_setpoint_id: m2_comfort_setpoint
+    mode_id: m2_mode
+    current_temperature_id: m2_room_temperature
+    pump_id: m2_pump
+    burner_id: bruleur_actif
+    status:
+      name: "Plancher chauffant - État"
+
+# --- Bouclage ECS à la demande ---------------------------------------------------
+# Ajoute une plage temporaire au bloc du jour de la programmation du bouclage,
+# puis rétablit exactement le bloc d'origine (sauvegardé en flash avant toute
+# écriture). La pompe reste commandée par la régulation.
+visslink_boost:
+  visslink_id: viessmann
+  time_id: ha_time
+  start:
+    name: "Bouclage ECS — Démarrer maintenant"
+  duration:
+    name: "Bouclage ECS — Durée"
+  restore:
+    name: "Bouclage ECS — Restaurer la programmation"
+  forget:
+    name: "Bouclage ECS — Oublier la sauvegarde"
+  active:
+    name: "Bouclage ECS — Plage temporaire en cours"
+  range:
+    name: "Bouclage ECS — Plage inscrite"
+  remaining:
+    name: "Bouclage ECS — Temps restant"
+  restoring:
+    name: "Bouclage ECS — Restauration en cours"
+  restore_required:
+    name: "Bouclage ECS — Restauration nécessaire"
+  status:
+    name: "Bouclage ECS — État de l'opération"
+
+# --- Programmations horaires -------------------------------------------------------
+# `address` est celle du lundi ; les 7 jours sont lus à address + 8 × jour.
+# `today` : programmation du jour. `active` : une plage programmée est en cours
+# (n'indique PAS que le brûleur ou une pompe fonctionne réellement).
+text_sensor:
+  - platform: visslink
+    id: programmation_a1
+    name: "Radiateurs - Programmation"
+    address: 0x2000
+    update_interval: 6h
+    time_id: ha_time
+    today:
+      name: "Radiateurs - Programmation du jour"
+    active:
+      name: "Radiateurs - Plage active"
+
+  - platform: visslink
+    id: programmation_m2
+    name: "Plancher - Programmation"
+    address: 0x3000
+    update_interval: 6h
+    time_id: ha_time
+    today:
+      name: "Plancher - Programmation du jour"
+    active:
+      name: "Plancher - Plage active"
+
+  - platform: visslink
+    id: programmation_ecs
+    name: "ECS - Programmation"
+    address: 0x2100
+    update_interval: 6h
+    time_id: ha_time
+    today:
+      name: "ECS - Programmation du jour"
+    active:
+      name: "ECS - Plage active"
+
+  - platform: visslink
+    id: programmation_bouclage
+    name: "Bouclage ECS - Programmation"
+    address: 0x2200
+    update_interval: 6h
+    time_id: ha_time
+    today:
+      name: "Bouclage ECS - Programmation du jour"
+    active:
+      name: "Bouclage ECS - Plage active"
+
+  # Réseau (aucune lecture Optolink), classé dans « Capteurs ».
+  - platform: wifi_info
+    ip_address:
+      name: "VissLink - Adresse IP"
+      entity_category: ""
+    ssid:
+      name: "VissLink - Réseau Wi-Fi"
+      entity_category: ""
+
+  # Horloge de la Vitotronic (0x088E), lecture seule.
+  - platform: visslink
+    visslink_id: viessmann
+    type: vito_clock
+    name: "Vitotronic - Horloge"
+
+# --- Éditeur des programmations ----------------------------------------------------
+# Réutilise les quatre programmations ci-dessus ; lit seulement le bloc
+# modifié, avant et après l'écriture. Carte Lovelace :
+# lovelace/visslink-schedule-card.js.
+visslink_schedule_editor:
+  id: programmations
+  visslink_id: viessmann
+  schedules:
+    - programmation_a1
+    - programmation_m2
+    - programmation_ecs
+    - programmation_bouclage
+  status:
+    name: "Programmations - État de l'édition"
+
+# --- Cycles du brûleur ---------------------------------------------------------------
+# Aucune lecture Optolink : observe 0x0842, 0x088A, 0x08A7 et 0x0802.
+# EXACT (compteurs) : démarrages sur 24 h, par heure, durée moyenne.
+# ESTIMÉ (brûleur lu toutes les 30 s, ± 15 s par changement d'état) : dernier
+# cycle, dernier arrêt, températures au démarrage et à l'arrêt.
+visslink_burner:
+  burner_id: bruleur_actif
+  starts_id: demarrages_bruleur
+  runtime_id: fonctionnement_bruleur
+  boiler_temperature_id: temperature_chaudiere
+  starts_24h:
+    name: "Brûleur - Démarrages sur 24 h"
+  starts_per_hour:
+    name: "Brûleur - Démarrages par heure"
+  average_runtime:
+    name: "Brûleur - Durée moyenne de fonctionnement"
+  last_cycle:
+    name: "Brûleur - Durée du dernier cycle (estimation)"
+  last_stop:
+    name: "Brûleur - Durée du dernier arrêt (estimation)"
+  start_temperature:
+    name: "Brûleur - Température chaudière au démarrage (estimation)"
+  stop_temperature:
+    name: "Brûleur - Température chaudière à l'arrêt (estimation)"
+  status:
+    name: "Brûleur - Précision des cycles"

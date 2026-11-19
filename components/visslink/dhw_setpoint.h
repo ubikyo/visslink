@@ -1,36 +1,29 @@
 #pragma once
 
-// Consigne d'eau chaude sanitaire (v0.6, EXPÉRIMENTAL, désactivée par défaut).
+// Consignes : eau chaude sanitaire (0x6300), chauffage A1/M2 (0x2306, 0x2307,
+// 0x3306, 0x3307) et Party A1/M2 (0x2308, 0x3308). SetpointWriter(adresse).
 //
 // Indépendant d'ESPHome (testé sur PC). Décide, le composant exécute :
 //
-//   demande HA -> autorisations, limites, liaison, opération en cours
-//              -> RELECTURE préalable de 0x6300 (valeur actuelle, panneau)
+//   demande HA -> limites, liaison, opération en cours
+//              -> RELECTURE préalable de la consigne (valeur actuelle, panneau)
 //              -> identique : rien n'est écrit
 //              -> différente : écriture d'un octet (WriteArbiter), accusé,
 //                 relecture, comparaison exacte -> confirmée / échec /
 //                 indéterminée.
 //
 // Règles :
-//  - enable_writes ET enable_dhw_setpoint_write, revérifiés à l'émission ;
-//  - valeur entière dans les bornes du number ET dans DHW_WRITE_MIN..MAX ;
+//  - seules les adresses des listes blanches (write_guard.h) ;
+//  - valeur entière dans les bornes du number ET dans les limites internes
+//    du registre ; chauffage : confort >= réduite du même circuit ; Party :
+//    aucun lien avec les consignes confort/réduite ;
 //  - une seule opération à la fois ; nouvelle demande refusée pendant
 //    l'opération et pendant MIN_INTERVAL_MS après une écriture ;
 //  - jamais d'écriture réémise : un échec ou une issue indéterminée est
-//    affiché, la dernière valeur confirmée reste affichée ;
+//    journalisé, la dernière valeur confirmée reste affichée ;
 //  - rien n'est persistant : après un redémarrage de l'ESP, aucune demande
 //    ne subsiste ;
 //  - la restauration du bouclage ECS passe avant (WriteArbiter, `deferred`).
-//
-// v0.7 : même transaction pour les consignes de chauffage A1/M2 (0x2306,
-// 0x2307, 0x3306, 0x3307) : SetpointWriter(adresse). Autorisation propre
-// (enable_heating_setpoint_writes), limites internes par registre, confort
-// >= réduite du même circuit. Le comportement et les messages de la consigne
-// ECS sont inchangés (DhwSetpointWriter = SetpointWriter(0x6300)).
-//
-// v0.9.1 : même transaction pour les consignes Party A1/M2 (0x2308, 0x3308) :
-// autorisations enable_writes ET `allow_write` de l'entité, limites internes
-// PARTY_SETPOINTS, aucun lien avec les consignes confort/réduite.
 
 #include <cmath>
 #include <cstdint>
@@ -45,21 +38,16 @@ namespace visslink {
 
 /// Conditions d'une demande, fournies par le composant.
 struct DhwContext {
-  bool enable_writes{false};
-  bool enable_dhw_setpoint_write{false};
   bool link_ok{false};
   bool has_value{false};  ///< une valeur a été lue (état du number)
   float config_min{0};    ///< bornes du number (min_value / max_value)
   float config_max{0};
   // v0.7, consignes de chauffage :
-  bool enable_heating_setpoint_writes{false};
   bool peer_known{false};  ///< l'autre consigne du circuit a été lue
   uint8_t peer_value{0};
   // v0.7, garde commune à toutes les consignes (setpoint_gate) :
   bool other_busy{false};    ///< une autre consigne est en cours de modification
   bool other_recent{false};  ///< une autre consigne a été écrite il y a moins de GLOBAL_SPACING_MS
-  // v0.9.1, consignes Party : option `allow_write` de l'entité.
-  bool allow_party_write{false};
 };
 using SetpointContext = DhwContext;
 
@@ -119,35 +107,8 @@ class SetpointWriter {
 
   /// Demande venant de Home Assistant.
   DhwAction request(float value, const DhwContext &ctx, uint32_t now) {
-    if (this->party_ != nullptr) {
-      const EcoPartyPermission permission =
-          eco_party_write_permitted(this->address_, ctx.enable_writes, ctx.allow_party_write);
-      if (permission == EcoPartyPermission::WRITES_DISABLED)
-        return this->refuse_(VL_TEXT("écritures désactivées (enable_writes: false)"),
-                             eco_party_permission_to_string(permission));
-      if (permission != EcoPartyPermission::OK)
-        return this->refuse_(VL_TEXT("écriture désactivée pour cette consigne (allow_write: false)"),
-                             eco_party_permission_to_string(permission));
-    } else if (this->heating_ != nullptr) {
-      const HeatingPermission permission =
-          heating_write_permitted(this->address_, ctx.enable_writes, ctx.enable_heating_setpoint_writes);
-      if (permission == HeatingPermission::WRITES_DISABLED)
-        return this->refuse_(VL_TEXT("écritures désactivées (enable_writes: false)"),
-                             heating_permission_to_string(permission));
-      if (permission != HeatingPermission::OK)
-        return this->refuse_(
-            VL_TEXT("écriture des consignes de chauffage désactivée (enable_heating_setpoint_writes: false)"),
-            heating_permission_to_string(permission));
-    } else {
-      const DhwPermission permission =
-          dhw_write_permitted(this->address_, ctx.enable_writes, ctx.enable_dhw_setpoint_write);
-      if (permission == DhwPermission::WRITES_DISABLED)
-        return this->refuse_(VL_TEXT("écritures désactivées (enable_writes: false)"),
-                             dhw_permission_to_string(permission));
-      if (permission != DhwPermission::OK)
-        return this->refuse_(VL_TEXT("écriture de la consigne ECS désactivée (enable_dhw_setpoint_write: false)"),
-                             dhw_permission_to_string(permission));
-    }
+    if (this->heating_ == nullptr && this->party_ == nullptr && !is_dhw_setpoint_write_whitelisted(this->address_))
+      return this->refuse_(VL_TEXT("registre non géré"), "not a managed setpoint register");
     uint8_t byte = 0;
     const WriteCheck check = check_write_value(this->address_, 1, value, ctx.config_min, ctx.config_max, &byte);
     if (check != WriteCheck::OK) {

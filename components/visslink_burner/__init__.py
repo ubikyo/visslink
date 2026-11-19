@@ -26,7 +26,6 @@ from esphome.const import (
     CONF_PLATFORM,
     DEVICE_CLASS_DURATION,
     DEVICE_CLASS_TEMPERATURE,
-    ENTITY_CATEGORY_DIAGNOSTIC,
     STATE_CLASS_MEASUREMENT,
     UNIT_CELSIUS,
     UNIT_SECOND,
@@ -86,7 +85,6 @@ def _duration_schema(icon):
         state_class=STATE_CLASS_MEASUREMENT,
         accuracy_decimals=0,
         icon=icon,
-        entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
     )
 
 
@@ -97,7 +95,6 @@ def _temperature_schema(icon):
         state_class=STATE_CLASS_MEASUREMENT,
         accuracy_decimals=1,
         icon=icon,
-        entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
     )
 
 
@@ -124,14 +121,12 @@ CONFIG_SCHEMA = cv.All(
                 state_class=STATE_CLASS_MEASUREMENT,
                 accuracy_decimals=0,
                 icon="mdi:counter",
-                entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
             ),
             cv.Optional(CONF_STARTS_PER_HOUR): sensor.sensor_schema(
                 unit_of_measurement="/h",
                 state_class=STATE_CLASS_MEASUREMENT,
                 accuracy_decimals=1,
                 icon="mdi:fire-circle",
-                entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
             ),
             cv.Optional(CONF_AVERAGE_RUNTIME): _duration_schema("mdi:timer-outline"),
             # Estimé : échantillonnage du brûleur.
@@ -145,7 +140,6 @@ CONFIG_SCHEMA = cv.All(
             ),
             cv.Optional(CONF_STATUS): text_sensor.text_sensor_schema(
                 icon="mdi:information-outline",
-                entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
             ),
         }
     ).extend(cv.COMPONENT_SCHEMA),

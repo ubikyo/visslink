@@ -35,9 +35,6 @@ void VissLinkBoost::setup() {
 
 void VissLinkBoost::dump_config() {
   ESP_LOGCONFIG(TAG, "VissLink circulation boost (experimental):");
-  ESP_LOGCONFIG(TAG, "  Schedule writes: %s",
-                this->parent_ != nullptr && this->parent_->schedule_writes_enabled() ? "ENABLED" : "disabled");
-  ESP_LOGCONFIG(TAG, "  Validated days mask: 0x%02X (bit 0 = Monday)", this->config_.validated_days_mask);
   ESP_LOGCONFIG(TAG, "  State: %s", visslink::boost_state_to_string(this->sequencer_.state()));
 }
 
@@ -87,9 +84,8 @@ void VissLinkBoost::press(BoostButton::Kind kind) {
       this->refuse_(VL_TEXT("aucune sauvegarde à oublier"), now);
     return;
   }
-  // Démarrer et restaurer écrivent dans la régulation : mêmes autorisations.
-  if (this->parent_ == nullptr || !this->parent_->schedule_writes_enabled()) {
-    this->refuse_(VL_TEXT("écritures de programmation désactivées (enable_writes / enable_schedule_writes)"), now);
+  if (this->parent_ == nullptr) {
+    this->refuse_(VL_TEXT("composant visslink absent"), now);
     return;
   }
   if (kind == BoostButton::Kind::RESTORE) {

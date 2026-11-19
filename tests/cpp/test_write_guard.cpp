@@ -161,7 +161,6 @@ TEST(mode_values_only_00_03_05) {
 TEST(mode_write_whitelist_is_a1_and_m2) {
   CHECK(is_mode_register(0x2301) && is_mode_register(0x3301));
   CHECK_EQ(MODE_WRITE_COUNT, 2u);
-  CHECK_EQ(M2_MODE_REGISTER, 0x3301);
   for (uint16_t a : {0x2301, 0x3301}) {
     for (uint8_t v : {0x00, 0x03, 0x05})
       CHECK_EQ(check_mode_write(a, 1, v), WriteCheck::OK);
@@ -173,24 +172,6 @@ TEST(mode_write_whitelist_is_a1_and_m2) {
   for (uint16_t a : {0x2302, 0x2303, 0x3303, 0x2323, 0x3323, 0x2306, 0x6300, 0x0000})
     for (uint8_t v : {0x00, 0x03, 0x05})
       CHECK_EQ(check_mode_write(a, 1, v), WriteCheck::NOT_WHITELISTED);
-}
-
-TEST(mode_write_permission_matrix) {
-  for (int mask = 0; mask < 8; mask++) {
-    const bool writes = mask & 1, modes = mask & 2, m2 = mask & 4;
-    const ModePermission a1 = mode_write_permitted(0x2301, writes, modes, m2);
-    const ModePermission b2 = mode_write_permitted(0x3301, writes, modes, m2);
-    CHECK_EQ(a1 == ModePermission::OK, writes && modes);
-    CHECK_EQ(b2 == ModePermission::OK, writes && modes && m2);
-    if (!writes)
-      CHECK(a1 == ModePermission::WRITES_DISABLED && b2 == ModePermission::WRITES_DISABLED);
-    else if (!modes)
-      CHECK(a1 == ModePermission::MODE_WRITES_DISABLED && b2 == ModePermission::MODE_WRITES_DISABLED);
-    else if (!m2)
-      CHECK(b2 == ModePermission::M2_WRITE_DISABLED);
-  }
-  for (uint16_t a : {0x2302, 0x2323, 0x3323, 0x2306})
-    CHECK(mode_write_permitted(a, true, true, true) == ModePermission::NOT_WHITELISTED);
 }
 
 TEST(mode_and_setpoint_whitelists_are_distinct) {
@@ -283,7 +264,6 @@ TEST(eco_party_registers_are_never_writable_as_setpoints_or_modes) {
     CHECK_EQ(check_write_value(a, 1, 1, 0, 1, &out), WriteCheck::NOT_WHITELISTED);
     for (uint8_t v : {0x00, 0x01})
       CHECK_EQ(check_mode_write(a, 1, v), WriteCheck::NOT_WHITELISTED);
-    CHECK(mode_write_permitted(a, true, true, true) == ModePermission::NOT_WHITELISTED);
   }
 }
 
@@ -331,15 +311,9 @@ TEST(v091_eco_party_whitelists_are_separate_and_exact) {
   CHECK(setpoint_write_limits(0x3308, &lo, &hi) && lo == 16 && hi == 22);
   // Les consignes confort/réduite et les autres registres restent hors des
   // listes Éco/Party.
-  for (uint16_t a : {0x2306, 0x2307, 0x3306, 0x3307, 0x6300, 0x2301, 0x3301, 0x2304, 0x2200})
-    CHECK_EQ(eco_party_write_permitted(a, true, true), EcoPartyPermission::NOT_WHITELISTED);
-}
-
-TEST(v091_eco_party_permission_needs_enable_writes_and_allow_write) {
-  for (uint16_t a : {0x2302, 0x2303, 0x3302, 0x3303, 0x2308, 0x3308}) {
-    CHECK_EQ(eco_party_write_permitted(a, false, true), EcoPartyPermission::WRITES_DISABLED);
-    CHECK_EQ(eco_party_write_permitted(a, false, false), EcoPartyPermission::WRITES_DISABLED);
-    CHECK_EQ(eco_party_write_permitted(a, true, false), EcoPartyPermission::ENTITY_WRITE_DISABLED);
-    CHECK_EQ(eco_party_write_permitted(a, true, true), EcoPartyPermission::OK);
+  for (uint16_t a : {0x2306, 0x2307, 0x3306, 0x3307, 0x6300, 0x2301, 0x3301, 0x2304, 0x2200}) {
+    CHECK(!is_eco_party_flag_whitelisted(a));
+    CHECK(!is_party_setpoint_write_whitelisted(a));
+    CHECK_EQ(check_flag_write(a, 1, 0x01), WriteCheck::NOT_WHITELISTED);
   }
 }

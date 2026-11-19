@@ -368,7 +368,6 @@ struct BoostAction {
 };
 
 struct BoostConfig {
-  uint8_t validated_days_mask{0};       ///< bit n : bloc du jour n validé (0 = lundi)
   uint32_t min_interval_ms{15 * 60000};  ///< entre deux déclenchements
   uint8_t max_per_day{8};               ///< déclenchements par jour (date Vitotronic)
   /// Écritures de restauration émises au plus (chacune précédée d'une
@@ -951,10 +950,6 @@ class BoostSequencer {
       delta = -delta;
     if (c.weekday != this->ha_.weekday || delta > BOOST_CLOCK_TOLERANCE_MIN) {
       this->abort_(VL_TEXT("horloges Vitotronic et Home Assistant incohérentes (") + format_vito_clock(c) + VL_TEXT(")"));
-      return;
-    }
-    if (!((this->config_.validated_days_mask >> c.weekday) & 1u)) {
-      this->abort_(VL_TEXT("correspondance du bloc non validée pour ce jour (") + format_vito_clock(c) + VL_TEXT(")"));
       return;
     }
     if (c.date_key() != this->count_date_) {

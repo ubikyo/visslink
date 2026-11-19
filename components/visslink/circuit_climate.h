@@ -19,9 +19,8 @@
 //    arrêté ; Inconnu = donnée nécessaire inconnue ou périmée (aucune lecture
 //    réussie depuis 3 intervalles + 30 s). Affichage seulement ;
 //  - commandes : HEAT -> 03, OFF -> 00 (ECS seule, l'eau chaude reste
-//    produite) ; jamais 05 ; consigne -> transaction de la consigne 0x3306
-//    (enable_heating_setpoint_writes), mode -> sélecteur de M2
-//    (enable_mode_writes + enable_m2_mode_write).
+//    produite) ; jamais 05 ; consigne -> transaction de la consigne 0x3306,
+//    mode -> sélecteur de M2.
 
 #include <cmath>
 #include <cstddef>

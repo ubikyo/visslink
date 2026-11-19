@@ -372,11 +372,7 @@ struct Rig {
   }
 };
 
-BoostConfig sunday_validated() {
-  BoostConfig c;
-  c.validated_days_mask = 1u << 6;
-  return c;
-}
+BoostConfig boost_config() { return BoostConfig(); }
 
 HaTime ha_at(uint16_t minute, uint8_t weekday = 6) {
   HaTime h;
@@ -389,7 +385,7 @@ HaTime ha_at(uint16_t minute, uint8_t weekday = 6) {
 TEST(boost_sequence_nominal) {
   Rig r;
   BoostSequencer q;
-  q.configure(sunday_validated());
+  q.configure(boost_config());
   q.boot(nullptr);
   CHECK(q.start(10, ha_at(14 * 60 + 3), r.now) == BoostStart::ACCEPTED);
   CHECK(q.start(10, ha_at(14 * 60 + 3), r.now) == BoostStart::BUSY);
@@ -415,26 +411,22 @@ TEST(boost_refusals_before_any_write) {
   struct Case {
     const char *name;
     HaTime ha;
-    uint8_t mask;
     bool read_fails;
     Block clock;
   };
   const Block good_clock = {0x20, 0x26, 0x11, 0x15, 0x07, 0x14, 0x03, 0x00};
-  for (const Case &c : {Case{"jour non validé", ha_at(843), 1u << 0, false, good_clock},
-                        Case{"HA indisponible", HaTime(), 1u << 6, false, good_clock},
-                        Case{"mauvais jour HA", ha_at(843, 5), 1u << 6, false, good_clock},
-                        Case{"horloges décalées", ha_at(843 + 6), 1u << 6, false, good_clock},
-                        Case{"horloge illisible", ha_at(843), 1u << 6, true, good_clock},
-                        Case{"jour incohérent", ha_at(843), 1u << 6, false,
+  for (const Case &c : {Case{"HA indisponible", HaTime(), false, good_clock},
+                        Case{"mauvais jour HA", ha_at(843, 5), false, good_clock},
+                        Case{"horloges décalées", ha_at(843 + 6), false, good_clock},
+                        Case{"horloge illisible", ha_at(843), true, good_clock},
+                        Case{"jour incohérent", ha_at(843), false,
                              {0x20, 0x26, 0x11, 0x15, 0x03, 0x14, 0x03, 0x00}},
-                        Case{"non BCD", ha_at(843), 1u << 6, false, {0x20, 0x26, 0x11, 0x15, 0x07, 0x1F, 0x03, 0x00}}}) {
+                        Case{"non BCD", ha_at(843), false, {0x20, 0x26, 0x11, 0x15, 0x07, 0x1F, 0x03, 0x00}}}) {
     Rig r;
     r.regs[VITO_CLOCK_ADDRESS] = c.clock;
     r.read_fails = c.read_fails;
     BoostSequencer q;
-    BoostConfig cfg;
-    cfg.validated_days_mask = c.mask;
-    q.configure(cfg);
+    q.configure(BoostConfig());
     q.boot(nullptr);
     CHECK(q.start(10, c.ha, r.now) == BoostStart::ACCEPTED);
     while (r.step(q)) {
@@ -450,7 +442,7 @@ TEST(boost_refusals_before_any_write) {
   Rig r;
   r.set_clock(7, 0, 0);
   BoostSequencer q;
-  q.configure(sunday_validated());
+  q.configure(boost_config());
   q.boot(nullptr);
   CHECK(q.start(10, ha_at(7 * 60), r.now) == BoostStart::ACCEPTED);
   while (r.step(q)) {
@@ -465,7 +457,7 @@ TEST(boost_backup_failure_prevents_write) {
   Rig r;
   r.save_fails = true;
   BoostSequencer q;
-  q.configure(sunday_validated());
+  q.configure(boost_config());
   q.boot(nullptr);
   q.start(10, ha_at(843), r.now);
   while (r.step(q)) {
@@ -480,7 +472,7 @@ TEST(boost_write_not_applied_or_unsent) {
     Rig r;
     r.write_ignored = true;
     BoostSequencer q;
-    q.configure(sunday_validated());
+    q.configure(boost_config());
     q.boot(nullptr);
     q.start(10, ha_at(843), r.now);
     while (r.step(q)) {
@@ -494,7 +486,7 @@ TEST(boost_write_not_applied_or_unsent) {
     Rig r;
     r.write_unsent = true;
     BoostSequencer q;
-    q.configure(sunday_validated());
+    q.configure(boost_config());
     q.boot(nullptr);
     q.start(10, ha_at(843), r.now);
     while (r.step(q)) {
@@ -508,7 +500,7 @@ TEST(boost_write_not_applied_or_unsent) {
 TEST(boost_unexpected_read_back_blocks_everything) {
   Rig r;
   BoostSequencer q;
-  q.configure(sunday_validated());
+  q.configure(boost_config());
   q.boot(nullptr);
   q.start(10, ha_at(843), r.now);
   // Exécution pas à pas : la régulation « corrige » le bloc après l'écriture.
@@ -527,7 +519,7 @@ TEST(boost_unexpected_read_back_blocks_everything) {
 TEST(boost_panel_change_is_never_overwritten) {
   Rig r;
   BoostSequencer q;
-  q.configure(sunday_validated());
+  q.configure(boost_config());
   q.boot(nullptr);
   q.start(10, ha_at(843), r.now);
   r.run(q, 2000);
@@ -557,7 +549,7 @@ TEST(boost_panel_change_is_never_overwritten) {
 TEST(boost_early_restore_button) {
   Rig r;
   BoostSequencer q;
-  q.configure(sunday_validated());
+  q.configure(boost_config());
   q.boot(nullptr);
   q.start(30, ha_at(843), r.now);
   r.run(q, 2000);
@@ -573,7 +565,7 @@ TEST(boost_early_restore_button) {
 TEST(boost_restore_failures_lead_to_recovery) {
   Rig r;
   BoostSequencer q;
-  q.configure(sunday_validated());
+  q.configure(boost_config());
   q.boot(nullptr);
   q.start(10, ha_at(843), r.now);
   r.run(q, 2000);
@@ -593,7 +585,7 @@ TEST(boost_power_cut_after_every_action) {
   for (int k = 1; k <= 12; k++) {
     Rig r;
     BoostSequencer q;
-    q.configure(sunday_validated());
+    q.configure(boost_config());
     q.boot(nullptr);
     q.start(10, ha_at(843), r.now);
     int done = 0;
@@ -613,7 +605,7 @@ TEST(boost_power_cut_after_every_action) {
     cuts++;
     // --- coupure : RAM perdue, flash conservée ---
     BoostSequencer after;
-    after.configure(sunday_validated());
+    after.configure(boost_config());
     after.boot(r.flash_has ? &r.flash : nullptr);
     const int writes_before = r.writes;
     r.run(after, 60 * 60 * 1000);
@@ -662,7 +654,7 @@ TEST(boost_record_integrity) {
 TEST(boost_rate_limits) {
   Rig r;
   BoostSequencer q;
-  BoostConfig cfg = sunday_validated();
+  BoostConfig cfg = boost_config();
   cfg.max_per_day = 2;
   q.configure(cfg);
   q.boot(nullptr);
@@ -677,7 +669,7 @@ TEST(boost_rate_limits) {
   CHECK(q.status() == "Refusé : nombre maximal de déclenchements atteint pour aujourd'hui");
   Rig s;
   BoostSequencer p;
-  p.configure(sunday_validated());
+  p.configure(boost_config());
   p.boot(nullptr);
   CHECK(p.start(10, ha_at(843), s.now) == BoostStart::ACCEPTED);
   s.run(p, 2000);
@@ -693,7 +685,7 @@ TEST(boost_rate_limits) {
 TEST(boost_take_refresh_only_after_confirmed_change) {
   Rig r;
   BoostSequencer q;
-  q.configure(sunday_validated());
+  q.configure(boost_config());
   q.boot(nullptr);
   CHECK_EQ(q.take_refresh(), 0);
   q.start(10, ha_at(14 * 60 + 3), r.now);
@@ -723,7 +715,7 @@ TEST(boost_no_refresh_without_confirmed_change) {
     Rig r;  // écriture ignorée par la régulation : rien n'a changé
     r.write_ignored = true;
     BoostSequencer q;
-    q.configure(sunday_validated());
+    q.configure(boost_config());
     q.boot(nullptr);
     q.start(10, ha_at(843), r.now);
     r.run(q, 2000);
@@ -734,7 +726,7 @@ TEST(boost_no_refresh_without_confirmed_change) {
   {
     Rig r;  // relecture illisible : état indéterminé, aucune lecture de plus
     BoostSequencer q;
-    q.configure(sunday_validated());
+    q.configure(boost_config());
     q.boot(nullptr);
     q.start(10, ha_at(843), r.now);
     while (q.state() != BoostState::VERIFY_PENDING && r.step(q)) {
@@ -745,11 +737,11 @@ TEST(boost_no_refresh_without_confirmed_change) {
     CHECK_EQ(q.take_refresh(), 0);
   }
   {
-    Rig r;  // refus avant toute écriture (jour non validé)
+    Rig r;  // refus avant toute écriture (heure de Home Assistant indisponible)
     BoostSequencer q;
     q.configure(BoostConfig());
     q.boot(nullptr);
-    q.start(10, ha_at(843), r.now);
+    q.start(10, HaTime(), r.now);
     r.run(q, 2000);
     CHECK(q.idle());
     CHECK_EQ(q.take_refresh(), 0);
@@ -757,7 +749,7 @@ TEST(boost_no_refresh_without_confirmed_change) {
   {
     Rig r;  // sauvegarde oubliée : aucune relecture confirmée
     BoostSequencer q;
-    q.configure(sunday_validated());
+    q.configure(boost_config());
     BoostRecord rec;
     rec.magic = BOOST_RECORD_MAGIC;
     rec.version = BOOST_RECORD_VERSION;
@@ -779,14 +771,14 @@ TEST(boost_refresh_after_recovery) {
   for (bool already_original : {false, true}) {
     Rig r;
     BoostSequencer q;
-    q.configure(sunday_validated());
+    q.configure(boost_config());
     q.boot(nullptr);
     q.start(10, ha_at(843), r.now);
     r.run(q, 2000);
     CHECK(q.state() == BoostState::ACTIVE);
     // Coupure pendant la plage : nouvelle instance, sauvegarde relue.
     BoostSequencer after;
-    after.configure(sunday_validated());
+    after.configure(boost_config());
     after.boot(&r.flash);
     CHECK(after.recovery_required());
     CHECK_EQ(after.take_refresh(), 0);
@@ -835,7 +827,7 @@ struct FakePort : BoostRefreshPort {
 
 /// Séquenceur amené en ACTIVE (plage confirmée).
 void to_active(Rig &r, BoostSequencer &q) {
-  q.configure(sunday_validated());
+  q.configure(boost_config());
   q.boot(nullptr);
   q.start(10, ha_at(843), r.now);
   r.run(q, 2000);
@@ -950,7 +942,7 @@ uint32_t write_at(const Rig &r, size_t n) {
 
 /// Amène le séquenceur en ACTIVE ; renvoie l'instant de la confirmation.
 uint32_t confirm(Rig &r, BoostSequencer &q, uint16_t duration, uint16_t ha_minute) {
-  q.configure(sunday_validated());
+  q.configure(boost_config());
   q.boot(nullptr);
   CHECK(q.start(duration, ha_at(ha_minute), r.now) == BoostStart::ACCEPTED);
   CHECK(r.run_until(q, [&] { return q.state() == BoostState::ACTIVE; }, 60000));
@@ -1174,7 +1166,7 @@ TEST(boost_reboot_during_restore_window_writes_nothing) {
   r.run(q, 4 * 60 * 1000);
   CHECK(q.restoring());
   BoostSequencer after;
-  after.configure(sunday_validated());
+  after.configure(boost_config());
   after.boot(r.flash_has ? &r.flash : nullptr);
   r.read_fails = false;
   r.run(after, 60 * 60 * 1000);
@@ -1212,7 +1204,7 @@ TEST(boost_reboot_never_restarts_a_full_duration) {
   confirm(r, q, 10, 843);
   r.run(q, 4 * 60 * 1000);
   BoostSequencer after;
-  after.configure(sunday_validated());
+  after.configure(boost_config());
   after.boot(r.flash_has ? &r.flash : nullptr);
   CHECK(after.recovery_required());
   CHECK(after.restore_alert());
@@ -1238,8 +1230,8 @@ TEST(boost_reboot_never_restarts_a_full_duration) {
 
 // --- v0.7.1 : sept jours, plage inscrite, temps restant, appuis répétés -------
 
-TEST(boost_all_seven_days_when_validated) {
-  // validated_days: les 7 jours. Pour chaque jour (2026-11-09 lundi ...
+TEST(boost_all_seven_days) {
+  // v1.0 : tous les jours, sans option. Pour chaque jour (2026-11-09 lundi ...
   // 2026-11-15 dimanche), seul le bloc du jour est écrit, sauvegardé avant,
   // relu, puis restauré à l'identique ; les autres blocs ne bougent pas.
   for (uint8_t d = 0; d < SCHEDULE_DAYS; d++) {
@@ -1250,9 +1242,7 @@ TEST(boost_all_seven_days_when_validated) {
       r.regs[loop_block_address(o)] = REAL;
     r.tick_clock();
     BoostSequencer q;
-    BoostConfig cfg;
-    cfg.validated_days_mask = 0x7F;
-    q.configure(cfg);
+    q.configure(BoostConfig());
     q.boot(nullptr);
     CHECK(q.start(10, ha_at(843, d), r.now) == BoostStart::ACCEPTED);
     CHECK(r.run_until(q, [&] { return q.state() == BoostState::ACTIVE; }, 60000));
@@ -1267,22 +1257,6 @@ TEST(boost_all_seven_days_when_validated) {
     CHECK_EQ(r.writes, 2);
     CHECK(!r.flash_has);
   }
-  // Masque sans le jour : toujours refusé, rien d'écrit.
-  Rig r;
-  r.day = 11, r.weekday_kw = 3;  // mercredi
-  r.regs[loop_block_address(2)] = REAL;
-  r.tick_clock();
-  BoostSequencer q;
-  BoostConfig cfg;
-  cfg.validated_days_mask = 0x7F & ~(1u << 2);
-  q.configure(cfg);
-  q.boot(nullptr);
-  CHECK(q.start(10, ha_at(843, 2), r.now) == BoostStart::ACCEPTED);
-  while (r.step(q)) {
-  }
-  CHECK(q.idle());
-  CHECK(q.status().rfind("Refusé : correspondance du bloc non validée pour ce jour", 0) == 0);
-  CHECK_EQ(r.writes, 0);
 }
 
 TEST(boost_range_and_remaining_are_distinct_displays) {
@@ -1291,7 +1265,7 @@ TEST(boost_range_and_remaining_are_distinct_displays) {
   Rig r(21u * 3600 + 28 * 60 + 30, 5000);
   r.regs[0x2230] = MORNING_ONLY;
   BoostSequencer q;
-  q.configure(sunday_validated());
+  q.configure(boost_config());
   q.boot(nullptr);
   CHECK(q.range_text() == "Aucune");
   CHECK_EQ(q.remaining_s(r.now), 0u);
@@ -1326,7 +1300,7 @@ TEST(boost_range_and_remaining_are_distinct_displays) {
   BoostSequencer before;
   confirm(t, before, 10, 843);
   BoostSequencer after;
-  after.configure(sunday_validated());
+  after.configure(boost_config());
   after.boot(&t.flash);
   CHECK(after.range_text() == "14:00-14:20 (dimanche) peut-être encore inscrite (récupération)");
   CHECK_EQ(after.remaining_s(t.now), 0u);
@@ -1421,7 +1395,7 @@ TEST(boost_v081_selection_during_preparation_is_used) {
   Rig r;
   r.regs[0x2230] = MORNING_ONLY;
   BoostSequencer q;
-  q.configure(sunday_validated());
+  q.configure(boost_config());
   q.boot(nullptr);
   CHECK(q.start(30, ha_at(843), r.now) == BoostStart::ACCEPTED);
   CHECK(q.change_duration(10, r.now) == BoostDurationChange::SHORTENED);
@@ -1450,7 +1424,7 @@ TEST(boost_v081_selection_when_idle_or_restoring) {
   Rig r;
   r.regs[0x2230] = MORNING_ONLY;
   BoostSequencer q;
-  q.configure(sunday_validated());
+  q.configure(boost_config());
   q.boot(nullptr);
   CHECK(q.change_duration(30, r.now) == BoostDurationChange::SELECTED);  // prochain démarrage
   CHECK_EQ(q.duration(), 0);

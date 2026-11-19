@@ -43,7 +43,7 @@
     return {
       circuits: Object.keys(labels).map((k) => ({ key: k, label: labels[k] })),
       circuit, label: labels[circuit], expected: "aperçu", busy: !!(state.op && state.op.busy),
-      status: state.status, writes_enabled: true, link_ok: true,
+      status: state.status, link_ok: true,
       operation: state.op || undefined,
       days: w.map((ranges, d) => ({ day: d, known: true, locked: circuit === "bouclage" && d === 6,
         raw: RAW[ranges[0]] || "...", age_s: 2 * 3600 + 300, ranges })),

@@ -44,8 +44,6 @@ void VissLinkScheduleEditor::setup() {
 
 void VissLinkScheduleEditor::dump_config() {
   ESP_LOGCONFIG(TAG, "VissLink schedule editor (experimental):");
-  ESP_LOGCONFIG(TAG, "  Schedule writes: %s",
-                this->parent_ != nullptr && this->parent_->schedule_writes_enabled() ? "ENABLED" : "disabled");
   for (uint8_t c = 0; c < EDITOR_CIRCUIT_COUNT; c++) {
     if (this->schedules_[c] != nullptr)
       ESP_LOGCONFIG(TAG, "  %s (%s): 0x%04X + 8 x day", EDITOR_CIRCUIT_KEYS[c], EDITOR_CIRCUIT_LABELS[c],
@@ -71,8 +69,8 @@ bool VissLinkScheduleEditor::refuse_(const std::string &why) {
 
 bool VissLinkScheduleEditor::context_(const std::string &circuit, visslink::EditContext *ctx) {
   this->last_error_.clear();
-  if (this->parent_ == nullptr || !this->parent_->schedule_writes_enabled())
-    return this->refuse_(VL_TEXT("écritures de programmation désactivées (enable_writes / enable_schedule_writes)"));
+  if (this->parent_ == nullptr)
+    return this->refuse_(VL_TEXT("composant visslink absent"));
   if (!this->parent_->link_ok())
     return this->refuse_(VL_TEXT("liaison Optolink non synchronisée"));
   const uint8_t c = visslink::editor_circuit_from_key(circuit);
@@ -168,7 +166,6 @@ void VissLinkScheduleEditor::read_(const std::string &circuit, JsonObject root) 
   }
   root["max_end"] = "23:50";
   root["max_ranges"] = visslink::SCHEDULE_SLOTS;
-  root["writes_enabled"] = this->parent_ != nullptr && this->parent_->schedule_writes_enabled();
   root["link_ok"] = this->parent_ != nullptr && this->parent_->link_ok();
   root["busy"] = this->sequencer_.busy();
   root["status"] = this->refusal_.empty() ? this->sequencer_.status() : this->refusal_;

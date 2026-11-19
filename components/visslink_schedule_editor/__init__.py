@@ -10,14 +10,13 @@ seul : lecture, comparaison avec le bloc affiché (une modification faite au
 panneau n'est jamais écrasée), sauvegarde en flash, écriture, relecture
 exacte. « Enregistré » n'est annoncé qu'après cette relecture.
 
-Autorisé par défaut (enable_writes et enable_schedule_writes du composant
-`visslink`, défaut true) ; aucune option d'autorisation ici. Verrou mutuel
-avec le bouclage ECS temporaire (visslink_boost), restauration comprise.
+Aucune option d'autorisation. Verrou mutuel avec le bouclage ECS temporaire
+(visslink_boost), restauration comprise.
 
 Les commandes passent par des actions ESPHome déclarées dans `api: actions:`
 (lambdas `id(...).read(...)`, `set_days(...)`, ...) ; voir
 docs/programmations-v0.8.md et l'exemple
-examples/iot-viessmann-programmations-v0.8.yaml.
+examples/iot-viessmann-v1.0.0.yaml.
 """
 
 import esphome.codegen as cg
@@ -57,7 +56,7 @@ CONFIG_SCHEMA = cv.Schema(
         # Seule entité de l'éditeur : opération en cours, confirmations et
         # échecs (jours enregistrés / non traités).
         cv.Optional(CONF_STATUS): text_sensor.text_sensor_schema(
-            icon="mdi:calendar-edit", entity_category="diagnostic"
+            icon="mdi:calendar-edit"
         ),
     }
 ).extend(cv.COMPONENT_SCHEMA)

@@ -14,8 +14,6 @@ namespace {
 
 DhwContext allowed(float min = 40, float max = 60) {
   DhwContext c;
-  c.enable_writes = true;
-  c.enable_dhw_setpoint_write = true;
   c.link_ok = true;
   c.has_value = true;
   c.config_min = min;
@@ -46,14 +44,12 @@ TEST(dhw_whitelist_is_only_0x6300_and_separate) {
   CHECK(find_writable(0x6300)->min <= DHW_WRITE_MIN && DHW_WRITE_MAX <= find_writable(0x6300)->max);
 }
 
-TEST(dhw_permission_needs_both_flags) {
-  CHECK(dhw_write_permitted(0x6300, false, false) == DhwPermission::WRITES_DISABLED);
-  CHECK(dhw_write_permitted(0x6300, false, true) == DhwPermission::WRITES_DISABLED);
-  CHECK(dhw_write_permitted(0x6300, true, false) == DhwPermission::DHW_WRITE_DISABLED);
-  CHECK(dhw_write_permitted(0x6300, true, true) == DhwPermission::OK);
-  CHECK(dhw_write_permitted(0x2306, true, true) == DhwPermission::NOT_WHITELISTED);
-  // Les autorisations des programmes A1/M2 ne s'appliquent jamais à 0x6300.
-  CHECK(mode_write_permitted(0x6300, true, true, true) == ModePermission::NOT_WHITELISTED);
+TEST(dhw_writer_refuses_unmanaged_register) {
+  SetpointWriter w(0x2301);  // programme : jamais par ce chemin
+  CHECK(w.request(3, allowed(0, 5), 0) == DhwAction::REFUSED);
+  CHECK(w.status() == "Refusé : registre non géré");
+  CHECK(std::string(w.reason()) == "not a managed setpoint register");
+  CHECK(!w.busy());
 }
 
 TEST(dhw_internal_limits_cannot_be_widened_by_config) {
@@ -80,19 +76,11 @@ TEST(dhw_refusals_write_nothing) {
     float value;
     const char *status;
   };
-  DhwContext off = allowed();
-  off.enable_writes = false;
-  DhwContext no_dhw = allowed();
-  no_dhw.enable_dhw_setpoint_write = false;
   DhwContext no_value = allowed();
   no_value.has_value = false;
   DhwContext no_link = allowed();
   no_link.link_ok = false;
   for (const Case &c : {
-           Case{"défaut", DhwContext(), 55, "Refusé : écritures désactivées (enable_writes: false)"},
-           Case{"enable_writes seul", no_dhw, 55,
-                "Refusé : écriture de la consigne ECS désactivée (enable_dhw_setpoint_write: false)"},
-           Case{"enable_dhw seul", off, 55, "Refusé : écritures désactivées (enable_writes: false)"},
            Case{"trop bas", allowed(), 45, "Refusé : valeur 45.0 °C hors limites (50-60 °C)"},
            Case{"trop haut", allowed(), 61, "Refusé : valeur 61.0 °C hors limites (50-60 °C)"},
            Case{"config étroite", allowed(52, 58), 59, "Refusé : valeur 59.0 °C hors limites (52-58 °C)"},

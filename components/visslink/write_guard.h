@@ -61,9 +61,7 @@ inline const WritableRegister *find_writable(uint16_t address) {
 
 // --- Consigne d'eau chaude sanitaire (v0.6, expérimental) --------------------
 //
-// Liste blanche DISTINCTE : la consigne ECS exige en plus de enable_writes sa
-// propre autorisation, enable_dhw_setpoint_write. Aucune autre autorisation
-// (programmes, M2, blocs horaires) ne la permet.
+// Liste blanche DISTINCTE : seule 0x6300, dans des limites internes.
 static constexpr uint16_t DHW_SETPOINT_ADDRESS = 0x6300;
 static constexpr uint16_t DHW_SETPOINT_WRITE_WHITELIST[] = {DHW_SETPOINT_ADDRESS};
 /// Limites INTERNES d'écriture (°C), plus étroites que la plage documentée
@@ -82,34 +80,9 @@ inline bool is_dhw_setpoint_write_whitelisted(uint16_t address) {
   return false;
 }
 
-/// Autorisations de configuration d'une écriture de consigne ECS, vérifiées
-/// à la demande ET juste avant l'émission.
-enum class DhwPermission : uint8_t {
-  OK,
-  WRITES_DISABLED,      ///< enable_writes: false
-  DHW_WRITE_DISABLED,   ///< enable_dhw_setpoint_write: false
-  NOT_WHITELISTED,      ///< pas la consigne ECS
-};
-
-inline const char *dhw_permission_to_string(DhwPermission permission) {
-  switch (permission) {
-    case DhwPermission::OK:
-      return "ok";
-    case DhwPermission::WRITES_DISABLED:
-      return "writes are disabled (enable_writes: false)";
-    case DhwPermission::DHW_WRITE_DISABLED:
-      return "DHW setpoint write is disabled (enable_dhw_setpoint_write: false)";
-    case DhwPermission::NOT_WHITELISTED:
-      return "not the DHW setpoint register";
-  }
-  return "unknown";
-}
-
 // --- Consignes de chauffage A1/M2 (v0.7, expérimental) ----------------------
 //
-// Liste blanche DISTINCTE, autorisation propre : enable_heating_setpoint_writes
-// (avec enable_writes). Ni enable_dhw_setpoint_write, ni les autorisations des
-// programmes ou des blocs horaires ne la permettent.
+// Liste blanche DISTINCTE.
 //
 // Limites INTERNES d'écriture par registre (°C), PROVISOIRES tant que
 // l'écriture n'est pas validée sur la chaudière, plus étroites que la plage
@@ -143,38 +116,6 @@ inline const HeatingSetpoint *find_heating_setpoint(uint16_t address) {
 }
 inline bool is_heating_setpoint_write_whitelisted(uint16_t address) { return find_heating_setpoint(address) != nullptr; }
 
-enum class HeatingPermission : uint8_t {
-  OK,
-  WRITES_DISABLED,          ///< enable_writes: false
-  HEATING_WRITE_DISABLED,   ///< enable_heating_setpoint_writes: false
-  NOT_WHITELISTED,          ///< pas une consigne de chauffage
-};
-
-inline const char *heating_permission_to_string(HeatingPermission permission) {
-  switch (permission) {
-    case HeatingPermission::OK:
-      return "ok";
-    case HeatingPermission::WRITES_DISABLED:
-      return "writes are disabled (enable_writes: false)";
-    case HeatingPermission::HEATING_WRITE_DISABLED:
-      return "heating setpoint writes are disabled (enable_heating_setpoint_writes: false)";
-    case HeatingPermission::NOT_WHITELISTED:
-      return "not a heating setpoint register";
-  }
-  return "unknown";
-}
-
-inline HeatingPermission heating_write_permitted(uint16_t address, bool enable_writes,
-                                                 bool enable_heating_setpoint_writes) {
-  if (!enable_writes)
-    return HeatingPermission::WRITES_DISABLED;
-  if (!enable_heating_setpoint_writes)
-    return HeatingPermission::HEATING_WRITE_DISABLED;
-  if (!is_heating_setpoint_write_whitelisted(address))
-    return HeatingPermission::NOT_WHITELISTED;
-  return HeatingPermission::OK;
-}
-
 // --- Éco / Party A1 et M2 (v0.9.1, expérimental) ----------------------------
 //
 // Lecture validée sur la Vitotronic 300 KW3 (209C) de l'installation : états
@@ -182,12 +123,8 @@ inline HeatingPermission heating_write_permitted(uint16_t address, bool enable_w
 // seulement pour la Vitotronic 200 KW2 (vcontrold), et pour aucun appareil
 // pour Éco M2 (0x3302) ; cf. docs/eco-party-v0.9.1.md.
 //
-// Listes blanches DISTINCTES de toutes les autres. Autorisations :
-// enable_writes ET l'option `allow_write` de l'entité (une par registre :
-// validation matérielle registre par registre). Aucune autre autorisation
-// (consignes, programmes, blocs horaires) ne les permet, et ces autorisations
-// ne permettent rien d'autre. Les consignes confort/réduite ne sont jamais
-// touchées pour simuler Éco ou Party.
+// Listes blanches DISTINCTES de toutes les autres. Les consignes confort/
+// réduite ne sont jamais touchées pour simuler Éco ou Party.
 
 /// Commande Éco ou Party d'un circuit : 1 octet, 00 = inactif, 01 = actif.
 struct EcoPartyFlag {
@@ -238,39 +175,6 @@ inline const PartySetpoint *find_party_setpoint(uint16_t address) {
 }
 inline bool is_party_setpoint_write_whitelisted(uint16_t address) { return find_party_setpoint(address) != nullptr; }
 
-enum class EcoPartyPermission : uint8_t {
-  OK,
-  WRITES_DISABLED,         ///< enable_writes: false
-  ENTITY_WRITE_DISABLED,   ///< allow_write: false sur l'entité
-  NOT_WHITELISTED,         ///< ni commande Éco/Party ni consigne Party
-};
-
-inline const char *eco_party_permission_to_string(EcoPartyPermission permission) {
-  switch (permission) {
-    case EcoPartyPermission::OK:
-      return "ok";
-    case EcoPartyPermission::WRITES_DISABLED:
-      return "writes are disabled (enable_writes: false)";
-    case EcoPartyPermission::ENTITY_WRITE_DISABLED:
-      return "write disabled for this entity (allow_write: false)";
-    case EcoPartyPermission::NOT_WHITELISTED:
-      return "not an Eco/Party register";
-  }
-  return "unknown";
-}
-
-/// Autorisation d'écriture d'une commande Éco/Party ou d'une consigne Party,
-/// vérifiée à la demande ET juste avant l'émission.
-inline EcoPartyPermission eco_party_write_permitted(uint16_t address, bool enable_writes, bool allow_write) {
-  if (!enable_writes)
-    return EcoPartyPermission::WRITES_DISABLED;
-  if (!is_eco_party_flag_whitelisted(address) && !is_party_setpoint_write_whitelisted(address))
-    return EcoPartyPermission::NOT_WHITELISTED;
-  if (!allow_write)
-    return EcoPartyPermission::ENTITY_WRITE_DISABLED;
-  return EcoPartyPermission::OK;
-}
-
 /// Limites internes d'écriture d'une consigne (ECS, chauffage ou, v0.9.1,
 /// Party). Faux si l'adresse n'en a pas.
 inline bool setpoint_write_limits(uint16_t address, uint8_t *min, uint8_t *max) {
@@ -292,16 +196,6 @@ inline bool setpoint_write_limits(uint16_t address, uint8_t *min, uint8_t *max) 
   return true;
 }
 
-inline DhwPermission dhw_write_permitted(uint16_t address, bool enable_writes, bool enable_dhw_setpoint_write) {
-  if (!enable_writes)
-    return DhwPermission::WRITES_DISABLED;
-  if (!enable_dhw_setpoint_write)
-    return DhwPermission::DHW_WRITE_DISABLED;
-  if (!is_dhw_setpoint_write_whitelisted(address))
-    return DhwPermission::NOT_WHITELISTED;
-  return DhwPermission::OK;
-}
-
 // --- Programmes de fonctionnement (v0.3/v0.4, expérimental) ------------------
 //
 // Liste blanche DISTINCTE de celle des consignes. Valeurs lues sur la
@@ -315,14 +209,11 @@ static constexpr uint16_t MODE_REGISTERS[] = {0x2301, 0x3301};
 ///  - 0x2301 (A1) : écriture documentée par vcontrold (setBetriebArtM1,
 ///    Vitotronic 200 KW2) ; une note openv la dit impossible sur un autre
 ///    appareil ;
-///  - 0x3301 (M2) : écriture NON documentée (vcontrold : lecture seule) ;
-///    exige une troisième autorisation, enable_m2_mode_write.
+///  - 0x3301 (M2) : écriture NON documentée (vcontrold : lecture seule).
 static constexpr uint16_t MODE_WRITE_WHITELIST[] = {
     0x2301,  // Radiateurs A1 - expérimental
     0x3301,  // Plancher M2 - expérimental, écriture non documentée
 };
-/// Programme de M2 : écriture soumise à enable_m2_mode_write.
-static constexpr uint16_t M2_MODE_REGISTER = 0x3301;
 static constexpr size_t MODE_WRITE_COUNT = sizeof(MODE_WRITE_WHITELIST) / sizeof(MODE_WRITE_WHITELIST[0]);
 /// Valeurs autorisées, dans l'ordre des options du sélecteur.
 static constexpr uint8_t OPERATING_MODE_VALUES[] = {0x00, 0x03, 0x05};
@@ -342,48 +233,6 @@ inline bool is_mode_write_whitelisted(uint16_t address) {
       return true;
   }
   return false;
-}
-
-/// Autorisations de configuration d'une écriture de programme, vérifiées à la
-/// demande ET juste avant l'émission :
-///  - tout programme : enable_writes ET enable_mode_writes ;
-///  - M2 (0x3301) : en plus enable_m2_mode_write.
-/// Une adresse hors de MODE_WRITE_WHITELIST n'est jamais autorisée.
-enum class ModePermission : uint8_t {
-  OK,
-  WRITES_DISABLED,       ///< enable_writes: false
-  MODE_WRITES_DISABLED,  ///< enable_mode_writes: false
-  M2_WRITE_DISABLED,     ///< enable_m2_mode_write: false
-  NOT_WHITELISTED,       ///< pas un registre de programme inscriptible
-};
-
-inline const char *mode_permission_to_string(ModePermission permission) {
-  switch (permission) {
-    case ModePermission::OK:
-      return "ok";
-    case ModePermission::WRITES_DISABLED:
-      return "writes are disabled (enable_writes: false)";
-    case ModePermission::MODE_WRITES_DISABLED:
-      return "operating mode writes are disabled (enable_mode_writes: false)";
-    case ModePermission::M2_WRITE_DISABLED:
-      return "M2 operating mode write is disabled (enable_m2_mode_write: false)";
-    case ModePermission::NOT_WHITELISTED:
-      return "not a writable operating mode register";
-  }
-  return "unknown";
-}
-
-inline ModePermission mode_write_permitted(uint16_t address, bool enable_writes, bool enable_mode_writes,
-                                           bool enable_m2_mode_write) {
-  if (!enable_writes)
-    return ModePermission::WRITES_DISABLED;
-  if (!enable_mode_writes)
-    return ModePermission::MODE_WRITES_DISABLED;
-  if (!is_mode_write_whitelisted(address))
-    return ModePermission::NOT_WHITELISTED;
-  if (address == M2_MODE_REGISTER && !enable_m2_mode_write)
-    return ModePermission::M2_WRITE_DISABLED;
-  return ModePermission::OK;
 }
 
 /// Index d'option d'une valeur lue, ou -1 si elle n'est pas un des trois

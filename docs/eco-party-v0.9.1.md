@@ -1,5 +1,11 @@
 # Éco et Party (v0.9.1) : pilotage expérimental
 
+> **v1.0.0 :** document historique. Les options d'autorisation (`enable_*`,
+> `allow_write`, `validated_days`), les entités « État modification / commande »
+> et les exemples intermédiaires cités ici n'existent plus. État actuel :
+> `docs/v1.0.0.md` et `examples/iot-viessmann-v1.0.0.yaml`.
+
+
 Exemple : `examples/iot-viessmann-eco-party-v0.9.1.yaml`. Analyse des sources
 (v0.9) : `docs/eco-party-v0.9.md`.
 

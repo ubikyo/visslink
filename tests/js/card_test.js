@@ -57,7 +57,7 @@ function readResponse(over = {}) {
   return {
     circuits: [{ key: "a1", label: "Radiateurs" }, { key: "m2", label: "Plancher" }],
     circuit: "a1", label: "Radiateurs", expected: "EXPECTED-WEEK", days,
-    busy: false, status: "Prêt", writes_enabled: true, link_ok: true, max_end: "23:50", max_ranges: 4, ...over,
+    busy: false, status: "Prêt", link_ok: true, max_end: "23:50", max_ranges: 4, ...over,
   };
 }
 
@@ -170,14 +170,14 @@ async function main() {
   assert.match(html, /bouclage temporaire/);
   assert.match(html, /modification possible après la restauration/);
 
-  // Jour pas encore lu, lecture seule, liaison absente.
-  response = readResponse({ writes_enabled: false, link_ok: false });
+  // Jour pas encore lu, liaison absente.
+  response = readResponse({ link_ok: false });
   response.days[2] = { day: 2, label: "Me", known: false, locked: false };
   card._day = 2;
   await card._load();
   html = card.shadowRoot.innerHTML;
   assert.match(html, /pas encore lu : rafraîchir/);
-  assert.match(html, /Écritures de programmation désactivées/);
+  assert.doesNotMatch(html, /Écritures de programmation désactivées/);
   assert.match(html, /Liaison Optolink non synchronisée/);
 
   // Rafraîchissement manuel et annulation.

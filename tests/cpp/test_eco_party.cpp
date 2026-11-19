@@ -14,8 +14,6 @@ namespace {
 
 FlagContext flag_ok() {
   FlagContext c;
-  c.enable_writes = true;
-  c.allow_write = true;
   c.link_ok = true;
   c.has_value = true;
   return c;
@@ -23,8 +21,6 @@ FlagContext flag_ok() {
 
 DhwContext party_ok() {
   DhwContext c;
-  c.enable_writes = true;
-  c.allow_party_write = true;
   c.link_ok = true;
   c.has_value = true;
   c.config_min = 3;
@@ -46,10 +42,6 @@ TEST(v091_flag_refusals_write_nothing) {
     FlagContext ctx;
     const char *status;
   };
-  FlagContext no_writes = flag_ok();
-  no_writes.enable_writes = false;
-  FlagContext no_allow = flag_ok();
-  no_allow.allow_write = false;
   FlagContext not_read = flag_ok();
   not_read.has_value = false;
   FlagContext no_link = flag_ok();
@@ -58,9 +50,7 @@ TEST(v091_flag_refusals_write_nothing) {
   busy.other_busy = true;
   FlagContext recent = flag_ok();
   recent.other_recent = true;
-  for (const Case &c : {Case{no_writes, "Refusé : écritures désactivées (enable_writes: false)"},
-                        Case{no_allow, "Refusé : écriture désactivée pour cette commande (allow_write: false)"},
-                        Case{not_read, "Refusé : état actuel pas encore lu"},
+  for (const Case &c : {Case{not_read, "Refusé : état actuel pas encore lu"},
                         Case{no_link, "Refusé : liaison Optolink non synchronisée"},
                         Case{busy, "Refusé : une autre commande Éco/Party est en cours"},
                         Case{recent, "Refusé : trop tôt après une autre commande Éco/Party (15 s)"}}) {
@@ -70,10 +60,12 @@ TEST(v091_flag_refusals_write_nothing) {
     CHECK(!w.busy());
     CHECK(!w.expects_write(1));
   }
-  // Adresse hors liste : jamais acceptée, même avec toutes les autorisations.
+  // Adresse hors liste : jamais acceptée.
   for (uint16_t a : {0x2306, 0x2301, 0x2308, 0x0000}) {
     FlagWriter w(a);
     CHECK(w.request(true, flag_ok(), 1000) == DhwAction::REFUSED);
+    CHECK(w.status() == "Refusé : registre non géré");
+    CHECK(std::string(w.reason()) == "not an Eco/Party register");
     CHECK(!w.busy());
   }
 }
@@ -224,38 +216,25 @@ TEST(v091_party_setpoint_uses_setpoint_transaction) {
   CHECK(w.status() == "Modifiée hors de Home Assistant (panneau ou Vitotrol ?) : 21 -> 22 °C");
 }
 
-TEST(v091_party_setpoint_permissions_and_limits) {
-  DhwContext no_allow = party_ok();
-  no_allow.allow_party_write = false;
-  DhwContext no_writes = party_ok();
-  no_writes.enable_writes = false;
-  // Les autorisations des autres consignes ne permettent jamais la Party.
-  DhwContext others = party_ok();
-  others.allow_party_write = false;
-  others.enable_heating_setpoint_writes = others.enable_dhw_setpoint_write = true;
+TEST(v091_party_setpoint_limits) {
   {
     SetpointWriter w(0x3308);
-    CHECK(w.request(20, no_allow, 0) == DhwAction::REFUSED);
-    CHECK(w.status() == "Refusé : écriture désactivée pour cette consigne (allow_write: false)");
-    CHECK(w.request(20, others, 0) == DhwAction::REFUSED);
-    CHECK(w.request(20, no_writes, 0) == DhwAction::REFUSED);
-    CHECK(w.status() == "Refusé : écritures désactivées (enable_writes: false)");
     CHECK(w.request(23, party_ok(), 0) == DhwAction::REFUSED);
     CHECK(w.status() == "Refusé : valeur 23.0 °C hors limites (16-22 °C)");
     CHECK(w.request(15, party_ok(), 0) == DhwAction::REFUSED);
     CHECK(!w.busy());
   }
-  // Une consigne de chauffage ne s'ouvre pas avec allow_party_write.
+  // Une consigne de chauffage garde sa règle confort >= réduite (sans effet
+  // sur la Party).
   {
     SetpointWriter h(0x2306);
     DhwContext c = party_ok();
     c.config_min = 16;
     c.config_max = 23;
     c.peer_known = true;
-    c.peer_value = 17;
+    c.peer_value = 22;
     CHECK(h.request(21, c, 0) == DhwAction::REFUSED);
-    CHECK(std::string(h.reason()) ==
-          "heating setpoint writes are disabled (enable_heating_setpoint_writes: false)");
+    CHECK(std::string(h.reason()) == "comfort setpoint below the reduced setpoint");
   }
   // Pas de lien avec les consignes confort/réduite : aucune lecture exigée.
   {

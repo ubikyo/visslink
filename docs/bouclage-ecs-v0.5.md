@@ -1,5 +1,11 @@
 # Bouclage ECS à la demande (v0.5, expérimental)
 
+> **v1.0.0 :** document historique. Les options d'autorisation (`enable_*`,
+> `allow_write`, `validated_days`), les entités « État modification / commande »
+> et les exemples intermédiaires cités ici n'existent plus. État actuel :
+> `docs/v1.0.0.md` et `examples/iot-viessmann-v1.0.0.yaml`.
+
+
 > **Statut : NON prêt pour la production.** Le code est implémenté, testé en
 > simulation et **désactivé par défaut** (`enable_schedule_writes: false`,
 > `validated_days: []`). **Aucune écriture de programmation n'a jamais été

@@ -1,5 +1,11 @@
 # Consignes de chauffage A1/M2 et climate du plancher (v0.7, expérimental)
 
+> **v1.0.0 :** document historique. Les options d'autorisation (`enable_*`,
+> `allow_write`, `validated_days`), les entités « État modification / commande »
+> et les exemples intermédiaires cités ici n'existent plus. État actuel :
+> `docs/v1.0.0.md` et `examples/iot-viessmann-v1.0.0.yaml`.
+
+
 > **Statut : NON validé sur la chaudière.** Les quatre consignes sont lues
 > depuis la v0.3. Aucune n'a été écrite sur la Vitotronic 300 KW3. Leur
 > écriture est désactivée par défaut et exige deux autorisations. Pour M2

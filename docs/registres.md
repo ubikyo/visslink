@@ -1,5 +1,11 @@
 # Registres KW : statut et validation (v0.2.2)
 
+> **v1.0.0 :** document historique. Les options d'autorisation (`enable_*`,
+> `allow_write`, `validated_days`), les entités « État modification / commande »
+> et les exemples intermédiaires cités ici n'existent plus. État actuel :
+> `docs/v1.0.0.md` et `examples/iot-viessmann-v1.0.0.yaml`.
+
+
 Installation de référence : Vitocrossal 300 CU03, Vitotronic 300 KW3,
 Vitocell 300-V, circuits A1 (radiateurs) et M2 (plancher chauffant).
 

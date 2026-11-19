@@ -5,8 +5,7 @@
 // Indépendant d'ESPHome (testé sur PC). Même transaction que les consignes
 // (dhw_setpoint.h), le composant exécute :
 //
-//   demande HA -> autorisations (enable_writes, allow_write de l'entité),
-//                 liaison, opération en cours, espacement
+//   demande HA -> liaison, opération en cours, espacement
 //              -> RELECTURE préalable du registre (état actuel)
 //              -> identique : rien n'est écrit
 //              -> différent : écriture d'un octet 00/01 (WriteArbiter),
@@ -15,8 +14,8 @@
 //                 indéterminé.
 //
 // Règles :
-//  - lecture validée sur la KW3 (0/1) ; écriture NON validée : chaque
-//    registre se désactive séparément (allow_write: false) ;
+//  - lecture validée sur la KW3 (0/1) ; écriture pas encore vérifiée sur
+//    la chaudière : la relecture dit si la Vitotronic l'applique ;
 //  - une seule commande Éco/Party à la fois, GLOBAL_SPACING_MS entre deux ;
 //  - jamais d'écriture réémise, jamais au démarrage, rien de persistant ;
 //  - une valeur lue autre que 00/01 n'est jamais interprétée ni écrite ;
@@ -40,8 +39,6 @@ namespace visslink {
 
 /// Conditions d'une demande, fournies par le composant.
 struct FlagContext {
-  bool enable_writes{false};
-  bool allow_write{false};  ///< option `allow_write` de l'entité
   bool link_ok{false};
   bool has_value{false};     ///< un état 00/01 a été lu
   bool other_busy{false};    ///< une autre commande Éco/Party est en cours
@@ -65,15 +62,8 @@ class FlagWriter {
 
   /// Demande venant de Home Assistant.
   DhwAction request(bool on, const FlagContext &ctx, uint32_t now) {
-    const EcoPartyPermission permission = eco_party_write_permitted(this->address_, ctx.enable_writes, ctx.allow_write);
-    if (permission == EcoPartyPermission::WRITES_DISABLED)
-      return this->refuse_(VL_TEXT("écritures désactivées (enable_writes: false)"),
-                           eco_party_permission_to_string(permission));
-    if (permission == EcoPartyPermission::ENTITY_WRITE_DISABLED)
-      return this->refuse_(VL_TEXT("écriture désactivée pour cette commande (allow_write: false)"),
-                           eco_party_permission_to_string(permission));
-    if (permission != EcoPartyPermission::OK || this->def_ == nullptr)
-      return this->refuse_(VL_TEXT("registre non autorisé"), eco_party_permission_to_string(permission));
+    if (this->def_ == nullptr)
+      return this->refuse_(VL_TEXT("registre non géré"), "not an Eco/Party register");
     if (this->state_ != DhwState::IDLE)
       return this->refuse_(VL_TEXT("commande déjà en cours (") + this->action_text_(this->target_) + VL_TEXT(")"),
                            "this Eco/Party command is already in progress");

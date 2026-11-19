@@ -1,5 +1,11 @@
 # Éditeur des programmations horaires (v0.8, expérimental)
 
+> **v1.0.0 :** document historique. Les options d'autorisation (`enable_*`,
+> `allow_write`, `validated_days`), les entités « État modification / commande »
+> et les exemples intermédiaires cités ici n'existent plus. État actuel :
+> `docs/v1.0.0.md` et `examples/iot-viessmann-v1.0.0.yaml`.
+
+
 > **Statut : implémenté et testé en simulation seulement.** L'écriture des
 > blocs de programmation des radiateurs A1 (`0x2000`), du plancher M2
 > (`0x3000`) et de l'ECS (`0x2100`) n'a **jamais été essayée sur la

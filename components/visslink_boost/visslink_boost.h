@@ -74,7 +74,6 @@ class VissLinkBoost : public Component, public visslink::VissLinkBlockClient {
     this->port_.set_parent(parent);
   }
   void set_time(time::RealTimeClock *clock) { this->clock_ = clock; }
-  void set_validated_days_mask(uint8_t mask) { this->config_.validated_days_mask = mask; }
   void set_duration_select(BoostDurationSelect *s) { this->duration_ = s; }
   /// v0.8.1 : durée choisie dans Home Assistant (rang dans BOOST_DURATIONS).
   void duration_selected(size_t index);

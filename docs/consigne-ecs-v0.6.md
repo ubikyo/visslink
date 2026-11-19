@@ -1,5 +1,11 @@
 # Consigne d'eau chaude sanitaire (v0.6, expérimental)
 
+> **v1.0.0 :** document historique. Les options d'autorisation (`enable_*`,
+> `allow_write`, `validated_days`), les entités « État modification / commande »
+> et les exemples intermédiaires cités ici n'existent plus. État actuel :
+> `docs/v1.0.0.md` et `examples/iot-viessmann-v1.0.0.yaml`.
+
+
 > **Statut : NON validé sur la chaudière.** La lecture de `0x6300` est
 > établie. L'écriture est documentée seulement pour une autre régulation
 > (Vitotronic 200 KW2, vcontrold) et **n'a jamais été faite sur la

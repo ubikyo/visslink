@@ -16,8 +16,6 @@ namespace {
 
 DhwContext heating_ctx(float min = 3, float max = 37, uint8_t peer = 17) {
   DhwContext c;
-  c.enable_writes = true;
-  c.enable_heating_setpoint_writes = true;
   c.link_ok = true;
   c.has_value = true;
   c.config_min = min;
@@ -50,16 +48,14 @@ TEST(heating_whitelist_limits_differ_by_circuit) {
   CHECK(find_heating_setpoint(0x2306)->comfort && !find_heating_setpoint(0x2307)->comfort);
 }
 
-TEST(heating_permission_isolated) {
-  CHECK(heating_write_permitted(0x2306, false, true) == HeatingPermission::WRITES_DISABLED);
-  CHECK(heating_write_permitted(0x2306, true, false) == HeatingPermission::HEATING_WRITE_DISABLED);
-  CHECK(heating_write_permitted(0x3307, true, true) == HeatingPermission::OK);
-  CHECK(heating_write_permitted(0x6300, true, true) == HeatingPermission::NOT_WHITELISTED);
-  // Les autres autorisations ne s'appliquent jamais aux consignes de chauffage.
-  CHECK(dhw_write_permitted(0x2306, true, true) == DhwPermission::NOT_WHITELISTED);
-  CHECK(mode_write_permitted(0x3306, true, true, true) == ModePermission::NOT_WHITELISTED);
-  // Ni l'inverse : la consigne de chauffage ne permet pas l'ECS.
-  CHECK(dhw_write_permitted(0x6300, true, false) == DhwPermission::DHW_WRITE_DISABLED);
+TEST(heating_whitelist_isolated) {
+  CHECK(is_heating_setpoint_write_whitelisted(0x2306) && is_heating_setpoint_write_whitelisted(0x3307));
+  CHECK(!is_heating_setpoint_write_whitelisted(0x6300));
+  // Les autres listes blanches ne contiennent jamais les consignes de chauffage.
+  CHECK(!is_dhw_setpoint_write_whitelisted(0x2306));
+  CHECK(!is_mode_write_whitelisted(0x3306));
+  CHECK(!is_eco_party_flag_whitelisted(0x3306));
+  CHECK(!is_party_setpoint_write_whitelisted(0x2306));
 }
 
 TEST(heating_internal_limits_per_register) {
@@ -87,18 +83,9 @@ TEST(heating_writer_refusals) {
     float value;
     const char *status;
   };
-  DhwContext only_writes = heating_ctx();
-  only_writes.enable_heating_setpoint_writes = false;
-  DhwContext dhw_flag = only_writes;
-  dhw_flag.enable_dhw_setpoint_write = true;  // l'autorisation ECS ne sert à rien ici
   DhwContext no_peer = heating_ctx();
   no_peer.peer_known = false;
   for (const Case &c : {
-           Case{0x2306, DhwContext(), 21, "Refusé : écritures désactivées (enable_writes: false)"},
-           Case{0x2306, only_writes, 21,
-                "Refusé : écriture des consignes de chauffage désactivée (enable_heating_setpoint_writes: false)"},
-           Case{0x3306, dhw_flag, 21,
-                "Refusé : écriture des consignes de chauffage désactivée (enable_heating_setpoint_writes: false)"},
            Case{0x3306, heating_ctx(), 23, "Refusé : valeur 23.0 °C hors limites (16-22 °C)"},
            Case{0x3307, heating_ctx(), 12, "Refusé : valeur 12.0 °C hors limites (14-20 °C)"},
            Case{0x2306, heating_ctx(16, 20), 21, "Refusé : valeur 21.0 °C hors limites (16-20 °C)"},
@@ -148,7 +135,7 @@ TEST(setpoint_gate_one_change_at_a_time) {
   CHECK(m2.status() == "Refusé : une autre consigne est en cours de modification");
   // L'ECS est soumise à la même garde.
   DhwContext dctx;
-  dctx.enable_writes = dctx.enable_dhw_setpoint_write = dctx.link_ok = dctx.has_value = true;
+  dctx.link_ok = dctx.has_value = true;
   dctx.config_min = 40, dctx.config_max = 60;
   setpoint_gate(all, &dhw, 1500, &dctx);
   CHECK(dhw.request(55, dctx, 1500) == DhwAction::REFUSED);

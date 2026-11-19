@@ -1,10 +1,9 @@
 """VissLink : communication Optolink (protocole KW) avec une régulation
-Viessmann Vitotronic. Écritures autorisées par défaut, limitées par les
-protections internes (listes blanches, limites, relectures, restauration) ;
-`enable_writes: false` (ou une autorisation particulière à `false`) les
-désactive."""
+Viessmann Vitotronic. Les commandes implémentées sont directement
+utilisables, sans option d'autorisation ; seules les protections techniques
+s'appliquent (listes blanches, limites, sérialisation, relectures,
+restauration)."""
 
-import logging
 from collections import Counter
 
 import esphome.codegen as cg
@@ -25,14 +24,7 @@ CONF_VISSLINK_ID = "visslink_id"
 CONF_SYNC_TIMEOUT = "sync_timeout"
 CONF_RESPONSE_TIMEOUT = "response_timeout"
 CONF_MAX_RETRIES = "max_retries"
-CONF_ENABLE_WRITES = "enable_writes"
-CONF_ENABLE_MODE_WRITES = "enable_mode_writes"
-CONF_ENABLE_M2_MODE_WRITE = "enable_m2_mode_write"
-CONF_ENABLE_SCHEDULE_WRITES = "enable_schedule_writes"
-CONF_ENABLE_DHW_SETPOINT_WRITE = "enable_dhw_setpoint_write"
-CONF_ENABLE_HEATING_SETPOINT_WRITES = "enable_heating_setpoint_writes"
 
-_LOGGER = logging.getLogger(__name__)
 
 visslink_ns = cg.esphome_ns.namespace("visslink")
 VissLinkComponent = visslink_ns.class_(
@@ -78,10 +70,8 @@ REGISTER_SCHEMA = cv.Schema(
 # ; un test le vérifie.
 MODE_REGISTERS = (0x2301, 0x3301)
 # Registres de programme inscriptibles (v0.4, expérimental) : A1 (écriture
-# documentée par vcontrold, setBetriebArtM1) et M2 (écriture NON documentée,
-# soumise en plus à enable_m2_mode_write).
+# documentée par vcontrold, setBetriebArtM1) et M2 (écriture NON documentée).
 MODE_WRITE_WHITELIST = (0x2301, 0x3301)
-M2_MODE_REGISTER = 0x3301
 # Valeur lue -> texte, dans l'ordre des options du sélecteur.
 OPERATING_MODES = {
     0x00: "ECS seule",
@@ -180,77 +170,6 @@ async def register_register(var, config):
     cg.add(parent.add_register(var))
 
 
-# Autorisations d'écriture : activées par défaut (sans déclaration YAML).
-# Chacune suit son parent : enable_writes: false désactive tout, et
-# enable_mode_writes: false désactive aussi le programme de M2. Un `false`
-# explicite désactive toujours la fonction. Les protections internes
-# (listes blanches, limites, relectures, restauration) ne dépendent pas de
-# ces options.
-WRITE_FLAG_PARENTS = {
-    CONF_ENABLE_WRITES: (),
-    CONF_ENABLE_MODE_WRITES: (CONF_ENABLE_WRITES,),
-    CONF_ENABLE_M2_MODE_WRITE: (CONF_ENABLE_WRITES, CONF_ENABLE_MODE_WRITES),
-    CONF_ENABLE_SCHEDULE_WRITES: (CONF_ENABLE_WRITES,),
-    CONF_ENABLE_DHW_SETPOINT_WRITE: (CONF_ENABLE_WRITES,),
-    CONF_ENABLE_HEATING_SETPOINT_WRITES: (CONF_ENABLE_WRITES,),
-}
-
-
-def _resolve_write_flags(config):
-    """Valeur effective de chaque autorisation (défaut : true). Erreur
-    seulement pour une autorisation explicitement à true dont un parent est
-    désactivé : la configuration se contredirait."""
-    for flag, parents in WRITE_FLAG_PARENTS.items():
-        explicit = config.get(flag)
-        parents_on = all(config[parent] for parent in parents)
-        if explicit is True and not parents_on:
-            raise cv.Invalid(
-                f"{flag} requires "
-                + " and ".join(f"{parent}: true" for parent in parents),
-                path=[flag],
-            )
-        config[flag] = (explicit is not False) and parents_on
-    return config
-
-
-def _warn_if_writes_enabled(config):
-    config = _resolve_write_flags(config)
-    if config[CONF_ENABLE_HEATING_SETPOINT_WRITES]:
-        _LOGGER.warning(
-            "VissLink: HEATING SETPOINT WRITES ENABLED (enable_heating_setpoint_"
-            "writes: true), A1 0x2306/0x2307, M2 0x3306/0x3307, provisional "
-            "limits, experimental: see docs/consignes-chauffage-v0.7.md"
-        )
-    if config[CONF_ENABLE_DHW_SETPOINT_WRITE]:
-        _LOGGER.warning(
-            "VissLink: DHW SETPOINT WRITE ENABLED (enable_dhw_setpoint_write: "
-            "true), 0x6300, internal limits 50..60 C, experimental: see "
-            "docs/consigne-ecs-v0.6.md"
-        )
-    if config[CONF_ENABLE_SCHEDULE_WRITES]:
-        _LOGGER.warning(
-            "VissLink: SCHEDULE BLOCK WRITES ENABLED (enable_schedule_writes: "
-            "true), circulation 0x2200-0x2237, experimental: see "
-            "docs/bouclage-ecs-v0.5.md"
-        )
-    if config[CONF_ENABLE_WRITES]:
-        _LOGGER.warning(
-            "VissLink: Optolink WRITES ENABLED (enable_writes: true). Writes are "
-            "not validated on hardware yet: see docs/ecriture-kw.md"
-        )
-    if config[CONF_ENABLE_MODE_WRITES]:
-        _LOGGER.warning(
-            "VissLink: OPERATING MODE WRITES ENABLED (enable_mode_writes: true), "
-            "experimental: see docs/ecriture-kw.md"
-        )
-    if config[CONF_ENABLE_M2_MODE_WRITE]:
-        _LOGGER.warning(
-            "VissLink: M2 OPERATING MODE WRITE ENABLED (enable_m2_mode_write: "
-            "true), 0x3301, UNDOCUMENTED write: see docs/ecriture-kw.md"
-        )
-    return config
-
-
 CONFIG_SCHEMA = cv.All(
     cv.Schema(
         {
@@ -272,32 +191,10 @@ CONFIG_SCHEMA = cv.All(
                 ),
             ),
             cv.Optional(CONF_MAX_RETRIES, default=2): cv.int_range(min=0, max=5),
-            # Autorisations d'écriture : ACTIVÉES par défaut, `false` pour
-            # désactiver (cf. _resolve_write_flags). Interrupteur général.
-            cv.Optional(CONF_ENABLE_WRITES): cv.boolean,
-            # v0.3, expérimental : écriture des programmes de fonctionnement
-            # (A1 ; M2 exige en plus enable_m2_mode_write). Exige enable_writes.
-            cv.Optional(CONF_ENABLE_MODE_WRITES): cv.boolean,
-            # v0.4, expérimental : écriture du programme de M2 (0x3301), non
-            # documentée. Exige enable_writes ET enable_mode_writes.
-            cv.Optional(CONF_ENABLE_M2_MODE_WRITE): cv.boolean,
-            # v0.5, expérimental : écriture des blocs horaires du bouclage ECS
-            # (0x2200-0x2237, 8 octets). Exige enable_writes.
-            cv.Optional(CONF_ENABLE_SCHEDULE_WRITES): cv.boolean,
-            # v0.6, expérimental : écriture de la consigne ECS (0x6300), dans
-            # les limites internes 50..60 °C. Exige enable_writes. Sans elle,
-            # enable_writes seul ne permet plus d'écrire 0x6300.
-            cv.Optional(CONF_ENABLE_DHW_SETPOINT_WRITE): cv.boolean,
-            # v0.7, expérimental : écriture des consignes de chauffage A1/M2
-            # (0x2306, 0x2307, 0x3306, 0x3307), limites internes provisoires
-            # par registre. Exige enable_writes. Sans elle, enable_writes seul
-            # ne permet plus d'écrire ces consignes.
-            cv.Optional(CONF_ENABLE_HEATING_SETPOINT_WRITES): cv.boolean,
         }
     )
     .extend(cv.COMPONENT_SCHEMA)
     .extend(uart.UART_DEVICE_SCHEMA),
-    _warn_if_writes_enabled,
 )
 
 FINAL_VALIDATE_SCHEMA = uart.final_validate_device_schema(
@@ -318,13 +215,3 @@ async def to_code(config):
     cg.add(var.set_sync_timeout(config[CONF_SYNC_TIMEOUT]))
     cg.add(var.set_response_timeout(config[CONF_RESPONSE_TIMEOUT]))
     cg.add(var.set_max_retries(config[CONF_MAX_RETRIES]))
-    cg.add(var.set_enable_writes(config[CONF_ENABLE_WRITES]))
-    cg.add(var.set_enable_mode_writes(config[CONF_ENABLE_MODE_WRITES]))
-    cg.add(var.set_enable_m2_mode_write(config[CONF_ENABLE_M2_MODE_WRITE]))
-    cg.add(var.set_enable_schedule_writes(config[CONF_ENABLE_SCHEDULE_WRITES]))
-    cg.add(var.set_enable_dhw_setpoint_write(config[CONF_ENABLE_DHW_SETPOINT_WRITE]))
-    cg.add(
-        var.set_enable_heating_setpoint_writes(
-            config[CONF_ENABLE_HEATING_SETPOINT_WRITES]
-        )
-    )

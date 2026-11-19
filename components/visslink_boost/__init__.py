@@ -5,10 +5,8 @@ Ajoute temporairement, au bloc du jour de la programmation du bouclage
 exactement les 8 octets d'origine. La pompe reste commandée par la
 régulation ; 0x0846 n'est jamais écrit.
 
-Autorisé par défaut (enable_writes et enable_schedule_writes du composant
-`visslink`, défaut true) les sept jours (`validated_days`, défaut : tous) ;
-`false` ou une liste réduite le restreint. Sauvegarde, relecture et
-restauration vérifiée restent obligatoires.
+Disponible tous les jours, sans option d'autorisation. Sauvegarde, relecture
+et restauration vérifiée restent obligatoires.
 Procédure : docs/bouclage-ecs-v0.5.md.
 """
 
@@ -22,7 +20,6 @@ from ..visslink import CONF_VISSLINK_ID, VissLinkComponent
 DEPENDENCIES = ["visslink", "time"]
 AUTO_LOAD = ["button", "select", "binary_sensor", "sensor", "text_sensor"]
 
-CONF_VALIDATED_DAYS = "validated_days"
 CONF_START = "start"
 CONF_RESTORE = "restore"
 CONF_FORGET = "forget"
@@ -34,7 +31,6 @@ CONF_STATUS = "status"
 CONF_RANGE = "range"
 CONF_REMAINING = "remaining"
 
-DAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 # Durées proposées, dans l'ordre de BOOST_DURATIONS (circulation_boost.h).
 DURATION_OPTIONS = ["10 min", "20 min", "30 min"]
 # v0.5.2 : option publiée au démarrage de l'ESP (BOOST_DEFAULT_DURATION_INDEX).
@@ -53,11 +49,6 @@ CONFIG_SCHEMA = cv.Schema(
         # Heure de Home Assistant : recoupement obligatoire avec l'horloge de
         # la Vitotronic (0x088E).
         cv.Required(CONF_TIME_ID): cv.use_id(time.RealTimeClock),
-        # Jours autorisés (bloc 0x2200 + 8 × jour). Défaut : les sept jours.
-        # Liste vide : aucun déclenchement possible.
-        cv.Optional(CONF_VALIDATED_DAYS, default=list(DAYS)): cv.ensure_list(
-            cv.one_of(*DAYS, lower=True)
-        ),
         cv.Required(CONF_START): button.button_schema(
             BoostButton, icon="mdi:water-pump"
         ),
@@ -82,7 +73,7 @@ CONFIG_SCHEMA = cv.Schema(
             icon="mdi:backup-restore"
         ),
         cv.Required(CONF_STATUS): text_sensor.text_sensor_schema(
-            icon="mdi:information-outline", entity_category="diagnostic"
+            icon="mdi:information-outline"
         ),
         # v0.7.1 (facultatifs) : plage temporaire inscrite dans la Vitotronic
         # ("14:00-14:30 (dimanche)" ou "Aucune"), et temps restant avant la
@@ -108,10 +99,6 @@ async def to_code(config):
     cg.add(var.set_parent(parent))
     clock = await cg.get_variable(config[CONF_TIME_ID])
     cg.add(var.set_time(clock))
-    mask = 0
-    for day in config[CONF_VALIDATED_DAYS]:
-        mask |= 1 << DAYS.index(day)
-    cg.add(var.set_validated_days_mask(mask))
 
     for key, kind in (
         (CONF_START, BoostButtonKind.START),

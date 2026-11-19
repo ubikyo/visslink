@@ -1,5 +1,11 @@
 # Écriture KW, consignes et programmes de fonctionnement (v0.3 – v0.4.1)
 
+> **v1.0.0 :** document historique. Les options d'autorisation (`enable_*`,
+> `allow_write`, `validated_days`), les entités « État modification / commande »
+> et les exemples intermédiaires cités ici n'existent plus. État actuel :
+> `docs/v1.0.0.md` et `examples/iot-viessmann-v1.0.0.yaml`.
+
+
 > **Statut : aucune écriture n'a été faite sur la chaudière.** Le code
 > d'écriture est implémenté et testé **en simulation seulement**. Une
 > simulation réussie montre que VissLink se comporte comme prévu face au
