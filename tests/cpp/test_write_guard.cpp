@@ -12,8 +12,11 @@
 using namespace esphome::visslink;
 using Submit = WriteArbiter::Submit;
 
-TEST(write_whitelist_is_exactly_the_five_setpoints) {
-  CHECK_EQ(WRITABLE_REGISTER_COUNT, 5u);
+TEST(write_whitelist_is_exactly_the_seven_setpoints) {
+  // v0.9.1 : 5 consignes + les 2 consignes Party (0x2308, 0x3308).
+  CHECK_EQ(WRITABLE_REGISTER_COUNT, 7u);
+  for (uint16_t a : {0x2308, 0x3308})
+    CHECK(find_writable(a) != nullptr && find_writable(a)->min == 3 && find_writable(a)->max == 37);
   for (uint16_t a : {0x2306, 0x2307, 0x3306, 0x3307})
     CHECK(find_writable(a) != nullptr && find_writable(a)->min == 3 && find_writable(a)->max == 37);
   CHECK(find_writable(0x6300) != nullptr && find_writable(0x6300)->min == 10 && find_writable(0x6300)->max == 60);
@@ -22,7 +25,7 @@ TEST(write_whitelist_is_exactly_the_five_setpoints) {
   // Registres lus mais jamais écrits : températures, brûleur, compteurs,
   // programmations, registres expérimentaux, voisins des consignes.
   for (uint16_t a : {0x0800, 0x0802, 0x0804, 0x3900, 0x0842, 0x088A, 0x08A7, 0x2000, 0x2200, 0x0846, 0x0845, 0x5502,
-                     0x2305, 0x2308, 0x3308, 0x6301, 0x0000, 0xFFFF})
+                     0x2305, 0x2309, 0x3309, 0x2302, 0x2303, 0x3302, 0x3303, 0x6301, 0x0000, 0xFFFF})
     CHECK(find_writable(a) == nullptr);
 }
 
@@ -198,7 +201,8 @@ TEST(mode_and_setpoint_whitelists_are_distinct) {
   CHECK_EQ(check_write_value(0x3301, 1, 3, 0, 5, &out), WriteCheck::NOT_WHITELISTED);
   CHECK(!is_mode_write_whitelisted(0x2306));
   CHECK(is_write_whitelisted(0x2301) && is_write_whitelisted(0x3301) && is_write_whitelisted(0x2306));
-  CHECK_EQ(WriteArbiter::MAX_PENDING, 7u);
+  CHECK_EQ(WriteArbiter::MAX_PENDING, 13u);  // v0.9.1 : 7 consignes, 2 programmes, 4 Éco/Party
+  CHECK_EQ(OwnerSet::MAX, WriteArbiter::MAX_PENDING);
 }
 
 TEST(mode_divergence_rules) {
@@ -268,13 +272,14 @@ TEST(write_timing_components) {
 }
 
 
-TEST(eco_party_registers_are_never_writable) {
-  // v0.5 : Éco et Party, lecture seule. Aucune liste blanche ne les contient.
+TEST(eco_party_registers_are_never_writable_as_setpoints_or_modes) {
+  // v0.5 : Éco et Party, lecture seule. v0.9.1 : écrits seulement par leur
+  // liste blanche propre (ECO_PARTY_FLAGS), jamais comme consigne ou programme.
   uint8_t out = 0;
   for (uint16_t a : {0x2302, 0x2303, 0x3302, 0x3303}) {
     CHECK(find_writable(a) == nullptr);
     CHECK(!is_mode_write_whitelisted(a));
-    CHECK(!is_write_whitelisted(a));
+    CHECK(is_write_whitelisted(a) == is_eco_party_flag_whitelisted(a));
     CHECK_EQ(check_write_value(a, 1, 1, 0, 1, &out), WriteCheck::NOT_WHITELISTED);
     for (uint8_t v : {0x00, 0x01})
       CHECK_EQ(check_mode_write(a, 1, v), WriteCheck::NOT_WHITELISTED);
@@ -282,19 +287,59 @@ TEST(eco_party_registers_are_never_writable) {
   }
 }
 
-TEST(v09_eco_party_and_party_setpoints_stay_read_only) {
-  // v0.9 : aucune source ne documente leur écriture sur la Vitotronic 300
-  // KW3 (209C) ; vcontrold ne les déclare que pour la 200 KW2, et rien pour
-  // Éco M2 (0x3302). Lecture seule tant que l'essai sur la chaudière n'est
-  // pas fait (docs/eco-party-v0.9.md).
+TEST(v091_eco_party_whitelists_are_separate_and_exact) {
+  // v0.9.1 : lecture des six registres validée sur la KW3 ; écriture autorisée
+  // seulement par leurs listes blanches propres (docs/eco-party-v0.9.1.md).
   uint8_t out = 0;
-  for (uint16_t a : {0x2302, 0x2303, 0x3302, 0x3303, 0x2308, 0x3308}) {
-    CHECK(find_writable(a) == nullptr);
-    CHECK(!is_write_whitelisted(a));
+  for (uint16_t a : {0x2302, 0x2303, 0x3302, 0x3303}) {
+    CHECK(is_eco_party_flag_whitelisted(a));
+    CHECK(is_write_whitelisted(a));
+    CHECK(find_writable(a) == nullptr);  // pas une consigne
     CHECK(!is_mode_write_whitelisted(a));
-    CHECK(!is_schedule_write_whitelisted(a));  // bouclage
-    CHECK(!is_schedule_editor_whitelisted(a));  // éditeur v0.8
-    for (uint8_t v : {0x00, 0x01, 0x04, 0x14, 0x25})
-      CHECK_EQ(check_write_value(a, 1, v, 0, 40, &out), WriteCheck::NOT_WHITELISTED);
+    CHECK(!is_schedule_write_whitelisted(a));
+    CHECK(!is_schedule_editor_whitelisted(a));
+    CHECK(!is_heating_setpoint_write_whitelisted(a));
+    CHECK_EQ(check_flag_write(a, 1, 0x00), WriteCheck::OK);
+    CHECK_EQ(check_flag_write(a, 1, 0x01), WriteCheck::OK);
+    for (uint8_t v : {0x02, 0x03, 0x05, 0xFF})
+      CHECK_EQ(check_flag_write(a, 1, v), WriteCheck::FLAG_VALUE_NOT_ALLOWED);
+    CHECK_EQ(check_flag_write(a, 2, 0x01), WriteCheck::BAD_LENGTH);
+    CHECK_EQ(check_write_value(a, 1, 1, 0, 40, &out), WriteCheck::NOT_WHITELISTED);
+    CHECK_EQ(check_mode_write(a, 1, 0x00), WriteCheck::NOT_WHITELISTED);
+  }
+  // Paires du même circuit.
+  CHECK_EQ(find_eco_party_flag(0x2302)->peer, 0x2303);
+  CHECK_EQ(find_eco_party_flag(0x2303)->peer, 0x2302);
+  CHECK_EQ(find_eco_party_flag(0x3302)->peer, 0x3303);
+  CHECK_EQ(find_eco_party_flag(0x3303)->peer, 0x3302);
+  // Consignes Party : liste blanche des consignes, limites internes propres.
+  for (uint16_t a : {0x2308, 0x3308}) {
+    CHECK(is_party_setpoint_write_whitelisted(a));
+    CHECK(find_writable(a) != nullptr);
+    CHECK(!is_eco_party_flag_whitelisted(a));
+    CHECK(!is_heating_setpoint_write_whitelisted(a));
+    CHECK(!is_dhw_setpoint_write_whitelisted(a));
+    CHECK_EQ(check_flag_write(a, 1, 1), WriteCheck::NOT_WHITELISTED);
+    CHECK_EQ(check_write_value(a, 1, 20, 3, 37, &out), WriteCheck::OK);
+    CHECK_EQ(out, 20);
+    CHECK_EQ(check_write_value(a, 1, 15, 3, 37, &out), WriteCheck::OUT_OF_PARTY_LIMITS);
+    CHECK_EQ(check_write_value(a, 1, 20.5f, 3, 37, &out), WriteCheck::NOT_INTEGER);
+  }
+  CHECK_EQ(check_write_value(0x2308, 1, 23, 3, 37, &out), WriteCheck::OK);
+  CHECK_EQ(check_write_value(0x3308, 1, 23, 3, 37, &out), WriteCheck::OUT_OF_PARTY_LIMITS);
+  uint8_t lo = 0, hi = 0;
+  CHECK(setpoint_write_limits(0x3308, &lo, &hi) && lo == 16 && hi == 22);
+  // Les consignes confort/réduite et les autres registres restent hors des
+  // listes Éco/Party.
+  for (uint16_t a : {0x2306, 0x2307, 0x3306, 0x3307, 0x6300, 0x2301, 0x3301, 0x2304, 0x2200})
+    CHECK_EQ(eco_party_write_permitted(a, true, true), EcoPartyPermission::NOT_WHITELISTED);
+}
+
+TEST(v091_eco_party_permission_needs_enable_writes_and_allow_write) {
+  for (uint16_t a : {0x2302, 0x2303, 0x3302, 0x3303, 0x2308, 0x3308}) {
+    CHECK_EQ(eco_party_write_permitted(a, false, true), EcoPartyPermission::WRITES_DISABLED);
+    CHECK_EQ(eco_party_write_permitted(a, false, false), EcoPartyPermission::WRITES_DISABLED);
+    CHECK_EQ(eco_party_write_permitted(a, true, false), EcoPartyPermission::ENTITY_WRITE_DISABLED);
+    CHECK_EQ(eco_party_write_permitted(a, true, true), EcoPartyPermission::OK);
   }
 }

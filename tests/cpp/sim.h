@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <set>
 #include <vector>
@@ -67,6 +68,10 @@ class SimBoiler {
   std::map<uint16_t, std::vector<uint8_t>> registers;
   std::set<uint16_t> writable;                    ///< adresses acceptées en écriture
   std::map<uint16_t, WriteFault> write_faults;    ///< réaction par adresse
+  /// v0.9.1 : appelé après chaque écriture appliquée (réaction simulée de la
+  /// régulation sur d'autres registres). Hypothèse de test, pas un
+  /// comportement mesuré.
+  std::function<void(uint16_t)> on_applied;
   std::map<uint16_t, std::pair<uint8_t, uint8_t>> write_clamp;  ///< bornes internes de la régulation
   uint32_t frame_timeout_ms{500};
 
@@ -166,6 +171,8 @@ class SimBoiler {
         value[0] = value[0] > clamp->second.second ? clamp->second.second : value[0];
       }
       registers[address] = value;
+      if (on_applied)
+        on_applied(address);  // v0.9.1 : effet de bord simulé (Party coupe Éco...)
     }
     pending_reply_.clear();
     switch (f) {

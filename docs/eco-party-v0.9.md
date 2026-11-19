@@ -5,6 +5,9 @@ L'analyse ci-dessous montre qu'aucune source ne documente ces écritures pour
 la Vitotronic 300 KW3 (`209C`). Elle précise ce qu'il faut vérifier sur la
 chaudière avant de les implémenter.
 
+> v0.9.1 : la lecture des six registres est validée sur la KW3 ; les
+> commandes sont livrées, désactivables une par une : `docs/eco-party-v0.9.1.md`.
+
 Exemple : `examples/iot-viessmann-eco-party-v0.9.yaml`. C'est l'exemple
 v0.8.1 plus la lecture des consignes Party A1 et M2.
 

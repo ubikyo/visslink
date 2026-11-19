@@ -46,6 +46,8 @@ static constexpr WritableRegister WRITABLE_REGISTERS[] = {
     {0x3306, 1, 3, 37},   // M2, consigne d'ambiance normale
     {0x3307, 1, 3, 37},   // M2, consigne d'ambiance réduite
     {0x6300, 1, 10, 60},  // eau chaude sanitaire
+    {0x2308, 1, 3, 37},   // v0.9.1 : A1, consigne Party
+    {0x3308, 1, 3, 37},   // v0.9.1 : M2, consigne Party
 };
 static constexpr size_t WRITABLE_REGISTER_COUNT = sizeof(WRITABLE_REGISTERS) / sizeof(WRITABLE_REGISTERS[0]);
 
@@ -173,12 +175,113 @@ inline HeatingPermission heating_write_permitted(uint16_t address, bool enable_w
   return HeatingPermission::OK;
 }
 
-/// Limites internes d'écriture d'une consigne (ECS ou chauffage). Faux si
-/// l'adresse n'en a pas.
+// --- Éco / Party A1 et M2 (v0.9.1, expérimental) ----------------------------
+//
+// Lecture validée sur la Vitotronic 300 KW3 (209C) de l'installation : états
+// 0/1, consignes Party en °C entiers. ÉCRITURE NON VALIDÉE : documentée
+// seulement pour la Vitotronic 200 KW2 (vcontrold), et pour aucun appareil
+// pour Éco M2 (0x3302) ; cf. docs/eco-party-v0.9.1.md.
+//
+// Listes blanches DISTINCTES de toutes les autres. Autorisations :
+// enable_writes ET l'option `allow_write` de l'entité (une par registre :
+// validation matérielle registre par registre). Aucune autre autorisation
+// (consignes, programmes, blocs horaires) ne les permet, et ces autorisations
+// ne permettent rien d'autre. Les consignes confort/réduite ne sont jamais
+// touchées pour simuler Éco ou Party.
+
+/// Commande Éco ou Party d'un circuit : 1 octet, 00 = inactif, 01 = actif.
+struct EcoPartyFlag {
+  uint16_t address;
+  uint16_t peer;  ///< l'autre commande du même circuit (relue après une écriture)
+  bool party;     ///< Party ; sinon Éco
+  bool m2;        ///< circuit M2 (plancher) ; sinon A1 (radiateurs)
+};
+static constexpr EcoPartyFlag ECO_PARTY_FLAGS[] = {
+    {0x2302, 0x2303, false, false},  // A1 radiateurs, Éco
+    {0x2303, 0x2302, true, false},   // A1 radiateurs, Party
+    {0x3302, 0x3303, false, true},   // M2 plancher, Éco (écriture documentée nulle part)
+    {0x3303, 0x3302, true, true},    // M2 plancher, Party
+};
+static constexpr size_t ECO_PARTY_FLAG_COUNT = sizeof(ECO_PARTY_FLAGS) / sizeof(ECO_PARTY_FLAGS[0]);
+
+inline const EcoPartyFlag *find_eco_party_flag(uint16_t address) {
+  for (const auto &f : ECO_PARTY_FLAGS) {
+    if (f.address == address)
+      return &f;
+  }
+  return nullptr;
+}
+inline bool is_eco_party_flag_whitelisted(uint16_t address) { return find_eco_party_flag(address) != nullptr; }
+
+/// Consigne Party d'un circuit (°C entiers). Limites INTERNES d'écriture
+/// PROVISOIRES, plus étroites que la plage documentée (3..37) : celles de la
+/// consigne confort du même circuit (M2 plancher plafonné à 22 °C). Aucun
+/// lien imposé avec les consignes confort/réduite, qui ne sont jamais écrites
+/// par cette fonction.
+struct PartySetpoint {
+  uint16_t address;
+  uint8_t min;
+  uint8_t max;
+  bool m2;
+};
+static constexpr PartySetpoint PARTY_SETPOINTS[] = {
+    {0x2308, 16, 23, false},  // A1 radiateurs
+    {0x3308, 16, 22, true},   // M2 plancher
+};
+
+inline const PartySetpoint *find_party_setpoint(uint16_t address) {
+  for (const auto &p : PARTY_SETPOINTS) {
+    if (p.address == address)
+      return &p;
+  }
+  return nullptr;
+}
+inline bool is_party_setpoint_write_whitelisted(uint16_t address) { return find_party_setpoint(address) != nullptr; }
+
+enum class EcoPartyPermission : uint8_t {
+  OK,
+  WRITES_DISABLED,         ///< enable_writes: false
+  ENTITY_WRITE_DISABLED,   ///< allow_write: false sur l'entité
+  NOT_WHITELISTED,         ///< ni commande Éco/Party ni consigne Party
+};
+
+inline const char *eco_party_permission_to_string(EcoPartyPermission permission) {
+  switch (permission) {
+    case EcoPartyPermission::OK:
+      return "ok";
+    case EcoPartyPermission::WRITES_DISABLED:
+      return "writes are disabled (enable_writes: false)";
+    case EcoPartyPermission::ENTITY_WRITE_DISABLED:
+      return "write disabled for this entity (allow_write: false)";
+    case EcoPartyPermission::NOT_WHITELISTED:
+      return "not an Eco/Party register";
+  }
+  return "unknown";
+}
+
+/// Autorisation d'écriture d'une commande Éco/Party ou d'une consigne Party,
+/// vérifiée à la demande ET juste avant l'émission.
+inline EcoPartyPermission eco_party_write_permitted(uint16_t address, bool enable_writes, bool allow_write) {
+  if (!enable_writes)
+    return EcoPartyPermission::WRITES_DISABLED;
+  if (!is_eco_party_flag_whitelisted(address) && !is_party_setpoint_write_whitelisted(address))
+    return EcoPartyPermission::NOT_WHITELISTED;
+  if (!allow_write)
+    return EcoPartyPermission::ENTITY_WRITE_DISABLED;
+  return EcoPartyPermission::OK;
+}
+
+/// Limites internes d'écriture d'une consigne (ECS, chauffage ou, v0.9.1,
+/// Party). Faux si l'adresse n'en a pas.
 inline bool setpoint_write_limits(uint16_t address, uint8_t *min, uint8_t *max) {
   if (is_dhw_setpoint_write_whitelisted(address)) {
     *min = DHW_WRITE_MIN;
     *max = DHW_WRITE_MAX;
+    return true;
+  }
+  if (const PartySetpoint *p = find_party_setpoint(address)) {
+    *min = p->min;
+    *max = p->max;
     return true;
   }
   const HeatingSetpoint *h = find_heating_setpoint(address);
@@ -309,9 +412,11 @@ inline const char *operating_mode_text(int raw) {
   }
 }
 
-/// Adresse présente dans l'une des deux listes blanches d'écriture.
+/// Adresse présente dans l'une des listes blanches d'écriture d'un octet
+/// (consignes, programmes, v0.9.1 commandes Éco/Party).
 inline bool is_write_whitelisted(uint16_t address) {
-  return find_writable(address) != nullptr || is_mode_write_whitelisted(address);
+  return find_writable(address) != nullptr || is_mode_write_whitelisted(address) ||
+         is_eco_party_flag_whitelisted(address);
 }
 
 enum class WriteCheck : uint8_t {
@@ -325,6 +430,8 @@ enum class WriteCheck : uint8_t {
   VALUE_NOT_ALLOWED, ///< programme : valeur hors de {00, 03, 05}
   OUT_OF_SAFE_LIMITS, ///< v0.6 : consigne ECS hors des limites internes (DHW_WRITE_MIN..MAX)
   OUT_OF_HEATING_LIMITS, ///< v0.7 : consigne de chauffage hors des limites internes du registre
+  OUT_OF_PARTY_LIMITS,   ///< v0.9.1 : consigne Party hors des limites internes du registre
+  FLAG_VALUE_NOT_ALLOWED, ///< v0.9.1 : commande Éco/Party : valeur hors de {00, 01}
 };
 
 inline const char *write_check_to_string(WriteCheck check) {
@@ -349,6 +456,10 @@ inline const char *write_check_to_string(WriteCheck check) {
       return "DHW setpoint outside the internal safety limits (50..60)";
     case WriteCheck::OUT_OF_HEATING_LIMITS:
       return "heating setpoint outside the internal limits of this register";
+    case WriteCheck::OUT_OF_PARTY_LIMITS:
+      return "Party setpoint outside the internal limits of this register";
+    case WriteCheck::FLAG_VALUE_NOT_ALLOWED:
+      return "Eco/Party value not allowed (only 00, 01)";
   }
   return "unknown";
 }
@@ -377,6 +488,10 @@ inline WriteCheck check_write_value(uint16_t address, uint8_t length, float valu
   const HeatingSetpoint *heating = find_heating_setpoint(address);
   if (heating != nullptr && (value < heating->min || value > heating->max))
     return WriteCheck::OUT_OF_HEATING_LIMITS;
+  // v0.9.1 : limites internes des consignes Party, par registre.
+  const PartySetpoint *party = find_party_setpoint(address);
+  if (party != nullptr && (value < party->min || value > party->max))
+    return WriteCheck::OUT_OF_PARTY_LIMITS;
   out[0] = static_cast<uint8_t>(value);
   return WriteCheck::OK;
 }
@@ -390,6 +505,18 @@ inline WriteCheck check_mode_write(uint16_t address, uint8_t length, uint8_t val
     return WriteCheck::BAD_LENGTH;
   if (operating_mode_index(value) < 0)
     return WriteCheck::VALUE_NOT_ALLOWED;
+  return WriteCheck::OK;
+}
+
+/// v0.9.1 : contrôle d'une écriture de commande Éco/Party : adresse de
+/// ECO_PARTY_FLAGS, 1 octet, valeur 00 ou 01.
+inline WriteCheck check_flag_write(uint16_t address, uint8_t length, uint8_t value) {
+  if (!is_eco_party_flag_whitelisted(address))
+    return WriteCheck::NOT_WHITELISTED;
+  if (length != 1)
+    return WriteCheck::BAD_LENGTH;
+  if (value > 1)
+    return WriteCheck::FLAG_VALUE_NOT_ALLOWED;
   return WriteCheck::OK;
 }
 
@@ -500,7 +627,9 @@ class WriteVerification {
 /// une restauration du bouclage). Construit implicitement depuis un seul
 /// propriétaire (ou NONE).
 struct OwnerSet {
-  static constexpr size_t MAX = 5;
+  /// Toutes les entités à écriture d'un octet (v0.9.1 : 7 consignes,
+  /// 2 programmes, 4 commandes Éco/Party).
+  static constexpr size_t MAX = WRITABLE_REGISTER_COUNT + MODE_WRITE_COUNT + ECO_PARTY_FLAG_COUNT;
   int owners[MAX]{};
   size_t count{0};
   OwnerSet() = default;
@@ -524,8 +653,9 @@ struct OwnerSet {
 class WriteArbiter {
  public:
   static constexpr int NONE = -1;
-  /// Une demande par entité au plus : 5 consignes + 2 programmes.
-  static constexpr size_t MAX_PENDING = WRITABLE_REGISTER_COUNT + MODE_WRITE_COUNT;
+  /// Une demande par entité au plus : 7 consignes + 2 programmes + 4
+  /// commandes Éco/Party (v0.9.1).
+  static constexpr size_t MAX_PENDING = WRITABLE_REGISTER_COUNT + MODE_WRITE_COUNT + ECO_PARTY_FLAG_COUNT;
   /// Délai minimal entre la fin d'une écriture (relecture comprise) et
   /// l'envoi de la suivante : pas de rafale, usure limitée de la mémoire de
   /// la régulation.

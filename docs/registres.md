@@ -376,6 +376,14 @@ Analyse des sources, consignes Party (`0x2308`, `0x3308`, lues en v0.9) et
 procédure d'essai sur la chaudière : `docs/eco-party-v0.9.md`. Conclusion :
 aucune écriture documentée pour la KW3, donc toujours en lecture seule.
 
+### v0.9.1 : lecture validée, pilotage expérimental
+
+Les six registres sont validés en lecture sur la KW3 (Éco/Party 0/1,
+consignes Party en °C entiers). Les commandes existent désormais (`switch`
+Éco/Party, `number` consignes Party), mais leur **écriture n'est pas
+validée** : elle se valide registre par registre, avec `allow_write` par
+entité. Procédure et comportement : `docs/eco-party-v0.9.1.md`.
+
 ### Perspectives (non implémentées)
 
 Ces états serviront plus tard au pilotage par présence depuis Home

@@ -42,7 +42,14 @@ VissLinkRegister = visslink_ns.class_("VissLinkRegister")
 
 # Plateformes partageant le même ordonnanceur (et donc le même espace
 # d'adresses : un registre n'est lu qu'une fois, quelle que soit la plateforme).
-REGISTER_DOMAINS = ("sensor", "binary_sensor", "text_sensor", "number", "select")
+REGISTER_DOMAINS = (
+    "sensor",
+    "binary_sensor",
+    "text_sensor",
+    "number",
+    "select",
+    "switch",
+)
 
 # Programmation horaire (text_sensor) : 7 blocs de 8 octets à partir du lundi.
 SCHEDULE_DAYS = 7

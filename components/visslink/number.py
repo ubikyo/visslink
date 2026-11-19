@@ -9,6 +9,12 @@ v0.7 : même transaction pour les consignes de chauffage A1/M2, avec
 `enable_heating_setpoint_writes` et les limites HEATING_WRITE_LIMITS. Option
 `status` (toute consigne) : texte d'état des modifications.
 
+v0.9.1 : consignes Party A1 (0x2308) et M2 (0x3308), même transaction,
+autorisées par `enable_writes` ET l'option `allow_write` de l'entité (vrai par
+défaut ; `false` = lecture seule, pour valider l'écriture registre par
+registre), limites internes PARTY_WRITE_LIMITS. `allow_write` n'existe que
+pour ces deux consignes.
+
 Le registre est lu périodiquement (`update_interval`, 5 min par défaut) et
 l'état publié est toujours la valeur LUE. Une modification n'est écrite que si
 le composant `visslink` a `enable_writes: true` ; sinon elle est refusée et
@@ -18,6 +24,8 @@ Seules les adresses de la liste blanche sont acceptées, en uint8 entier, dans
 des bornes comprises dans la plage documentée de la régulation. La liste doit
 rester identique à WRITABLE_REGISTERS (write_guard.h) : un test le vérifie.
 """
+
+import logging
 
 import esphome.codegen as cg
 import esphome.config_validation as cv
@@ -41,6 +49,8 @@ from . import (
     visslink_ns,
 )
 
+_LOGGER = logging.getLogger(__name__)
+
 DEPENDENCIES = ["visslink"]
 AUTO_LOAD = ["text_sensor"]
 
@@ -54,6 +64,8 @@ WRITABLE_REGISTERS = {
     0x3306: (3, 37),  # M2, consigne d'ambiance normale (confort)
     0x3307: (3, 37),  # M2, consigne d'ambiance réduite (éco)
     0x6300: (10, 60),  # consigne d'eau chaude sanitaire
+    0x2308: (3, 37),  # v0.9.1 : A1, consigne Party
+    0x3308: (3, 37),  # v0.9.1 : M2, consigne Party
 }
 
 # v0.6 : consigne ECS, liste blanche distincte et limites INTERNES d'écriture
@@ -73,6 +85,15 @@ HEATING_WRITE_LIMITS = {
     0x3306: (16, 22),  # M2 plancher, confort
     0x3307: (14, 20),  # M2 plancher, réduite
 }
+
+# v0.9.1 : consignes Party, limites INTERNES d'écriture PROVISOIRES
+# (PARTY_SETPOINTS, write_guard.h ; un test vérifie la concordance). Écriture
+# non validée sur la KW3 : désactivable par entité (`allow_write: false`).
+PARTY_WRITE_LIMITS = {
+    0x2308: (16, 23),  # A1 radiateurs
+    0x3308: (16, 22),  # M2 plancher
+}
+CONF_ALLOW_WRITE = "allow_write"
 
 
 def _integer(value):
@@ -107,6 +128,11 @@ def _validate(config):
         raise cv.Invalid(
             "min_value must be lower than max_value", path=[CONF_MAX_VALUE]
         )
+    if CONF_ALLOW_WRITE in config and address not in PARTY_WRITE_LIMITS:
+        raise cv.Invalid(
+            "allow_write is only available for the Party setpoints (0x2308, 0x3308)",
+            path=[CONF_ALLOW_WRITE],
+        )
     return config
 
 
@@ -129,6 +155,8 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_STATUS): text_sensor.text_sensor_schema(
                 icon="mdi:information-outline", entity_category="diagnostic"
             ),
+            # v0.9.1 : consignes Party seulement ; false = lecture seule.
+            cv.Optional(CONF_ALLOW_WRITE): cv.boolean,
         }
     ),
     _validate,
@@ -149,6 +177,16 @@ async def to_code(config):
     await register_register(var, config)
     # v0.6/v0.7 : chaque consigne a sa transaction dédiée.
     cg.add(parent.add_setpoint_number(var))
+    if config[CONF_ADDRESS] in PARTY_WRITE_LIMITS:
+        allow = config.get(CONF_ALLOW_WRITE, True)
+        cg.add(parent.set_setpoint_allow_write(var, allow))
+        if allow:
+            _LOGGER.warning(
+                "VissLink: PARTY SETPOINT WRITE ENABLED (0x%04X, allow_write: "
+                "true), not validated on the Vitotronic 300 KW3: see "
+                "docs/eco-party-v0.9.1.md",
+                config[CONF_ADDRESS],
+            )
     if CONF_STATUS in config:
         status = await text_sensor.new_text_sensor(config[CONF_STATUS])
         cg.add(parent.set_setpoint_status_sensor(var, status))

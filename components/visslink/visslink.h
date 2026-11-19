@@ -23,6 +23,9 @@
 #ifdef USE_SELECT
 #include "esphome/components/select/select.h"
 #endif
+#ifdef USE_SWITCH
+#include "esphome/components/switch/switch.h"
+#endif
 #ifdef USE_TIME
 #include "esphome/components/time/real_time_clock.h"
 #endif
@@ -35,6 +38,7 @@
 #include "circulation_boost.h"
 #include "decode.h"
 #include "dhw_setpoint.h"
+#include "eco_party.h"
 #include "kw_protocol.h"
 #include "schedule.h"
 #include "schedule_editor.h"
@@ -332,6 +336,37 @@ class VissLinkModeSelect : public select::Select, public VissLinkRegister {
 };
 #endif
 
+#ifdef USE_SWITCH
+/// Commande Éco ou Party d'un circuit (v0.9.1, expérimental) : 0x2302,
+/// 0x2303 (A1), 0x3302, 0x3303 (M2). 00 = off, 01 = on ; toute autre valeur
+/// lue n'est pas interprétée (l'état publié reste le dernier état valide,
+/// avertissement). L'état publié provient toujours d'une lecture, jamais de
+/// la commande. Écriture : enable_writes ET `allow_write` de l'entité
+/// (eco_party_write_permitted, vérifié à la demande et juste avant
+/// l'émission) ; jamais au démarrage (restore_mode DISABLED imposé).
+class VissLinkFlagSwitch : public switch_::Switch, public VissLinkRegister {
+ public:
+  void set_parent(VissLinkComponent *parent) { this->parent_ = parent; }
+
+  uint8_t get_length() const override { return 1; }
+  bool publish_data(uint8_t block, const uint8_t *data) override;
+  void publish_unknown(uint8_t block) override;
+  void expect_written_value(uint8_t value) override { this->verification_.expect(value); }
+  void restore_read_state() override;
+  bool write_allowed(uint8_t value) const override;
+  void dump_register_config() override;
+  /// Dernier état lu (0/1), ou -1 si aucun.
+  int flag_raw() const { return this->raw_; }
+
+ protected:
+  void write_state(bool state) override;
+
+  VissLinkComponent *parent_{nullptr};
+  WriteVerification verification_;
+  int raw_{-1};
+};
+#endif
+
 /// Relie l'ordonnanceur, le protocole KW et les registres.
 class VissLinkComponent : public Component, public uart::UARTDevice {
  public:
@@ -382,6 +417,19 @@ class VissLinkComponent : public Component, public uart::UARTDevice {
   /// Texte facultatif d'état des modifications de cette consigne.
   void set_setpoint_status_sensor(VissLinkNumber *number, text_sensor::TextSensor *sensor);
 #endif
+#endif
+#ifdef USE_NUMBER
+  /// v0.9.1 : consigne Party, option `allow_write` de l'entité.
+  void set_setpoint_allow_write(VissLinkNumber *number, bool allow);
+#endif
+#ifdef USE_SWITCH
+  /// v0.9.1 : commande Éco/Party et son option `allow_write`.
+  void add_flag_switch(VissLinkFlagSwitch *sw, bool allow_write);
+#ifdef USE_TEXT_SENSOR
+  void set_flag_status_sensor(VissLinkFlagSwitch *sw, text_sensor::TextSensor *sensor);
+#endif
+  /// Demande venant de Home Assistant (VissLinkFlagSwitch::write_state).
+  void submit_flag_write(VissLinkFlagSwitch *sw, bool on);
 #endif
   /// v0.7 : une modification de cette consigne est en cours (relecture ou
   /// écriture) ; `target` = valeur demandée.
@@ -470,10 +518,32 @@ class VissLinkComponent : public Component, public uart::UARTDevice {
     int owner{WriteArbiter::NONE};
     SetpointWriter writer;
     uint32_t published{0};  ///< version du texte publiée
+    bool allow_write{true};  ///< v0.9.1 : consigne Party, option de l'entité
 #ifdef USE_TEXT_SENSOR
     text_sensor::TextSensor *status{nullptr};
 #endif
   };
+  // v0.9.1 : commandes Éco/Party, une transaction par registre.
+  struct FlagChannel {
+    FlagChannel(VissLinkRegister *r, uint16_t address, bool allow) : reg(r), writer(address), allow_write(allow) {}
+    VissLinkRegister *reg;
+    int owner{WriteArbiter::NONE};
+    FlagWriter writer;
+    bool allow_write;
+    uint32_t published{0};
+#ifdef USE_TEXT_SENSOR
+    text_sensor::TextSensor *status{nullptr};
+#endif
+  };
+  void flag_on_read_(FlagChannel &ch, bool ok, uint8_t value, bool verify, bool after_peer_write, uint32_t now);
+  void flag_publish_(FlagChannel &ch);
+  FlagChannel *flag_channel_(int index);
+  /// Commande Éco/Party de l'autre fonction du même circuit, ou NONE.
+  int flag_peer_of_(int index) const;
+  bool flag_permitted_(const FlagChannel &ch) const {
+    return eco_party_write_permitted(ch.writer.address(), this->enable_writes_, ch.allow_write) ==
+           EcoPartyPermission::OK;
+  }
 #ifdef USE_NUMBER
   void submit_setpoint_(SetpointChannel &ch, VissLinkNumber *number, float value);
 #endif
@@ -494,7 +564,8 @@ class VissLinkComponent : public Component, public uart::UARTDevice {
   bool enable_schedule_writes_{false};
   bool enable_dhw_setpoint_write_{false};
   bool enable_heating_setpoint_writes_{false};
-  std::vector<SetpointChannel> setpoints_;  ///< consignes déclarées (au plus 5)
+  std::vector<SetpointChannel> setpoints_;  ///< consignes déclarées (au plus 7)
+  std::vector<FlagChannel> flags_;          ///< v0.9.1 : commandes Éco/Party (au plus 4)
   BlockClients block_clients_;
   /// Lecture ponctuelle (v0.5) : une à la fois, nouvelles tentatives comme
   /// une lecture ordinaire.

@@ -27,6 +27,10 @@
 // (enable_heating_setpoint_writes), limites internes par registre, confort
 // >= réduite du même circuit. Le comportement et les messages de la consigne
 // ECS sont inchangés (DhwSetpointWriter = SetpointWriter(0x6300)).
+//
+// v0.9.1 : même transaction pour les consignes Party A1/M2 (0x2308, 0x3308) :
+// autorisations enable_writes ET `allow_write` de l'entité, limites internes
+// PARTY_SETPOINTS, aucun lien avec les consignes confort/réduite.
 
 #include <cmath>
 #include <cstdint>
@@ -54,6 +58,8 @@ struct DhwContext {
   // v0.7, garde commune à toutes les consignes (setpoint_gate) :
   bool other_busy{false};    ///< une autre consigne est en cours de modification
   bool other_recent{false};  ///< une autre consigne a été écrite il y a moins de GLOBAL_SPACING_MS
+  // v0.9.1, consignes Party : option `allow_write` de l'entité.
+  bool allow_party_write{false};
 };
 using SetpointContext = DhwContext;
 
@@ -95,13 +101,15 @@ class SetpointWriter {
  public:
   /// v0.7 : `address` = consigne ECS (défaut) ou de chauffage.
   explicit SetpointWriter(uint16_t address = DHW_SETPOINT_ADDRESS)
-      : address_(address), heating_(find_heating_setpoint(address)) {
+      : address_(address), heating_(find_heating_setpoint(address)), party_(find_party_setpoint(address)) {
     // v0.8.1 : texte publié dès le démarrage, tant qu'aucune modification n'a
     // été demandée (jamais « inconnu », qui ressemblerait à un défaut).
     this->status_ = VL_TEXT("Aucune modification effectuée");
   }
   uint16_t address() const { return this->address_; }
   bool heating() const { return this->heating_ != nullptr; }
+  /// v0.9.1 : consigne Party.
+  bool party() const { return this->party_ != nullptr; }
 
   /// Relecture préalable non obtenue dans ce délai : abandon, rien d'écrit.
   static constexpr uint32_t PRE_READ_TIMEOUT_MS = 60000;
@@ -111,7 +119,16 @@ class SetpointWriter {
 
   /// Demande venant de Home Assistant.
   DhwAction request(float value, const DhwContext &ctx, uint32_t now) {
-    if (this->heating_ != nullptr) {
+    if (this->party_ != nullptr) {
+      const EcoPartyPermission permission =
+          eco_party_write_permitted(this->address_, ctx.enable_writes, ctx.allow_party_write);
+      if (permission == EcoPartyPermission::WRITES_DISABLED)
+        return this->refuse_(VL_TEXT("écritures désactivées (enable_writes: false)"),
+                             eco_party_permission_to_string(permission));
+      if (permission != EcoPartyPermission::OK)
+        return this->refuse_(VL_TEXT("écriture désactivée pour cette consigne (allow_write: false)"),
+                             eco_party_permission_to_string(permission));
+    } else if (this->heating_ != nullptr) {
       const HeatingPermission permission =
           heating_write_permitted(this->address_, ctx.enable_writes, ctx.enable_heating_setpoint_writes);
       if (permission == HeatingPermission::WRITES_DISABLED)
@@ -141,8 +158,9 @@ class SetpointWriter {
     }
     if (this->state_ != DhwState::IDLE) {
       return this->refuse_(VL_TEXT("modification déjà en cours (") + std::to_string(this->target_) + VL_TEXT(" °C)"),
-                           this->heating_ != nullptr ? "another heating setpoint change is in progress"
-                                                     : "another DHW setpoint change is in progress");
+                           this->party_ != nullptr     ? "another Party setpoint change is in progress"
+                           : this->heating_ != nullptr ? "another heating setpoint change is in progress"
+                                                       : "another DHW setpoint change is in progress");
     }
     if (ctx.other_busy)
       return this->refuse_(VL_TEXT("une autre consigne est en cours de modification"),
@@ -234,7 +252,7 @@ class SetpointWriter {
     if (this->state_ == DhwState::IDLE && ok) {
       // Lecture périodique : modification faite ailleurs (panneau) ?
       if (this->has_confirmed_ && value != this->confirmed_) {
-        this->set_status_((this->heating_ != nullptr ? VL_TEXT("Modifiée hors de Home Assistant (panneau ou Vitotrol ?) : ")
+        this->set_status_((this->heating_ != nullptr || this->party_ != nullptr ? VL_TEXT("Modifiée hors de Home Assistant (panneau ou Vitotrol ?) : ")
                                                      : VL_TEXT("Modifiée hors de Home Assistant (panneau ?) : ")) +
                           std::to_string(this->confirmed_) + VL_TEXT(" -> ") + std::to_string(value) + VL_TEXT(" °C"));
         this->panel_changes_++;
@@ -351,6 +369,7 @@ class SetpointWriter {
 
   uint16_t address_;
   const HeatingSetpoint *heating_;
+  const PartySetpoint *party_;  ///< v0.9.1
   uint32_t requested_ms_{0};
   uint32_t duration_ms_{0};
   DhwState state_{DhwState::IDLE};

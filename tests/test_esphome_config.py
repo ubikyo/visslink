@@ -550,6 +550,10 @@ WRITABLE = {
     0x3307: (3, 37),
     0x6300: (10, 60),
 }
+# v0.9.1 : liste blanche complète des consignes, avec les consignes Party
+# (absentes de l'exemple de production).
+PARTY_WRITABLE = {0x2308: (3, 37), 0x3308: (3, 37)}
+WRITABLE_ALL = {**WRITABLE, **PARTY_WRITABLE}
 
 
 def test_example_writes_enabled_by_default(repo_root, tmp_path):
@@ -637,9 +641,9 @@ def test_target_number_syntax_is_accepted(repo_root, tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-@pytest.mark.parametrize("address", sorted(WRITABLE))
+@pytest.mark.parametrize("address", sorted(WRITABLE_ALL))
 def test_documented_bounds_are_accepted(repo_root, tmp_path, address):
-    lo, hi = WRITABLE[address]
+    lo, hi = WRITABLE_ALL[address]
 
     def transform(text):
         head, _, _ = text.partition("\nnumber:\n")
@@ -668,8 +672,8 @@ def test_python_and_cpp_whitelists_match(repo_root):
         int(a, 16): (int(lo), int(hi))
         for a, lo, hi in re.findall(r"0x([0-9A-Fa-f]{4}): \((\d+), (\d+)\)", block)
     }
-    assert cpp_table == WRITABLE
-    assert py_table == WRITABLE
+    assert cpp_table == WRITABLE_ALL
+    assert py_table == WRITABLE_ALL
 
 
 # --- Compatibilité v0.2.1 / v0.2.2 ---------------------------------------------
@@ -2070,20 +2074,17 @@ def test_eco_party_v09_example_only_adds_party_setpoint_reads(repo_root):
 
 
 @pytest.mark.parametrize("address", PARTY_SETPOINTS)
-def test_party_setpoints_never_writable(repo_root, tmp_path, address):
-    """Consigne Party : ni number (liste blanche des consignes), ni select."""
-    for old, expected in (
-        ("address: 0x2306", "not in the VissLink write whitelist"),
-        ("address: 0x2301", "is not an operating mode register"),
-    ):
-        result = _run_config(
-            repo_root,
-            tmp_path,
-            lambda s, old=old: s.replace(old, f"address: 0x{address:04X}"),
-        )
-        out = result.stdout + result.stderr
-        assert result.returncode != 0, hex(address)
-        assert expected in out, out
+def test_party_setpoints_never_operating_modes(repo_root, tmp_path, address):
+    """Consigne Party : jamais un programme (select). v0.9.1 : number
+    autorisé (liste blanche des consignes, cf. tests v0.9.1)."""
+    result = _run_config(
+        repo_root,
+        tmp_path,
+        lambda s: s.replace("address: 0x2301", f"address: 0x{address:04X}"),
+    )
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, hex(address)
+    assert "is not an operating mode register" in out, out
 
 
 def test_climate_has_no_eco_party_preset(repo_root):
@@ -2099,16 +2100,280 @@ def test_climate_has_no_eco_party_preset(repo_root):
         assert "preset" not in text.lower(), path
 
 
-def test_eco_party_registers_absent_from_cpp_whitelists(repo_root):
-    """Aucune liste blanche C++ (consignes, programmes, blocs) ne contient
-    Éco, Party ou les consignes Party."""
+def test_eco_party_registers_absent_from_other_cpp_whitelists(repo_root):
+    """v0.9.1 : Éco, Party et consignes Party n'apparaissent dans aucune liste
+    blanche du bouclage ni de l'éditeur ; dans write_guard.h, seulement dans
+    leurs tables propres (et WRITABLE_REGISTERS pour les consignes Party)."""
+    addresses = ("0x2302", "0x2303", "0x3302", "0x3303", "0x2308", "0x3308")
     code = ""
     for path in (
-        "components/visslink/write_guard.h",
         "components/visslink/circulation_boost.h",
         "components/visslink/schedule_editor.h",
     ):
         text = (repo_root / path).read_text(encoding="utf-8")
         code += re.sub(r"//[^\n]*", "", text).upper()
-    for address in ("0x2302", "0x2303", "0x3302", "0x3303", "0x2308", "0x3308"):
+    for address in addresses:
         assert address.upper() not in code, address
+    guard = (repo_root / "components/visslink/write_guard.h").read_text(
+        encoding="utf-8"
+    )
+    for table in (
+        "MODE_REGISTERS[]",
+        "MODE_WRITE_WHITELIST[]",
+        "HEATING_SETPOINTS[]",
+        "DHW_SETPOINT_WRITE_WHITELIST[]",
+    ):
+        body = guard.partition(table)[2].partition("};")[0].upper()
+        assert body, table
+        for address in addresses:
+            assert address.upper() not in body, (table, address)
+
+
+# --- v0.9.1 : pilotage Éco / Party ---------------------------------------------
+
+ECO_PARTY_V091 = "examples/iot-viessmann-eco-party-v0.9.1.yaml"
+ECO_PARTY_FLAGS = {
+    0x2302: ("A1", "Eco"),
+    0x2303: ("A1", "Party"),
+    0x3302: ("M2", "Eco"),
+    0x3303: ("M2", "Party"),
+}
+PARTY_LIMITS = {0x2308: (16, 23), 0x3308: (16, 22)}
+
+
+def _switch(address, extra=""):
+    return (
+        "\nswitch:\n"
+        "  - platform: visslink\n"
+        "    visslink_id: viessmann\n"
+        '    name: "Commande"\n'
+        f"    address: 0x{address:04X}\n" + extra
+    )
+
+
+def _without_v091_switches(text):
+    """Exemple v0.9.1 sans sa section switch (pour en injecter une autre)."""
+    head, _, rest = text.partition("\nswitch:\n")
+    return head + "\nnumber:\n" + rest.partition("\nnumber:\n")[2]
+
+
+def test_eco_party_v091_example_valid_step1(repo_root, tmp_path):
+    result = _run_config(repo_root, tmp_path, example=ECO_PARTY_V091)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    # Chaque registre une seule fois, toutes plateformes confondues.
+    for address in ("0x2302", "0x2303", "0x3302", "0x3303", "0x2308", "0x3308"):
+        assert out.count(f"address: {address}\n") == 1, address
+    switches = out.partition("\nswitch:\n")[2].partition("\nnumber:\n")[0]
+    entries = (
+        switches.split("\n- ")
+        if switches.startswith("- ")
+        else switches.split("\n  - ")
+    )
+    for address in ECO_PARTY_FLAGS:
+        entry = [e for e in entries if f"address: 0x{address:X}\n" in e]
+        assert len(entry) == 1, hex(address)
+        assert "restore_mode: DISABLED" in entry[0], hex(address)
+        assert "allow_write: false" in entry[0], hex(address)
+        assert "update_interval: 60s" in entry[0], hex(address)
+    # Étape 1 : seule la consigne Party A1 est inscriptible.
+    text = _active_lines((repo_root / ECO_PARTY_V091).read_text(encoding="utf-8"))
+    assert text.count("allow_write: true") == 1
+    assert text.count("allow_write: false") == 5
+    block = text.partition("address: 0x2308")[2].partition("- platform")[0]
+    assert "allow_write: true" in block
+    # Ni les autorisations générales, ni preset, ni validated_days.
+    for flag in WRITE_FLAGS:
+        assert f"{flag}:" not in text, flag
+    assert "validated_days" not in text
+    assert "preset" not in out.lower()
+
+
+def test_eco_party_v091_example_only_changes_eco_party_entities(repo_root):
+    """Par rapport à la v0.9 : seules les entités Éco/Party changent de
+    plateforme (binary_sensor -> switch, sensor -> number)."""
+    base = _active_lines((repo_root / ECO_PARTY_V09).read_text(encoding="utf-8"))
+    new = _active_lines((repo_root / ECO_PARTY_V091).read_text(encoding="utf-8"))
+    removed = [line for line in base.splitlines() if line not in new.splitlines()]
+    allowed_removed = re.compile(
+        r'^\s*name: "(Radiateurs|Plancher chauffant) - Consigne Party \(lecture\)"$'
+        r"|^\s*(data_type: uint8|device_class: temperature|accuracy_decimals: 0)$"
+    )
+    assert all(allowed_removed.match(line) for line in removed), removed
+    added = [line for line in new.splitlines() if line not in base.splitlines()]
+    allowed_added = re.compile(
+        r"^(switch:|\s*(- platform: visslink|visslink_id: viessmann|"
+        r'name: "(Radiateurs|Plancher|Plancher chauffant) - (Consigne Party|Éco|Party)'
+        r'( - État (modification|commande))?"|'
+        r"address: 0x(2302|2303|3302|3303|2308|3308)|"
+        r"min_value: 16|max_value: (22|23)|step: 1|update_interval: (60s|5min)|"
+        r'unit_of_measurement: "°C"|mode: box|icon: mdi:(leaf|party-popper)|'
+        r"allow_write: (true|false)( +#.*)?|status:))$"
+    )
+    assert all(allowed_added.match(line) for line in added), [
+        line for line in added if not allowed_added.match(line)
+    ]
+
+
+@pytest.mark.parametrize("address", sorted(ECO_PARTY_FLAGS))
+def test_eco_party_switch_accepted_only_on_the_four_commands(
+    repo_root, tmp_path, address
+):
+    def transform(text):
+        text = _without_v091_switches(text)
+        return text + _switch(address)
+
+    result = _run_config(repo_root, tmp_path, transform, example=ECO_PARTY_V091)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "allow_write: true" in out  # défaut : inscriptible
+    assert "restore_mode: DISABLED" in out
+
+
+@pytest.mark.parametrize(
+    "address", [0x2301, 0x2304, 0x2306, 0x2308, 0x3301, 0x6300, 0x0842, 0x2200]
+)
+def test_eco_party_switch_rejects_other_registers(repo_root, tmp_path, address):
+    def transform(text):
+        return _without_v091_switches(text) + _switch(address)
+
+    result = _run_config(repo_root, tmp_path, transform, example=ECO_PARTY_V091)
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, hex(address)
+    assert "is not an Eco/Party command" in out, out
+
+
+@pytest.mark.parametrize(
+    "extra, expected",
+    [
+        ("    restore_mode: ALWAYS_OFF\n", "restore_mode must be DISABLED"),
+        ("    restore_mode: RESTORE_DEFAULT_ON\n", "restore_mode must be DISABLED"),
+        ("    inverted: true\n", "inverted"),
+    ],
+)
+def test_eco_party_switch_never_commands_at_boot(repo_root, tmp_path, extra, expected):
+    def transform(text):
+        return _without_v091_switches(text) + _switch(0x2303, extra)
+
+    result = _run_config(repo_root, tmp_path, transform, example=ECO_PARTY_V091)
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, extra
+    assert expected in out, out
+
+
+def test_eco_party_switch_and_binary_sensor_cannot_share_an_address(
+    repo_root, tmp_path
+):
+    def transform(text):
+        return text.replace(
+            "\nbinary_sensor:\n",
+            "\nbinary_sensor:\n"
+            "  - platform: visslink\n"
+            "    visslink_id: viessmann\n"
+            '    name: "Doublon"\n'
+            "    address: 0x2303\n",
+            1,
+        )
+
+    result = _run_config(repo_root, tmp_path, transform, example=ECO_PARTY_V091)
+    out = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "declared by several visslink entities" in out, out
+
+
+def test_allow_write_only_for_party_setpoints(repo_root, tmp_path):
+    result = _run_config(
+        repo_root,
+        tmp_path,
+        lambda s: s.replace(
+            "    address: 0x2306\n", "    address: 0x2306\n    allow_write: false\n", 1
+        ),
+        example=ECO_PARTY_V091,
+    )
+    out = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "allow_write is only available for the Party setpoints" in out, out
+
+
+def test_python_and_cpp_eco_party_tables_match(repo_root):
+    header = (repo_root / "components/visslink/write_guard.h").read_text(
+        encoding="utf-8"
+    )
+    flags = {
+        int(a, 16): (int(p, 16), party == "true", m2 == "true")
+        for a, p, party, m2 in re.findall(
+            r"\{0x([0-9A-Fa-f]{4}), 0x([0-9A-Fa-f]{4}), (true|false), (true|false)\}",
+            header,
+        )
+    }
+    assert flags == {
+        0x2302: (0x2303, False, False),
+        0x2303: (0x2302, True, False),
+        0x3302: (0x3303, False, True),
+        0x3303: (0x3302, True, True),
+    }
+    switch_py = (repo_root / "components/visslink/switch.py").read_text(
+        encoding="utf-8"
+    )
+    block = switch_py.partition("ECO_PARTY_FLAGS = {")[2].partition("}")[0]
+    py_flags = {
+        int(a, 16): (c, f)
+        for a, c, f in re.findall(
+            r'0x([0-9A-Fa-f]{4}): \("(A1|M2)", "(Eco|Party)"\)', block
+        )
+    }
+    assert py_flags == ECO_PARTY_FLAGS
+    for address, (circuit, function) in ECO_PARTY_FLAGS.items():
+        assert flags[address][1] == (function == "Party")
+        assert flags[address][2] == (circuit == "M2")
+    cpp_limits = {
+        int(a, 16): (int(lo), int(hi))
+        for a, lo, hi in re.findall(
+            r"\{0x([0-9A-Fa-f]{4}), (\d+), (\d+), (?:true|false)\},\s*//", header
+        )
+    }
+    number_py = (repo_root / "components/visslink/number.py").read_text(
+        encoding="utf-8"
+    )
+    block = number_py.partition("PARTY_WRITE_LIMITS = {")[2].partition("}")[0]
+    py_limits = {
+        int(a, 16): (int(lo), int(hi))
+        for a, lo, hi in re.findall(r"0x([0-9A-Fa-f]{4}): \((\d+), (\d+)\)", block)
+    }
+    assert cpp_limits == py_limits == PARTY_LIMITS
+    for address, (lo, hi) in PARTY_LIMITS.items():  # dans la plage documentée
+        assert PARTY_WRITABLE[address][0] <= lo < hi <= PARTY_WRITABLE[address][1]
+    # M2 plancher : jamais au-delà du plafond de sa consigne confort.
+    assert PARTY_LIMITS[0x3308][1] == HEATING[0x3306][1]
+
+
+@pytest.mark.parametrize("address", sorted(PARTY_LIMITS))
+def test_party_setpoint_number_bounds(repo_root, tmp_path, address):
+    def transform(text):
+        return text.replace(
+            f"    address: 0x{address:04X}\n    min_value: 16\n",
+            f"    address: 0x{address:04X}\n    min_value: 2\n",
+            1,
+        )
+
+    result = _run_config(repo_root, tmp_path, transform, example=ECO_PARTY_V091)
+    out = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "min_value must be at least 3" in out, out
+
+
+def test_eco_party_v091_cpp_never_writes_comfort_reduced_or_at_boot(repo_root):
+    """Les chemins Éco/Party n'utilisent que leurs adresses ; aucun appel
+    d'écriture dans setup() ; le climate M2 n'a toujours pas de preset."""
+    cpp = (repo_root / "components/visslink/visslink.cpp").read_text(encoding="utf-8")
+    setup = cpp.partition("void VissLinkComponent::setup() {")[2].partition("\n}\n")[0]
+    assert "submit" not in setup and "request_write" not in setup
+    flag_code = cpp.partition("// Commandes Éco / Party A1 et M2 (v0.9.1")[2].partition(
+        "void VissLinkComponent::dump_config()"
+    )[0]
+    assert flag_code
+    for address in ("0x2306", "0x2307", "0x3306", "0x3307", "0x6300"):
+        assert address not in flag_code
+    eco = (repo_root / "components/visslink/eco_party.h").read_text(encoding="utf-8")
+    for address in ("0x2306", "0x2307", "0x3306", "0x3307"):
+        assert address not in eco

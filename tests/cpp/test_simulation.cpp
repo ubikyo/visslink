@@ -8,12 +8,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <set>
 #include <string>
 #include <memory>
 
 #include "decode.h"
 #include "circuit_climate.h"
 #include "dhw_setpoint.h"
+#include "eco_party.h"
 #include "kw_protocol.h"
 #include "schedule.h"
 #include "scheduler.h"
@@ -41,6 +43,7 @@ struct Bench {
     bool schedule{false};  ///< programmation : blocs de 8 octets, adresse + 8 x bloc
     bool number{false};    ///< consigne réglable (v0.3), uint8
     bool mode{false};      ///< programme de fonctionnement (v0.3), sélecteur
+    bool flag{false};      ///< v0.9.1 : commande Éco/Party (switch)
     float min{0}, max{0};  ///< bornes configurées (number)
     uint8_t raw_len{0};    ///< lecture brute de N octets (horloge 0x088E)
     InvalidRawValues invalid{};  ///< v0.5.1 : valeurs publiées inconnues (sensor)
@@ -197,7 +200,66 @@ struct Bench {
   bool enable_heating_setpoint_writes{false};
   SetpointWriter dhw;                    ///< consigne ECS (0x6300)
   int dhw_owner{WriteArbiter::NONE};
-  std::map<size_t, SetpointWriter> heat;  ///< consignes de chauffage, par index
+  std::map<size_t, SetpointWriter> heat;  ///< consignes de chauffage (v0.9.1 : et Party), par index
+  // v0.9.1 : allow_write des consignes Party et des commandes Éco/Party
+  // (VissLinkComponent::SetpointChannel / FlagChannel).
+  std::map<size_t, bool> allow;
+  std::map<size_t, FlagWriter> flags;  ///< commandes Éco/Party, par index
+  std::map<size_t, int> flag_state;    ///< état publié du switch (0/1, -1 = aucun)
+  std::vector<DhwAction> flag_actions;
+  bool allowed(size_t index) const {
+    auto it = allow.find(index);
+    return it != allow.end() && it->second;
+  }
+  FlagWriter *flag_for(int index) {
+    if (index == WriteArbiter::NONE)
+      return nullptr;
+    auto it = flags.find(static_cast<size_t>(index));
+    return it == flags.end() ? nullptr : &it->second;
+  }
+  /// VissLinkComponent::flag_peer_of_.
+  int flag_peer(int index) {
+    FlagWriter *w = flag_for(index);
+    if (w == nullptr)
+      return ReadBackTracker::NONE;
+    for (const auto &kv : flags) {
+      if (kv.second.address() == w->peer_address())
+        return static_cast<int>(kv.first);
+    }
+    return ReadBackTracker::NONE;
+  }
+  /// VissLinkComponent::flag_on_read_.
+  void flag_on_read(size_t index, bool ok, uint8_t value, bool verify, bool after_peer, uint32_t now) {
+    FlagWriter *w = flag_for(static_cast<int>(index));
+    const DhwAction a = w->on_read(ok, value, verify, now, after_peer);
+    if (a != DhwAction::NONE)
+      flag_actions.push_back(a);
+    if (a == DhwAction::SUBMIT &&
+        writes.submit(static_cast<int>(index), w->address(), w->target(), now) == WriteArbiter::Submit::FULL)
+      w->on_dropped("full");
+  }
+  /// VissLinkComponent::submit_flag_write : PRE_READ ou la raison du refus.
+  std::string request_flag(size_t index, bool on, uint32_t now) {
+    FlagWriter *w = flag_for(static_cast<int>(index));
+    if (w == nullptr)
+      return "not a flag";
+    FlagContext ctx;
+    ctx.enable_writes = enable_writes;
+    ctx.allow_write = allowed(index);
+    ctx.link_ok = link_ok;
+    auto st = flag_state.find(index);
+    ctx.has_value = st != flag_state.end() && st->second >= 0;
+    std::vector<const FlagWriter *> all;
+    for (const auto &kv : flags)
+      all.push_back(&kv.second);
+    flag_gate(all, w, now, &ctx);
+    const DhwAction a = w->request(on, ctx, now);
+    flag_actions.push_back(a);
+    if (a != DhwAction::PRE_READ)
+      return std::string("refused: ") + w->reason();
+    scheduler.expedite_block(index, 0, now);
+    return "pre-read";
+  }
   /// VissLinkBlockClient::restore_priority (bouclage ECS).
   std::function<bool()> restore_priority;
   std::vector<DhwAction> dhw_actions;  ///< issues des demandes et relectures
@@ -216,6 +278,13 @@ struct Bench {
   }
   /// VissLinkComponent::setpoint_permitted_.
   bool setpoint_permitted(uint16_t address) const {
+    if (is_party_setpoint_write_whitelisted(address)) {
+      for (const auto &kv : heat) {
+        if (kv.second.address() == address)
+          return eco_party_write_permitted(address, enable_writes, allowed(kv.first)) == EcoPartyPermission::OK;
+      }
+      return false;
+    }
     if (is_dhw_setpoint_write_whitelisted(address))
       return dhw_write_permitted(address, enable_writes, enable_dhw_setpoint_write) == DhwPermission::OK;
     return heating_write_permitted(address, enable_writes, enable_heating_setpoint_writes) == HeatingPermission::OK;
@@ -228,6 +297,8 @@ struct Bench {
     if (dhw_owner != WriteArbiter::NONE)
       set.add(dhw_owner);
     for (const auto &kv : heat)
+      set.add(static_cast<int>(kv.first));
+    for (const auto &kv : flags)
       set.add(static_cast<int>(kv.first));
     return set;
   }
@@ -335,8 +406,23 @@ struct Bench {
     // VissLinkComponent::add_setpoint_number
     if (address == DHW_SETPOINT_ADDRESS)
       dhw_owner = static_cast<int>(regs.size() - 1);
-    else if (is_heating_setpoint_write_whitelisted(address))
+    else if (is_heating_setpoint_write_whitelisted(address) || is_party_setpoint_write_whitelisted(address))
       heat.emplace(regs.size() - 1, SetpointWriter(address));
+    if (is_party_setpoint_write_whitelisted(address))
+      allow[regs.size() - 1] = true;  // allow_write par défaut
+    return regs.size() - 1;
+  }
+  /// v0.9.1 : switch Éco/Party (VissLinkComponent::add_flag_switch).
+  size_t add_flag(uint16_t address, uint32_t interval_ms, uint32_t now, bool allow_write = true) {
+    Reg r{address, DataType::UINT8, false, 1};
+    r.flag = true;
+    regs.push_back(r);
+    params.push_back({interval_ms, 1});
+    scheduler.add(interval_ms, now + stagger_ms * (regs.size() - 1));
+    if (is_eco_party_flag_whitelisted(address)) {
+      flags.emplace(regs.size() - 1, FlagWriter(address));
+      allow[regs.size() - 1] = allow_write;
+    }
     return regs.size() - 1;
   }
   size_t add_mode(uint16_t address, uint32_t interval_ms, uint32_t now) {
@@ -432,6 +518,7 @@ struct Bench {
       ctx.enable_writes = enable_writes;
       ctx.enable_dhw_setpoint_write = enable_dhw_setpoint_write;
       ctx.enable_heating_setpoint_writes = enable_heating_setpoint_writes;
+      ctx.allow_party_write = allowed(index);
       ctx.link_ok = link_ok;
       ctx.has_value = has_read_value(index);
       ctx.config_min = r.min;
@@ -495,6 +582,9 @@ struct Bench {
     dhw = SetpointWriter();  // rien de persistant
     for (auto &kv : heat)
       kv.second = SetpointWriter(kv.second.address());
+    for (auto &kv : flags)
+      kv.second = FlagWriter(kv.second.address());
+    flag_state.clear();
     write_in_flight = false;
     link_ok = false;
     verify.clear();
@@ -518,7 +608,7 @@ struct Bench {
     add(0x0804, 60000, now);
   }
   static uint8_t length(const Reg &r) {
-    if (r.number || r.mode)
+    if (r.number || r.mode || r.flag)
       return 1;
     if (r.schedule)
       return SCHEDULE_BLOCK_LENGTH;
@@ -535,6 +625,8 @@ struct Bench {
     const KwResult result = kw.loop(now, serial);
     dhw.poll(now);  // VissLinkComponent::loop
     for (auto &kv : heat)
+      kv.second.poll(now);
+    for (auto &kv : flags)
       kv.second.poll(now);
     if (result != KwResult::NONE && write_in_flight && is_block_owner(writes.current().owner)) {
       // VissLinkComponent::handle_block_write_result_
@@ -584,8 +676,15 @@ struct Bench {
                    : result == KwResult::WRITE_REJECTED ? DhwAck::REJECTED
                    : result == KwResult::SYNC_TIMEOUT   ? DhwAck::NOT_SENT
                                                         : DhwAck::INDETERMINATE);
+      if (FlagWriter *fw = flag_for(w.owner))
+        fw->on_ack(result == KwResult::SUCCESS          ? DhwAck::RECEIVED
+                   : result == KwResult::WRITE_REJECTED ? DhwAck::REJECTED
+                   : result == KwResult::SYNC_TIMEOUT   ? DhwAck::NOT_SENT
+                                                        : DhwAck::INDETERMINATE);
       verify[w.owner].expect(w.value);
-      const int peer = mode_peer(w.owner);
+      int peer = mode_peer(w.owner);
+      if (peer == ReadBackTracker::NONE)
+        peer = flag_peer(w.owner);
       read_back.start(w.owner, peer);
       if (peer != ReadBackTracker::NONE && !scheduler.expedite(peer, now + 1))  // écrit relu d'abord
         read_back.done(peer);
@@ -630,6 +729,20 @@ struct Bench {
           if (writer_for(static_cast<int>(index)) != nullptr)
             setpoint_on_read(index, true, value, verifying, now);
           read_back_done(index, now);
+        } else if (r.flag) {
+          // VissLinkFlagSwitch::publish_data + flag_on_read_ (v0.9.1).
+          const uint8_t raw = kw.data()[0];
+          const bool verifying = writes.active() && writes.current().owner == static_cast<int>(index) &&
+                                 read_back.waiting(static_cast<int>(index));
+          const bool after_peer = writes.active() && writes.current().owner != static_cast<int>(index) &&
+                                  read_back.waiting(static_cast<int>(index));
+          if (verify[index].pending())
+            verify_results.push_back(verify[index].on_read(raw));
+          if (raw <= 1)
+            flag_state[index] = raw;  // toujours la valeur lue ; autre valeur : non interprétée
+          if (flag_for(static_cast<int>(index)) != nullptr)
+            flag_on_read(index, true, raw, verifying, after_peer, now);
+          read_back_done(index, now);
         } else if (r.mode) {
           const uint8_t raw = kw.data()[0];
           if (verify[index].pending())
@@ -650,7 +763,15 @@ struct Bench {
         failures[index]++;
         if (scheduler.finish(false, now)) {
           gave_up[index]++;
-          if (r.number || r.mode) {
+          if (r.flag) {
+            const bool verifying = writes.active() && writes.current().owner == static_cast<int>(index) &&
+                                   read_back.waiting(static_cast<int>(index));
+            if (verify[index].pending())
+              verify_results.push_back(verify[index].on_give_up());
+            if (flag_for(static_cast<int>(index)) != nullptr)
+              flag_on_read(index, false, 0, verifying, false, now);
+            read_back_done(index, now);
+          } else if (r.number || r.mode) {
             const bool verifying = writes.active() && writes.current().owner == static_cast<int>(index) &&
                                    read_back.waiting(static_cast<int>(index));
             const bool was_pending = verify[index].pending();
@@ -684,6 +805,8 @@ struct Bench {
         expired_writes++;
         if (SetpointWriter *sw = writer_for(w.owner))
           sw->on_dropped("expired");
+        if (FlagWriter *fw = flag_for(w.owner))
+          fw->on_dropped("expired");
         if (is_block_owner(w.owner))
           notify_block_write(w.owner, w.address, false, false, now);
       }
@@ -716,8 +839,15 @@ struct Bench {
               r.mode && is_mode_register(w.address) && check_mode_write(w.address, 1, w.value) == WriteCheck::OK &&
               mode_write_permitted(w.address, enable_writes, enable_mode_writes, enable_m2_mode_write) ==
                   ModePermission::OK;
-          const bool allowed = r.address == w.address && is_write_whitelisted(w.address) && (number_ok || mode_ok);
-          if (allowed && kw.request_write(w.address, &w.value, 1, now)) {
+          // v0.9.1 : commande Éco/Party (VissLinkComponent::start_write_).
+          FlagWriter *fw = flag_for(w.owner);
+          const bool flag_ok = r.flag && fw != nullptr && fw->address() == w.address &&
+                               eco_party_write_permitted(w.address, enable_writes, allowed(w.owner)) ==
+                                   EcoPartyPermission::OK &&
+                               fw->expects_write(w.value) && check_flag_write(w.address, 1, w.value) == WriteCheck::OK;
+          const bool allowed_now =
+              r.address == w.address && is_write_whitelisted(w.address) && (number_ok || mode_ok || flag_ok);
+          if (allowed_now && kw.request_write(w.address, &w.value, 1, now)) {
             write_in_flight = true;
             started = true;
             if (restore_observer && restore_observer() && writer_for(w.owner) != nullptr) {
@@ -734,6 +864,8 @@ struct Bench {
             writes.complete(now);
             if (SetpointWriter *sw = writer_for(w.owner))
               sw->on_dropped("refused at send time");
+            if (FlagWriter *fw2 = flag_for(w.owner))
+              fw2->on_dropped("refused at send time");
           }
         }
       }
@@ -5024,4 +5156,274 @@ TEST(sim_v09_party_setpoints_read_only_with_eco_party) {
   CHECK_NEAR(b.last_value[m2_party], 23.0, 1e-9);
   CHECK(b.last_binary[c.eco_party[3]] == BinaryValue::OFF);
   CHECK(b.boiler.write_log.empty());
+}
+
+// ---------------------------------------------------------------------------
+// v0.9.1 : commandes Éco/Party (switch) et consignes Party (number)
+
+namespace {
+
+/// Exemple v0.9.1 (examples/iot-viessmann-eco-party-v0.9.1.yaml), réduit à ce
+/// qui partage la ligne : 4 commandes Éco/Party à 60 s, 2 consignes Party à
+/// 5 min, consignes confort/réduite, brûleur à 30 s. `allowed` : adresses
+/// dont l'entité a allow_write: true.
+struct EcoParty {
+  size_t burner{0}, a1_eco{0}, a1_party{0}, m2_eco{0}, m2_party{0}, a1_party_temp{0}, m2_party_temp{0};
+  std::vector<size_t> comfort_reduced;
+
+  EcoParty(Bench &b, std::set<uint16_t> allowed) {
+    b.enable_writes = true;
+    b.enable_heating_setpoint_writes = true;
+    auto &r = b.boiler.registers;
+    r[0x0842] = {0x01};
+    for (uint16_t a : {0x2302, 0x2303, 0x3302, 0x3303})
+      r[a] = {0x00};
+    r[0x2308] = {21};
+    r[0x3308] = {20};
+    r[0x2306] = {20};
+    r[0x2307] = {16};
+    r[0x3306] = {21};
+    r[0x3307] = {17};
+    b.boiler.writable = {0x2302, 0x2303, 0x3302, 0x3303, 0x2308, 0x3308, 0x2306, 0x2307, 0x3306, 0x3307};
+    b.add(0x0800, 60 * S, 0);
+    b.add(0x0802, 60 * S, 0);
+    burner = b.add_binary(0x0842, 30 * S, 0);
+    a1_eco = b.add_flag(0x2302, 60 * S, 0, allowed.count(0x2302) != 0);
+    a1_party = b.add_flag(0x2303, 60 * S, 0, allowed.count(0x2303) != 0);
+    m2_eco = b.add_flag(0x3302, 60 * S, 0, allowed.count(0x3302) != 0);
+    m2_party = b.add_flag(0x3303, 60 * S, 0, allowed.count(0x3303) != 0);
+    a1_party_temp = b.add_number(0x2308, 16, 23, 5 * MIN, 0);
+    m2_party_temp = b.add_number(0x3308, 16, 22, 5 * MIN, 0);
+    b.allow[a1_party_temp] = allowed.count(0x2308) != 0;
+    b.allow[m2_party_temp] = allowed.count(0x3308) != 0;
+    comfort_reduced = {b.add_number(0x2306, 16, 24, 5 * MIN, 0), b.add_number(0x2307, 10, 20, 5 * MIN, 0),
+                       b.add_number(0x3306, 16, 24, 5 * MIN, 0), b.add_number(0x3307, 10, 20, 5 * MIN, 0)};
+  }
+};
+
+const std::set<uint16_t> ALL_ECO_PARTY = {0x2302, 0x2303, 0x3302, 0x3303, 0x2308, 0x3308};
+
+int comfort_reduced_writes(const SimBoiler &boiler) {
+  int n = 0;
+  for (uint16_t a : {0x2306, 0x2307, 0x3306, 0x3307})
+    n += writes_to(boiler, a);
+  return n;
+}
+
+}  // namespace
+
+TEST(sim_v091_progressive_validation_step1_party_setpoint_a1_only) {
+  // Étape 1 de la procédure : seule la consigne Party A1 a allow_write: true.
+  Bench b;
+  EcoParty e(b, {0x2308});
+  b.run(0, BOOT);
+  CHECK_EQ(b.flag_state[e.a1_party], 0);
+  CHECK_EQ(b.number_state[e.a1_party_temp], 21);
+  CHECK_EQ(b.number_state[e.m2_party_temp], 20);
+  const std::string refused = "refused: write disabled for this entity (allow_write: false)";
+  CHECK(b.request_flag(e.a1_party, true, BOOT) == refused);
+  CHECK(b.request_flag(e.a1_eco, true, BOOT) == refused);
+  CHECK(b.request_flag(e.m2_party, true, BOOT) == refused);
+  CHECK(b.request_flag(e.m2_eco, true, BOOT) == refused);
+  CHECK(b.request(e.m2_party_temp, 21, BOOT) == refused);
+  CHECK(b.flags.at(e.a1_party).status() == "Refusé : écriture désactivée pour cette commande (allow_write: false)");
+  CHECK(b.request(e.a1_party_temp, 22, BOOT) == "pre-read");
+  const uint32_t done = run_until(b, BOOT, MIN, [&] { return !b.writer_for(static_cast<int>(e.a1_party_temp))->busy(); });
+  b.run(done, 10 * MIN);
+  CHECK_EQ(b.boiler.write_frames, 1);
+  CHECK(b.boiler.write_log[0] == (std::vector<uint8_t>{0x01, 0xF4, 0x23, 0x08, 0x01, 22}));
+  CHECK(read_back_follows_each_write(b.boiler));
+  CHECK(b.writer_for(static_cast<int>(e.a1_party_temp))->status() ==
+        "Confirmée : 22 °C relue (précédente 21 °C, accusé reçu)");
+  CHECK_EQ(b.number_state[e.a1_party_temp], 22);
+  CHECK_EQ(comfort_reduced_writes(b.boiler), 0);  // jamais touchées
+  for (uint16_t a : {0x2302, 0x2303, 0x3302, 0x3303, 0x3308})
+    CHECK_EQ(writes_to(b.boiler, a), 0);
+  CHECK(b.failures.empty());
+}
+
+TEST(sim_v091_each_function_written_and_confirmed_in_procedure_order) {
+  Bench b;
+  EcoParty e(b, ALL_ECO_PARTY);
+  b.run(0, BOOT);
+  uint32_t t = BOOT;
+  struct Step {
+    uint16_t address;
+    bool flag;
+    size_t index;
+    int value;
+    std::vector<uint8_t> frame;
+  };
+  const std::vector<Step> steps = {
+      {0x2308, false, e.a1_party_temp, 22, {0x01, 0xF4, 0x23, 0x08, 0x01, 22}},
+      {0x2303, true, e.a1_party, 1, {0x01, 0xF4, 0x23, 0x03, 0x01, 0x01}},
+      {0x2302, true, e.a1_eco, 1, {0x01, 0xF4, 0x23, 0x02, 0x01, 0x01}},
+      {0x3308, false, e.m2_party_temp, 19, {0x01, 0xF4, 0x33, 0x08, 0x01, 19}},
+      {0x3303, true, e.m2_party, 1, {0x01, 0xF4, 0x33, 0x03, 0x01, 0x01}},
+      {0x3302, true, e.m2_eco, 1, {0x01, 0xF4, 0x33, 0x02, 0x01, 0x01}},
+  };
+  for (size_t i = 0; i < steps.size(); i++) {
+    const Step &s = steps[i];
+    const std::string r = s.flag ? b.request_flag(s.index, s.value != 0, t) : b.request(s.index, s.value, t);
+    CHECK(r == "pre-read");
+    t = run_until(b, t, MIN, [&] {
+      return s.flag ? !b.flags.at(s.index).busy() : !b.writer_for(static_cast<int>(s.index))->busy();
+    });
+    b.run(t, MIN);  // relectures et espacement (15 s entre deux commandes)
+    t += MIN;
+    CHECK_EQ(b.boiler.write_frames, static_cast<int>(i + 1));
+    CHECK(b.boiler.write_log[i] == s.frame);
+    CHECK_EQ(b.boiler_value(s.address), s.value);
+    if (s.flag) {
+      CHECK(b.flags.at(s.index).last_outcome() == DhwOutcome::CONFIRMED);
+      CHECK_EQ(b.flag_state[s.index], 1);
+    } else {
+      CHECK(b.writer_for(static_cast<int>(s.index))->last_outcome() == DhwOutcome::CONFIRMED);
+      CHECK_EQ(b.number_state[s.index], s.value);
+    }
+  }
+  CHECK(b.flags.at(e.a1_party).status() == "Confirmé : Party activé relu (accusé reçu)");
+  CHECK(b.flags.at(e.m2_eco).status() == "Confirmé : Éco activé relu (accusé reçu)");
+  // Après chaque commande Éco/Party : relecture du registre puis de l'autre
+  // commande du même circuit.
+  const size_t w = find_frame(b.boiler, 0xF4, 0x2303);
+  CHECK(b.boiler.frame_log[w + 1] == (std::pair<uint8_t, uint16_t>{0xF7, 0x2303}));
+  CHECK(b.boiler.frame_log[w + 2] == (std::pair<uint8_t, uint16_t>{0xF7, 0x2302}));
+  CHECK(read_back_follows_each_write(b.boiler));
+  CHECK_EQ(comfort_reduced_writes(b.boiler), 0);
+  CHECK(b.verify_results == std::vector<VerifyResult>(6, VerifyResult::CONFIRMED));
+  // Désactivation : même chemin.
+  CHECK(b.request_flag(e.a1_party, false, t) == "pre-read");
+  b.run(t, MIN);
+  CHECK_EQ(b.boiler_value(0x2303), 0);
+  CHECK_EQ(b.flag_state[e.a1_party], 0);
+  CHECK(b.flags.at(e.a1_party).status() == "Confirmé : Party désactivé relu (accusé reçu)");
+  CHECK(b.failures.empty());
+}
+
+TEST(sim_v091_no_write_without_request_permission_or_after_reboot) {
+  for (bool writes : {true, false}) {
+    Bench b;
+    EcoParty e(b, ALL_ECO_PARTY);
+    b.enable_writes = writes;
+    b.run(0, 2 * H);  // aucune demande : rien n'est écrit, même au démarrage
+    CHECK_EQ(b.boiler.write_frames, 0);
+    if (!writes) {
+      CHECK(b.request_flag(e.a1_party, true, 2 * H) == "refused: writes are disabled (enable_writes: false)");
+      CHECK(b.request(e.a1_party_temp, 22, 2 * H) == "refused: writes are disabled (enable_writes: false)");
+      b.run(2 * H, 10 * MIN);
+      CHECK_EQ(b.boiler.write_frames, 0);
+      continue;
+    }
+    // Demande puis redémarrage avant l'émission : rien ne subsiste.
+    CHECK(b.request_flag(e.m2_party, true, 2 * H) == "pre-read");
+    b.reboot(2 * H + 5);
+    b.run(2 * H + 5, H);
+    CHECK_EQ(b.boiler.write_frames, 0);
+    CHECK_EQ(b.boiler_value(0x3303), 0);
+    CHECK(b.flags.at(e.m2_party).status() == "Aucune modification effectuée");
+  }
+}
+
+TEST(sim_v091_ignored_write_reported_once_never_retried) {
+  // M2 avec Vitotrol : hypothèse d'une écriture accusée mais non appliquée
+  // (« Fernbedienung », notice KW3 p. 43). Échec affiché, aucun nouvel essai.
+  Bench b;
+  EcoParty e(b, ALL_ECO_PARTY);
+  b.boiler.write_faults[0x3303] = SimBoiler::WriteFault::ACK_IGNORED;
+  b.boiler.write_faults[0x3308] = SimBoiler::WriteFault::NACK_OTHER;
+  b.run(0, BOOT);
+  CHECK(b.request_flag(e.m2_party, true, BOOT) == "pre-read");
+  b.run(BOOT, MIN);
+  CHECK(b.flags.at(e.m2_party).last_outcome() == DhwOutcome::MISMATCH);
+  CHECK(b.flags.at(e.m2_party).status() ==
+        "Échec : relu désactivé au lieu de activé (accusé reçu) ; pas de nouvel essai");
+  CHECK_EQ(b.flag_state[e.m2_party], 0);  // état lu, jamais la commande
+  CHECK(b.request(e.m2_party_temp, 19, BOOT + MIN) == "pre-read");
+  b.run(BOOT + MIN, 30 * MIN);
+  CHECK(b.writer_for(static_cast<int>(e.m2_party_temp))->last_outcome() == DhwOutcome::MISMATCH);
+  CHECK_EQ(b.number_state[e.m2_party_temp], 20);
+  CHECK_EQ(writes_to(b.boiler, 0x3303), 1);
+  CHECK_EQ(writes_to(b.boiler, 0x3308), 1);
+  CHECK_EQ(b.boiler.write_frames, 2);
+}
+
+TEST(sim_v091_eco_and_party_together_follow_the_boiler) {
+  // Éco + Party simultanés : non documenté. Hypothèse de test : la régulation
+  // coupe Éco quand Party est activé. VissLink ne suppose rien : il relit
+  // Éco après la commande Party et l'affiche, sans le réécrire.
+  Bench b;
+  EcoParty e(b, ALL_ECO_PARTY);
+  b.boiler.registers[0x2302] = {0x01};  // Éco A1 actif
+  b.boiler.on_applied = [&](uint16_t a) {
+    if (a == 0x2303 && b.boiler.registers[0x2303][0] == 1)
+      b.boiler.registers[0x2302] = {0x00};
+  };
+  b.run(0, BOOT);
+  CHECK_EQ(b.flag_state[e.a1_eco], 1);
+  CHECK(b.request_flag(e.a1_party, true, BOOT) == "pre-read");
+  b.run(BOOT, MIN);
+  CHECK(b.flags.at(e.a1_party).last_outcome() == DhwOutcome::CONFIRMED);
+  CHECK_EQ(b.flag_state[e.a1_eco], 0);  // relu juste après, sans attendre 60 s
+  CHECK(b.flags.at(e.a1_eco).status() == "Modifié par la régulation après la commande Party : activé -> désactivé");
+  CHECK_EQ(b.flags.at(e.a1_eco).panel_changes(), 0u);
+  CHECK_EQ(b.boiler.write_frames, 1);  // Éco jamais réécrit
+}
+
+TEST(sim_v091_sync_with_panel_vitotrol_and_automatic_end) {
+  Bench b;
+  EcoParty e(b, ALL_ECO_PARTY);
+  b.run(0, BOOT);
+  // Party M2 activé à la Vitotrol, consigne Party A1 changée au panneau.
+  b.boiler.registers[0x3303] = {0x01};
+  b.boiler.registers[0x2308] = {19};
+  b.run(BOOT, 5 * MIN + 10 * S);
+  CHECK_EQ(b.flag_state[e.m2_party], 1);
+  CHECK(b.flags.at(e.m2_party).status() ==
+        "Modifié hors de Home Assistant (fin automatique, panneau ou Vitotrol ?) : désactivé -> activé");
+  CHECK_EQ(b.number_state[e.a1_party_temp], 19);
+  CHECK(b.writer_for(static_cast<int>(e.a1_party_temp))->status() ==
+        "Modifiée hors de Home Assistant (panneau ou Vitotrol ?) : 21 -> 19 °C");
+  // Fin automatique (passage en période normale) : relue, jamais réactivée.
+  b.boiler.registers[0x3303] = {0x00};
+  b.run(BOOT + 5 * MIN + 10 * S, 70 * S);
+  CHECK_EQ(b.flag_state[e.m2_party], 0);
+  // Valeur inattendue : jamais interprétée ni écrite.
+  b.boiler.registers[0x2303] = {0x05};
+  b.run(BOOT + 7 * MIN, 70 * S);
+  CHECK_EQ(b.flag_state[e.a1_party], 0);
+  CHECK(b.flags.at(e.a1_party).status() == "Valeur inattendue lue : 0x05 (non interprétée)");
+  CHECK(b.request_flag(e.a1_party, true, BOOT + 9 * MIN) == "pre-read");
+  b.run(BOOT + 9 * MIN, MIN);
+  CHECK(b.flags.at(e.a1_party).status() == "Abandon : valeur inattendue 0x05 lue, rien n'a été écrit");
+  CHECK_EQ(b.boiler.write_frames, 0);
+}
+
+TEST(sim_v091_commands_keep_periodic_reads) {
+  // Usage réaliste sur 2 h : une commande toutes les 10 min. Le brûleur
+  // (30 s) garde sa cadence ; une seule commande Éco/Party à la fois.
+  Bench b;
+  EcoParty e(b, ALL_ECO_PARTY);
+  b.run(0, BOOT);
+  const size_t order[] = {e.a1_party, e.a1_eco, e.m2_party, e.m2_eco};
+  int requested = 0;
+  for (uint32_t t = BOOT; t < 2 * H; t += 10 * MIN) {
+    const size_t idx = order[(t / (10 * MIN)) % 4];
+    if (b.request_flag(idx, b.flag_state[idx] == 0, t) == "pre-read")
+      requested++;
+    // Demande concurrente immédiate : refusée (une à la fois).
+    const size_t other = order[((t / (10 * MIN)) + 1) % 4];
+    CHECK(b.request_flag(other, true, t) == "refused: another Eco/Party command is in progress");
+    b.run(t, 10 * MIN);
+  }
+  CHECK_EQ(requested, 12);
+  CHECK_EQ(b.boiler.write_frames, 12);
+  CHECK(read_back_follows_each_write(b.boiler));
+  CHECK(b.successes[e.burner] >= 225);
+  CHECK(b.max_gap_ms[e.burner] < 60 * S);  // retard ponctuel (45 s mesuré), jamais un cycle sauté
+  if (report_enabled())
+    std::printf("  v0.9.1 : brûleur, écart max %.1f s, %d lectures\n", b.max_gap_ms[e.burner] / 1000.0,
+                b.successes[e.burner]);
+  CHECK_EQ(comfort_reduced_writes(b.boiler), 0);
+  CHECK(b.failures.empty());
 }
